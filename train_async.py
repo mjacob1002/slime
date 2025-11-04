@@ -1,4 +1,11 @@
 import ray
+import logging
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S', level=logging.INFO)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
@@ -11,6 +18,9 @@ def train(args):
     pgs = create_placement_groups(args)
     wandb_run_id = init_wandb_primary(args)
 
+    # create the actor and critic models
+    #actor_model, critic_model = create_training_models(args, pgs, wandb_run_id=wandb_run_id)
+
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"], wandb_run_id=wandb_run_id)
@@ -22,6 +32,7 @@ def train(args):
     actor_model.update_weights()
 
     # async train loop.
+    logger.info("Starting rollout 0")
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
@@ -30,6 +41,7 @@ def train(args):
 
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
+            logger.info(f"Starting rollout {rollout_id + 1}")
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
         if args.use_critic:
@@ -51,6 +63,8 @@ def train(args):
                 ray.get(rollout_manager.save.remote(rollout_id))
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
+            if rollout_data_next_future is None:
+                print(f"rollout_data_next_future is None at rollout_id {rollout_id}, (rollout_id + 1) % args.update_weights_interval == 0, args.update_weights_interval: {args.update_weights_interval}")
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None

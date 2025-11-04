@@ -1,3 +1,4 @@
+import time
 import ray
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
@@ -27,6 +28,7 @@ def train(args):
         ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
 
     # always update weight first so that sglang has the loaded weights from training.
+    # TODO: this is where the weights get updated; where do profile
     actor_model.update_weights()
 
     if args.offload_rollout:
@@ -57,7 +59,6 @@ def train(args):
             ray.get(critic_train_handle)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
-
         if args.save_interval is not None and (
             (rollout_id + 1) % args.save_interval == 0
             or (num_rollout_per_epoch is not None and (rollout_id + 1) % num_rollout_per_epoch == 0)
@@ -82,6 +83,7 @@ def train(args):
                 actor_model.clear_memory()
             ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
 
+        # Update weights to sync training weights to inference engines
         actor_model.update_weights()
 
         if args.offload_rollout:

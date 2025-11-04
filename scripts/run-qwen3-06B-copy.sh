@@ -14,7 +14,10 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
-export RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING=1
+export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+TRAINING_GPU=3
+INFERENCE_GPU=1
+TOTAL_GPUS=$((TRAINING_GPU + INFERENCE_GPU))
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -25,13 +28,14 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/glm4-9B.sh"
+source "${SCRIPT_DIR}/models/qwen3-0.6B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/GLM-Z1-9B-0414/
-   --ref-load /root/GLM-Z1-9B-0414_torch_dist
-   --load /root/GLM-Z1-9B-0414_slime/
-   --save /root/GLM-Z1-9B-0414_slime/
+   --hf-checkpoint /root/Qwen3-0.6B
+   #--hf-checkpoint /root/Qwen3-4B-FP8
+   --ref-load /root/Qwen3-0.6B_torch_dist
+   --load /root/Qwen3-0.6B_slime/
+   --save /root/Qwen3-0.6B_slime/
    --save-interval 20
 )
 
@@ -41,15 +45,12 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-
    --rm-type deepscaler
-
-   --num-rollout 3 # each rollout is effectively a loop of sampling -> training
-   --rollout-batch-size 32
+   --num-rollout 5
+   --rollout-batch-size 32 
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-max-response-len 32768
    --rollout-temperature 0.8
-
    --global-batch-size 256
    --balance-data
 )
@@ -65,7 +66,7 @@ EVAL_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 1
    --sequence-parallel
-   --pipeline-model-parallel-size 2
+   --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
@@ -76,7 +77,7 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4608
+   --max-tokens-per-gpu 9216
 )
 
 GRPO_ARGS=(
@@ -99,7 +100,7 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   #--use-wandb
+   # --use-wandb
    # --wandb-project slime-dev
    # --wandb-group qwen3-4B-test
    # --wandb-key ${WANDB_KEY}
@@ -107,6 +108,7 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
+   --sglang-mem-fraction-static 0.85
 )
 
 MISC_ARGS=(
@@ -122,7 +124,7 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus $TOTAL_GPUS --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir /root/slime/logs
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -133,20 +135,22 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
+# we control training, so we set these params for training.
+# SGLang takes care of the inference side
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train.py \
+   -- python3 train_async.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2\
-   --rollout-num-gpus 1\
+   --actor-num-gpus-per-node $TRAINING_GPU \
+   --rollout-num-gpus $INFERENCE_GPU \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
+   ${DISTRIBUTED_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]}
-
