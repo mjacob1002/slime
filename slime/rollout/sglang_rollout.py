@@ -38,15 +38,21 @@ def _load_and_encode_image(path: str) -> str:
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
+    Uses a work queue pattern where worker coroutines pull tasks from a queue.
+    This enables elastic scaling of inference workers.
     """
 
     def __init__(self, args: Namespace) -> None:
         # persistant state for the generation process
         self.args = args
         self.tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-        )
+        
+        # Work queue configuration
+        self.work_queue = asyncio.Queue()
+        self.num_workers = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        self.workers = []  # List of worker tasks
+        self.worker_shutdown = False
+        
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -69,12 +75,23 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
+        self.worker_shutdown = False
 
-    def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
-        for group in samples:
-            self.pendings.add(
-                asyncio.create_task(
-                    # submit a group of samples as a single task.
+    async def _worker_loop(self, worker_id: int) -> None:
+        """Worker coroutine that pulls tasks from the work queue and processes them."""
+        while not self.worker_shutdown:
+            try:
+                # Wait for work with a timeout so we can check shutdown flag
+                try:
+                    group = await asyncio.wait_for(self.work_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                
+                if group is None:  # Poison pill to signal shutdown
+                    break
+                
+                # Process the work item
+                task = asyncio.create_task(
                     generate_and_rm_group(
                         self.args,
                         group,
@@ -82,8 +99,54 @@ class GenerateState(metaclass=SingletonMeta):
                         evaluation=False,
                     )
                 )
-            )
+                self.pendings.add(task)
+                
+                # Don't wait for completion here - let the main loop handle that
+                self.work_queue.task_done()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"Worker {worker_id} encountered error: {e}", flush=True)
+                # Continue processing other items
+
+    def start_workers(self) -> None:
+        """Start worker coroutines that will process items from the work queue."""
+        if self.workers:
+            return  # Already started
+        
+        for i in range(self.num_workers):
+            worker_task = asyncio.create_task(self._worker_loop(i))
+            self.workers.append(worker_task)
+        
+        print(f"Started {self.num_workers} worker coroutines for work queue processing", flush=True)
+
+    async def stop_workers(self) -> None:
+        """Stop all worker coroutines gracefully."""
+        if not self.workers:
+            return
+        
+        self.worker_shutdown = True
+        
+        # Send poison pills to wake up all workers
+        for _ in range(len(self.workers)):
+            await self.work_queue.put(None)
+        
+        # Wait for workers to finish
+        await asyncio.gather(*self.workers, return_exceptions=True)
+        self.workers = []
+        
+        print(f"Stopped all worker coroutines", flush=True)
+
+    def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
+        """Submit generation tasks to the work queue."""
+        for group in samples:
+            # This is non-blocking - just adds to queue
+            self.work_queue.put_nowait(group)
+        
         self.remaining_batch_size += len(samples)
+        
+       
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
@@ -203,19 +266,21 @@ async def generate_and_rm(
             assert sample.reward is not None
         return sample
 
+    # there is only one copy of this GenerateState
     state = GenerateState(args)
 
-    # generate
-    async with state.semaphore:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
+    # generate - no semaphore needed with work queue pattern
+    if state.aborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
-        if args.custom_generate_function_path is not None:
-            custom_generate_func = load_function(args.custom_generate_function_path)
-            sample = await custom_generate_func(args, sample, sampling_params)
-        else:
-            sample = await generate(args, sample, sampling_params)
+    if args.custom_generate_function_path is not None:
+        print(f"Using custom generate function: {args.custom_generate_function_path}", flush=True)
+        custom_generate_func = load_function(args.custom_generate_function_path)
+        sample = await custom_generate_func(args, sample, sampling_params)
+    else:
+        #print(f"Using default generate function", flush=True)
+        sample = await generate(args, sample, sampling_params)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -275,9 +340,18 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     state = GenerateState(args)
     assert not state.aborted
     state.aborted = True
+    
+    # Clear the work queue - items in queue won't be processed
+    while not state.work_queue.empty():
+        try:
+            state.work_queue.get_nowait()
+            state.work_queue.task_done()
+        except asyncio.QueueEmpty:
+            break
+    
     response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
 
-    # abort all the requests
+    # abort all the requests at the SGLang worker level
     for url in response["urls"]:
         print(f"Abort request for {url}", flush=True)
         await post(f"{url}/abort_request", {"abort_all": True})
@@ -323,6 +397,9 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    
+    # Start worker coroutines to process work queue
+    state.start_workers()
 
     # instantiate data filters
     dynamic_filter = (
@@ -340,10 +417,36 @@ async def generate_rollout_async(
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
+            print(f"DEBUG: Requesting {args.over_sampling_batch_size} samples from data_source", flush=True)
             samples = data_source(args.over_sampling_batch_size)
+            print(f"DEBUG: Received {len(samples)} sample groups from data_source", flush=True)
+            if len(samples) == 0:
+                raise ValueError(
+                    f"data_source returned 0 samples when requesting {args.over_sampling_batch_size}. "
+                    f"Check that:\n"
+                    f"  1. args.over_sampling_batch_size = {args.over_sampling_batch_size} (should be > 0)\n"
+                    f"  2. Your dataset is loaded and not empty\n"
+                    f"  3. Dataset path: {getattr(args, 'prompt_data', 'NOT SET')}\n"
+                    f"  4. args.rollout_global_dataset = {getattr(args, 'rollout_global_dataset', 'NOT SET')}"
+                )
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
+        # Give workers a chance to pull from queue and create tasks
+        # TODO: is the best way to treat this pendings set really to just wait a few seconds and hope it started to pull from it?
+        if not state.pendings:
+            # Wait briefly for workers to pick up tasks from the queue
+            for _ in range(10):  # Try for up to 100ms
+                await asyncio.sleep(0.01)
+                if state.pendings:
+                    break
+            
+            if not state.pendings:
+                raise ValueError(
+                    f"No pending tasks to wait for, but only collected {len(data)}/{target_data_size} samples. "
+                    "This likely means the data_source is exhausted or returning empty batches."
+                )
+        print(f"[DEBUG] Successfully got past the trap: {state.pendings}")
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             group: list[Sample] = task.result()
@@ -378,6 +481,9 @@ async def generate_rollout_async(
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
+    
+    # Stop worker coroutines
+    await state.stop_workers()
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)

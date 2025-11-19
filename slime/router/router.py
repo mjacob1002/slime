@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 
 import httpx
@@ -32,6 +33,8 @@ class SlimeRouter:
         # Worker information
         self.worker_urls: dict[str, int] = {}
         self.max_weight_version = None
+        #TODO: why wasn't this in the code before?
+        self.worker_urls_lock = asyncio.Lock()
 
         # TODO: remove this hardcode
         self.client = httpx.AsyncClient(
@@ -122,16 +125,19 @@ class SlimeRouter:
             )
 
         # Add if new, keep a simple request count per worker
-        if worker_url not in self.worker_urls:
-            self.worker_urls[worker_url] = 0
-            if self.verbose:
-                print(f"[slime-router] Added new worker: {worker_url}")
+        with self.worker_urls_lock:
+            if worker_url not in self.worker_urls:
+                self.worker_urls[worker_url] = 0
+                if self.verbose:
+                    print(f"[slime-router] Added new worker: {worker_url}")
 
         return {"status": "success", "worker_urls": self.worker_urls}
 
     async def list_workers(self, request: Request):
         """List all registered workers"""
-        return {"urls": list(self.worker_urls.keys())}
+        with self.worker_urls_lock:
+            return {"urls": list(self.worker_urls.keys())}
+        return {"urls": []}
 
     async def retrieve_from_text(self, request: Request):
         """Get token information from text input"""
@@ -161,18 +167,20 @@ class SlimeRouter:
 
     def _use_url(self):
         """Select a worker URL using round-robin strategy"""
-        assert len(self.worker_urls) > 0, "No workers available"
+        with self.worker_urls_lock:
+            assert len(self.worker_urls) > 0, "No workers available"
 
-        # get the url with mininal count
-        url = min(self.worker_urls, key=self.worker_urls.get)
-        self.worker_urls[url] += 1
-        return url
+            # get the url with mininal count
+            url = min(self.worker_urls, key=self.worker_urls.get)
+            self.worker_urls[url] += 1
+            return url
 
     def _finish_url(self, url):
         """Mark the request to the given URL as finished"""
-        assert url in self.worker_urls, f"URL {url} not recognized"
-        self.worker_urls[url] -= 1
-        assert self.worker_urls[url] >= 0, f"URL {url} count went negative"
+        with self.worker_urls_lock:
+            assert url in self.worker_urls, f"URL {url} not recognized"
+            self.worker_urls[url] -= 1
+            assert self.worker_urls[url] >= 0, f"URL {url} count went negative"
 
 
 if __name__ == "__main__":

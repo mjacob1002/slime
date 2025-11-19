@@ -46,11 +46,11 @@ ROLLOUT_ARGS=(
 
    --num-rollout 3 # each rollout is effectively a loop of sampling -> training
    --rollout-batch-size 32
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --n-samples-per-prompt 4
+   --rollout-max-response-len 1024
    --rollout-temperature 0.8
 
-   --global-batch-size 256
+   --global-batch-size 128
    --balance-data
 )
 
@@ -135,7 +135,7 @@ RUNTIME_ENV_JSON="{
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train.py \
+   -- python3 train_async.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 2\
    --rollout-num-gpus 1\

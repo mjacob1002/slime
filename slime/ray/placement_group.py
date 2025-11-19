@@ -160,6 +160,7 @@ def create_training_models(args, pgs, rollout_manager, wandb_run_id):
 
 
 def create_rollout_manager(args, pg, wandb_run_id):
+    # the manager is a coordinator that manages the SGLang Rollout Actors
     rollout_manager = RolloutManager.options(
         num_cpus=1,
         num_gpus=0,

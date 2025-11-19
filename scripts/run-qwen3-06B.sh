@@ -14,9 +14,9 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,3,5
 TRAINING_GPU=1
-INFERENCE_GPU=3
+INFERENCE_GPU=1
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then

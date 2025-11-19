@@ -44,7 +44,9 @@ class RolloutManager:
         init_http_client(args)
 
         self.data_source = RolloutDataSourceWithBuffer(args)
-
+        print(f"self.args.rollout_function_path: {self.args.rollout_function_path}")
+        print(f"self.args.eval_function_path: {self.args.eval_function_path}")
+        print(f"self.args: {self.args}")
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
         self.custom_reward_post_process_func = None

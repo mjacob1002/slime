@@ -14,8 +14,9 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
-export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
-TRAINING_GPU=3
+export CUDA_VISIBLE_DEVICES=2,5
+echo "Starting the modified script"
+TRAINING_GPU=1
 INFERENCE_GPU=1
 TOTAL_GPUS=$((TRAINING_GPU + INFERENCE_GPU))
 
@@ -46,7 +47,7 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type deepscaler
-   --num-rollout 5
+   --num-rollout 2
    --rollout-batch-size 32 
    --n-samples-per-prompt 8
    --rollout-max-response-len 32768
