@@ -92,9 +92,23 @@ class RayTrainGroup:
 
         # Create worker actors
         self._actor_handlers = []
+        self._elastic_actor_rank = None  # Track which rank is elastic (if any)
         master_addr, master_port = None, None
+        
+        # Check if last actor should be elastic
+        use_elastic = getattr(self.args, 'enable_elastic', False) and world_size >= 2
+        
         for rank in range(world_size):
-            actor = TrainRayActor.options(
+            # Make last actor elastic if enabled
+            if use_elastic and rank == world_size - 1:
+                from slime.ray.elastic_actor import ElasticActor
+                actor_class = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(ElasticActor)
+                print(f"[RayTrainGroup] Creating ElasticActor for rank {rank}")
+                self._elastic_actor_rank = rank
+            else:
+                actor_class = TrainRayActor
+            
+            actor = actor_class.options(
                 num_cpus=num_gpus_per_actor,
                 num_gpus=num_gpus_per_actor,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
@@ -141,3 +155,19 @@ class RayTrainGroup:
 
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+    
+    def has_elastic_actor(self) -> bool:
+        """Check if this group has an elastic actor"""
+        return self._elastic_actor_rank is not None
+    
+    def get_elastic_actor(self):
+        """Get the elastic actor handler (if exists)"""
+        if self._elastic_actor_rank is None:
+            return None
+        return self._actor_handlers[self._elastic_actor_rank]
+    
+    def get_non_elastic_actors(self):
+        """Get all non-elastic actor handlers"""
+        if self._elastic_actor_rank is None:
+            return self._actor_handlers
+        return [actor for i, actor in enumerate(self._actor_handlers) if i != self._elastic_actor_rank]

@@ -76,6 +76,35 @@ class GenerateState(metaclass=SingletonMeta):
         self.pendings = set()
         self.aborted = False
         self.worker_shutdown = False
+    
+    def get_progress(self) -> dict:
+        """Get current rollout progress for elastic actor switching decisions"""
+        return {
+            'work_queue_size': self.work_queue.qsize(),
+            'pending_tasks': len(self.pendings),
+            'remaining_batch_size': self.remaining_batch_size,
+            'aborted': self.aborted,
+        }
+    
+    @classmethod
+    def get_current_progress_safe(cls) -> dict:
+        """Class method to safely get progress even if no rollout is active"""
+        try:
+            # If singleton exists, get its progress
+            instance = cls._instances.get(cls, None)
+            if instance is not None:
+                return {**instance.get_progress(), 'active': True}
+        except:
+            pass
+        
+        # No active rollout
+        return {
+            'work_queue_size': 0,
+            'pending_tasks': 0,
+            'remaining_batch_size': 0,
+            'aborted': False,
+            'active': False,
+        }
 
     async def _worker_loop(self, worker_id: int) -> None:
         """Worker coroutine that pulls tasks from the work queue and processes them."""

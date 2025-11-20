@@ -104,6 +104,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This will always be true when --colocate is set."
                 ),
             )
+            parser.add_argument(
+                "--enable-elastic",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable elastic actor mode. Converts one training actor into an elastic actor "
+                    "that can switch between training and inference modes based on workload. "
+                    "This improves GPU utilization by having the elastic actor help with rollouts "
+                    "during inference phase and participate in training during training phase. "
+                    "Requires at least 2 training actors (actor-num-gpus-per-node >= 2). "
+                    "Currently only supports PP=1 (no pipeline parallelism)."
+                ),
+            )
 
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)

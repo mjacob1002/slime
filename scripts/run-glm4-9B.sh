@@ -14,6 +14,7 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
+export CUDA_VISIBLE_DEVICES="4,2,6"
 export RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING=1
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
@@ -26,6 +27,21 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/models/glm4-9B.sh"
+
+# ============================================================================
+# GPU Configuration - Modify these for your experiments
+# ============================================================================
+NUM_TRAINING_GPUS=2      # Number of GPUs for training actors (DP size)
+NUM_INFERENCE_GPUS=1     # Number of GPUs for inference engines
+
+# Common configurations:
+# - Standard (3 GPUs):     NUM_TRAINING_GPUS=2, NUM_INFERENCE_GPUS=1
+# - Elastic (3 GPUs):      NUM_TRAINING_GPUS=2, NUM_INFERENCE_GPUS=1, --enable-elastic
+# - Training-heavy (4 GPUs): NUM_TRAINING_GPUS=3, NUM_INFERENCE_GPUS=1
+# - Inference-heavy (4 GPUs): NUM_TRAINING_GPUS=2, NUM_INFERENCE_GPUS=2
+# 
+# Note: Elastic mode requires NUM_TRAINING_GPUS >= 2 and PP=1
+# ============================================================================
 
 CKPT_ARGS=(
    --hf-checkpoint /root/GLM-Z1-9B-0414/
@@ -65,7 +81,7 @@ EVAL_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 1
    --sequence-parallel
-   --pipeline-model-parallel-size 2
+   --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
@@ -120,9 +136,17 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+# ELASTIC MODE: Enables dynamic GPU switching between training and inference
+# Uncomment to enable elastic actor that helps with both rollouts and training
+ELASTIC_ARGS=(
+    --enable-elastic
+)
+
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+TOTAL_GPUS=$((NUM_TRAINING_GPUS + NUM_INFERENCE_GPUS))
+echo "Launching Ray with ${TOTAL_GPUS} GPUs (${NUM_TRAINING_GPUS} training + ${NUM_INFERENCE_GPUS} inference)"
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${TOTAL_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -137,8 +161,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train_async.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 2\
-   --rollout-num-gpus 1\
+   --actor-num-gpus-per-node ${NUM_TRAINING_GPUS} \
+   --rollout-num-gpus ${NUM_INFERENCE_GPUS} \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
@@ -148,5 +172,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]}
+   ${MISC_ARGS[@]} \
+   ${ELASTIC_ARGS[@]}
 

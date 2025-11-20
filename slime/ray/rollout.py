@@ -72,6 +72,11 @@ class RolloutManager:
     def dispose(self):
         if self._metric_checker is not None:
             self._metric_checker.dispose()
+    
+    def get_rollout_progress(self) -> dict:
+        """Get current rollout progress for elastic actor switching decisions"""
+        from slime.rollout.sglang_rollout import GenerateState
+        return GenerateState.get_current_progress_safe()
 
     # TODO maybe rename "rollout_engines" and "all_rollout_engines" later
     @property
