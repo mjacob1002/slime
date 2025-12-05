@@ -83,7 +83,7 @@ class SGLangEngine(RayActor):
         self.args = args
         self.rank = rank
 
-    def init(self, dist_init_addr, port, nccl_port, host=None):
+    def init(self, dist_init_addr, port, nccl_port, host=None, base_gpu_id_override=None):
         self.router_ip = self.args.sglang_router_ip
         self.router_port = self.args.sglang_router_port
 
@@ -91,6 +91,11 @@ class SGLangEngine(RayActor):
         server_args_dict, external_engine_need_check_fields = _compute_server_args(
             self.args, self.rank, dist_init_addr, nccl_port, host, port
         )
+        
+        # Override base_gpu_id if provided (used by elastic actor)
+        if base_gpu_id_override is not None:
+            print(f"[SGLangEngine] Overriding base_gpu_id from {server_args_dict['base_gpu_id']} to {base_gpu_id_override}")
+            server_args_dict['base_gpu_id'] = base_gpu_id_override
 
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]

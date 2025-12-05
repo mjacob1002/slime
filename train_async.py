@@ -18,10 +18,13 @@ def coordinate_elastic_actor(actor_model, rollout_manager, rollout_id):
     """
     Coordinate elastic actor during training.
     Check if training finishes early and elastic actor should switch to help with rollout.
+    
+    Returns:
+        (switched: bool, engine_url: str or None)
     """
     elastic_actor = actor_model.get_elastic_actor()
     if elastic_actor is None:
-        return False  # No elastic actor
+        return False, None  # No elastic actor
     
     # Get current rollout progress
     progress = ray.get(rollout_manager.get_rollout_progress.remote())
@@ -41,12 +44,12 @@ def coordinate_elastic_actor(actor_model, rollout_manager, rollout_id):
             ray.get(rollout_manager.register_elastic_engine.remote(engine_url))
             logger.info(f"[Elastic Coordinator] Elastic actor switched to inference: {engine_url}")
             
-            return True
+            return True, engine_url
         except Exception as e:
             logger.error(f"[Elastic Coordinator] Failed to switch elastic actor: {e}")
-            return False
+            return False, None
     
-    return False
+    return False, None
 
 
 def train(args):
@@ -134,20 +137,30 @@ def train(args):
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
 
         # ELASTIC MODE: Switch elastic actor to training before starting training
-        if use_elastic and rollout_id > args.start_rollout_id:
+        if use_elastic:
             logger.info(f"[Elastic] Switching elastic actor to TRAINING mode for rollout {rollout_id}")
             elastic_actor = actor_model.get_elastic_actor()
+            
+            # Unregister from router if currently in inference mode
+            if elastic_engine_url:
+                ray.get(rollout_manager.unregister_elastic_engine.remote(elastic_engine_url))
+            
+            # Switch to training mode
             ray.get(elastic_actor.switch_to_training.remote(
                 role='actor',
                 with_ref=args.kl_coef != 0 or args.use_kl_loss
             ))
+            
+            # Sync weights from rank 0 to elastic actor
+            logger.info(f"[Elastic] Syncing weights from rank 0 to elastic actor")
+            actor_model.update_weights()
 
-        # Start the next rollout early (if not using elastic mode)
-        # In elastic mode, we do sequential execution to simplify coordination
-        if not use_elastic:
-            if rollout_id + 1 < args.num_rollout:
-                logger.info(f"Starting rollout {rollout_id + 1}")
-                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+        # Start the next rollout early (async overlap)
+        if rollout_id + 1 < args.num_rollout:
+            logger.info(f"Starting rollout {rollout_id + 1}")
+            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+        else:
+            rollout_data_next_future = None
 
         # Training phase
         if args.use_critic:
@@ -161,13 +174,14 @@ def train(args):
                     ray.get(train_handle)
                     
                     # Check if we should switch elastic actor to help with ongoing rollout
-                    # (only relevant if rollout is still running)
+                    # (only relevant if next rollout is running and has work)
                     if rollout_data_next_future is not None:
-                        switched = coordinate_elastic_actor(
-                            actor_model, rollout_manager, rollout_id
+                        switched, engine_url = coordinate_elastic_actor(
+                            actor_model, rollout_manager, rollout_id + 1
                         )
                         if switched:
-                            logger.info("[Elastic] Elastic actor is now helping with rollout")
+                            logger.info(f"[Elastic] Elastic actor is now helping with rollout {rollout_id + 1}")
+                            elastic_engine_url = engine_url  # Store for later unregistration
                 else:
                     ray.get(train_handle)
                     
@@ -181,24 +195,16 @@ def train(args):
                 ray.get(train_handle)
                 
                 # Check if we should switch elastic actor to help with ongoing rollout
+                # (only relevant if next rollout is running and has work)
                 if rollout_data_next_future is not None:
-                    switched = coordinate_elastic_actor(
-                        actor_model, rollout_manager, rollout_id
+                    switched, engine_url = coordinate_elastic_actor(
+                        actor_model, rollout_manager, rollout_id + 1
                     )
                     if switched:
-                        logger.info("[Elastic] Elastic actor is now helping with rollout")
+                        logger.info(f"[Elastic] Elastic actor is now helping with rollout {rollout_id + 1}")
+                        elastic_engine_url = engine_url  # Store for later unregistration
             else:
                 ray.get(train_handle)
-
-        # ELASTIC MODE: Start next rollout after training completes
-        if use_elastic:
-            if rollout_id + 1 < args.num_rollout:
-                logger.info(f"[Elastic] Switching elastic actor to INFERENCE mode")
-                elastic_actor = actor_model.get_elastic_actor()
-                ray.get(elastic_actor.switch_to_inference.remote())
-                
-                logger.info(f"Starting rollout {rollout_id + 1}")
-                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
         if args.save_interval is not None and (
             (rollout_id + 1) % args.save_interval == 0
