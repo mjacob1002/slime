@@ -30,13 +30,16 @@ def train(args):
 
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
+    # time the rollout that will be used for training
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        print(f"Inside rollout {rollout_id}")
         # Sync the last generation
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
 
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
+            print(f"Launching async rollout {rollout_id + 1}")
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
         if args.use_critic:
@@ -45,7 +48,11 @@ def train(args):
                 ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
             ray.get(critic_train_handle)
         else:
+            print(f"Training on data from rollout {rollout_id}")
+            # time this training section
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            print(f"Finished training on data from rollout {rollout_id}")
+
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             actor_model.save_model(
@@ -64,6 +71,7 @@ def train(args):
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
+            print(f"Updating eights in rollout {rollout_id + 1}")
             actor_model.update_weights()
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
