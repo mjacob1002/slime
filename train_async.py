@@ -1,3 +1,5 @@
+import time
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
@@ -29,19 +31,23 @@ def train(args):
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
     # async train loop.
+    rollout_start_time = time.time()
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
-    # time the rollout that will be used for training
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         print(f"Inside rollout {rollout_id}")
         # Sync the last generation
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
+            rollout_elapsed = time.time() - rollout_start_time
+            print(f"Rollout {rollout_id} took {rollout_elapsed:.2f}s")
 
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
             print(f"Launching async rollout {rollout_id + 1}")
+            rollout_start_time = time.time()
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
+        train_start_time = time.time()
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if rollout_id >= args.num_critic_only_steps:
@@ -49,9 +55,10 @@ def train(args):
             ray.get(critic_train_handle)
         else:
             print(f"Training on data from rollout {rollout_id}")
-            # time this training section
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
             print(f"Finished training on data from rollout {rollout_id}")
+        train_elapsed = time.time() - train_start_time
+        print(f"Training on rollout {rollout_id} took {train_elapsed:.2f}s")
 
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
