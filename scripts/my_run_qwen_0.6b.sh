@@ -14,10 +14,12 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,5,6,7
 TRAINING_GPU=1
 INFERENCE_GPU=1
 TOTAL_GPUS=$((TRAINING_GPU + INFERENCE_GPU))
+# need to include this bottom part to allow for elasticity
+TOTAL_GPUS=4
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -49,7 +51,7 @@ ROLLOUT_ARGS=(
    --num-rollout 5
    --rollout-batch-size 32 
    --n-samples-per-prompt 8
-   --rollout-max-response-len 32384 
+   --rollout-max-response-len 8092 
    --rollout-temperature 0.8
    --global-batch-size 256
    --balance-data
@@ -124,7 +126,7 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus $TOTAL_GPUS --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir /root/slime/logs
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus $TOTAL_GPUS --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir /workspace/slime/logs
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -139,7 +141,7 @@ RUNTIME_ENV_JSON="{
 # SGLang takes care of the inference side
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train_async.py \
+   -- python3 train_async_with_dynamic_adiding_exp.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node $TRAINING_GPU \
    --rollout-num-gpus $INFERENCE_GPU \

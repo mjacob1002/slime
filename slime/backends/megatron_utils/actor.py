@@ -99,6 +99,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         start_rollout_id = loaded_rollout_id + 1
 
+        # Print checkpoint status
+        if loaded_rollout_id == 0:
+            print(f"[slime] Starting fresh run (no previous checkpoint found), beginning at rollout 0")
+        else:
+            print(f"[slime] Resuming from previous checkpoint at iteration {loaded_rollout_id}, starting at rollout {start_rollout_id}")
+
         self.weights_backuper = TensorBackuper.create(
             source_getter=lambda: named_params_and_buffers(
                 self.args,

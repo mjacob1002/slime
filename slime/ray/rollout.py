@@ -8,7 +8,9 @@ from typing import Any
 
 import numpy as np
 import ray
+import requests
 import torch
+from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
@@ -138,6 +140,36 @@ class RolloutManager:
 
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
+
+    def get_state_for_dynamic_engines(self):
+        """Return state needed for dynamic engine addition."""
+        return {
+            "args": self.args,
+            "num_engines": len(self.all_rollout_engines),
+            "nodes_per_engine": self.nodes_per_engine,
+        }
+
+    def get_placement_group_info(self):
+        """Return placement group and current engine info for dynamic scaling."""
+        return {
+            "pg": self.pg,
+            "args": self.args,
+            "num_engines": len(self.all_rollout_engines),
+            "nodes_per_engine": self.nodes_per_engine,
+        }
+
+    def extend_engines(self, new_engines: list):
+        """Extend all_rollout_engines with newly created engines."""
+        self.all_rollout_engines.extend(new_engines)
+        return len(self.all_rollout_engines)
+
+    def pop_engines(self, count: int):
+        """Remove and return the last `count` engines from all_rollout_engines."""
+        if count > len(self.all_rollout_engines):
+            raise ValueError(f"Cannot remove {count} engines, only {len(self.all_rollout_engines)} available")
+        removed = self.all_rollout_engines[-count:]
+        self.all_rollout_engines = self.all_rollout_engines[:-count]
+        return removed
 
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
@@ -743,3 +775,330 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
+
+def add_inference_engines(rollout_manager, engine_addrs: list[str]) -> int:
+    """
+    Dynamically add external SGLang inference engines to the rollout manager.
+
+    Args:
+        rollout_manager: The RolloutManager Ray actor
+        engine_addrs: List of "host:port" addresses for external SGLang servers
+
+    Returns:
+        Number of engines successfully added
+    """
+    # 1. Get current state
+    state = ray.get(rollout_manager.get_state_for_dynamic_engines.remote())
+    args = state["args"]
+    start_rank = state["num_engines"]
+
+    # 2. Validate external mode
+    if not args.rollout_external:
+        raise ValueError("add_inference_engines only supports external engines (rollout_external=True)")
+
+    # 3. Create SGLangEngine actors
+    RolloutRayActor = ray.remote(SGLangEngine)
+    new_engines = []
+
+    for i, addr in enumerate(engine_addrs):
+        rank = start_rank + i
+        engine = RolloutRayActor.options(
+            num_cpus=0.2,
+            num_gpus=0,  # No GPU needed for external mode
+        ).remote(args, rank=rank, worker_type="regular")
+        new_engines.append(engine)
+
+    # 4. Initialize engines with their addresses
+    init_handles = []
+    for engine, addr in zip(new_engines, engine_addrs):
+        host, port = addr.split(":")
+        init_handles.append(
+            engine.init.remote(
+                dist_init_addr=addr,
+                nccl_port=None,
+                host=host,
+                port=int(port),
+            )
+        )
+    ray.get(init_handles)
+
+    # 5. Register engines with router
+    if args.sglang_router_ip and args.sglang_router_port:
+        for addr in engine_addrs:
+            host, port = addr.split(":")
+            worker_url = f"http://{host}:{port}"
+            response = requests.post(
+                f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers",
+                json={"url": worker_url, "worker_type": "regular"},
+            )
+            response.raise_for_status()
+
+    # 6. Extend RolloutManager's engine list
+    ray.get(rollout_manager.extend_engines.remote(new_engines))
+
+    return len(new_engines)
+
+
+def remove_inference_engines(rollout_manager, count: int) -> int:
+    """
+    Dynamically remove external SGLang inference engines from the rollout manager.
+
+    Removes the last `count` engines that were added. Engines are unregistered
+    from the router and the Ray actors are killed.
+
+    Args:
+        rollout_manager: The RolloutManager Ray actor
+        count: Number of engines to remove (removes from the end of the list)
+
+    Returns:
+        Number of engines successfully removed
+    """
+    # 1. Get current state
+    state = ray.get(rollout_manager.get_state_for_dynamic_engines.remote())
+    args = state["args"]
+
+    # 2. Validate external mode
+    if not args.rollout_external:
+        raise ValueError("remove_inference_engines only supports external engines (rollout_external=True)")
+
+    # 3. Pop engines from RolloutManager
+    removed_engines = ray.get(rollout_manager.pop_engines.remote(count))
+
+    # 4. Get engine addresses and unregister from router
+    if args.sglang_router_ip and args.sglang_router_port:
+        for engine in removed_engines:
+            try:
+                # Get engine's server address
+                host = ray.get(engine.get_server_host.remote())
+                port = ray.get(engine.get_server_port.remote())
+                worker_url = f"http://{host}:{port}"
+
+                # Unregister from router
+                try:
+                    all_workers = requests.get(
+                        f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers"
+                    ).json()["workers"]
+                    for worker in all_workers:
+                        if worker["url"] == worker_url:
+                            worker_id = worker["id"]
+                            response = requests.delete(
+                                f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers/{worker_id}"
+                            )
+                            response.raise_for_status()
+                            break
+                except Exception as e:
+                    logger.warning(f"Failed to unregister worker {worker_url} from router: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to get engine address for unregistration: {e}")
+
+    # 5. Kill the Ray actors
+    for engine in removed_engines:
+        try:
+            ray.kill(engine)
+        except Exception as e:
+            logger.warning(f"Failed to kill engine actor: {e}")
+
+    return len(removed_engines)
+
+
+def _allocate_ports_for_dynamic_engines(args, engines_with_ranks: list[tuple[int, any]]) -> dict:
+    """
+    Allocate ports for dynamically added engines.
+
+    Args:
+        args: Configuration arguments
+        engines_with_ranks: List of (rank, engine_actor) tuples
+
+    Returns:
+        Dict mapping rank -> {host, port, nccl_port, dist_init_addr}
+    """
+    addr_and_ports = {}
+    start_port = 15000  # Shared across engines to avoid port conflicts
+
+    for rank, engine in engines_with_ranks:
+        # Get host and free consecutive ports from the engine's node
+        def get_port(consecutive=1):
+            nonlocal start_port
+            _, port = ray.get(
+                engine._get_current_node_ip_and_free_port.remote(
+                    start_port=start_port,
+                    consecutive=consecutive,
+                )
+            )
+            start_port = port + consecutive
+            return port
+
+        def get_host():
+            host, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
+            return host
+
+        host = get_host()
+        server_port = get_port()
+        nccl_port = get_port()
+        dist_init_port = get_port(30 + args.sglang_dp_size)
+
+        addr_and_ports[rank] = {
+            "host": host,
+            "port": server_port,
+            "nccl_port": nccl_port,
+            "dist_init_addr": f"{host}:{dist_init_port}",
+        }
+
+    return addr_and_ports
+
+
+def add_engines_internal(rollout_manager, num_engines: int) -> list:
+    """
+    Dynamically add new SGLang engines using the same configuration as existing engines.
+
+    This function creates new Ray-managed engines that launch SGLang server processes.
+    GPUs are allocated via Ray, using a new placement group for the additional engines.
+
+    Args:
+        rollout_manager: The RolloutManager Ray actor
+        num_engines: Number of engines to add
+
+    Returns:
+        List of Ray actor references for the new engines
+    """
+    # Lazy import to avoid circular dependency
+    from slime.ray.placement_group import InfoActor, sort_key
+
+    # Get current state from RolloutManager
+    state = ray.get(rollout_manager.get_placement_group_info.remote())
+    print(f"Got the current state from the rollout manager.")
+    args = state["args"]
+    start_rank = state["num_engines"]
+
+    # Calculate GPUs needed per engine
+    num_gpus_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
+    total_gpus_needed = num_engines * num_gpus_per_engine
+
+    # Create a new placement group for the additional engines
+    bundles = [{"GPU": 1, "CPU": 1} for _ in range(total_gpus_needed)]
+    print("about to enter the placement_group function from Ray in order to get the placement groups")
+    new_pg = placement_group(bundles, strategy="PACK")
+    print("got the new placement group return call. About to try and get when new_pg is ready")
+    ray.get(new_pg.ready())
+    print(f"new_pg is ready!")
+
+    # Query GPU IDs from the new placement group (reuse InfoActor pattern)
+    info_actors = [
+        InfoActor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=new_pg,
+                placement_group_bundle_index=i,
+            )
+        ).remote()
+        for i in range(total_gpus_needed)
+    ]
+    gpu_info = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+    for actor in info_actors:
+        ray.kill(actor)
+
+    # Sort bundles by node IP and GPU ID for consistent ordering
+    bundle_infos = [(i, gpu_info[i][0], gpu_info[i][1]) for i in range(total_gpus_needed)]
+    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
+    reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
+    reordered_gpu_ids = [gpu_info[info[0]][1] for info in sorted_bundle_infos]
+
+    # Prepare environment variables (same as init_rollout_engines)
+    env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
+        "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
+        "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+        "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+        "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+        "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+        "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+    }
+
+    # Create engine Ray actors
+    RolloutRayActor = ray.remote(SGLangEngine)
+    new_engines = []
+
+    for i in range(num_engines):
+        rank = start_rank + i
+        base_gpu_id = int(reordered_gpu_ids[i * num_gpus_per_engine])
+
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=new_pg,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=reordered_bundle_indices[i * num_gpus_per_engine],
+        )
+
+        engine = RolloutRayActor.options(
+            num_cpus=0.2,
+            num_gpus=0.2,
+            scheduling_strategy=scheduling_strategy,
+            runtime_env={"env_vars": env_vars},
+        ).remote(args, rank=rank, worker_type="regular", base_gpu_id=base_gpu_id)
+
+        new_engines.append((rank, engine))
+
+    # Allocate ports for new engines
+    addr_and_ports = _allocate_ports_for_dynamic_engines(args, new_engines)
+
+    # Initialize all engines
+    init_handles = [engine.init.remote(**addr_and_ports[rank]) for rank, engine in new_engines]
+    ray.get(init_handles)
+
+    # Register engines with router (required for engines to receive work)
+    if args.sglang_router_ip and args.sglang_router_port:
+        for rank, engine in new_engines:
+            host = addr_and_ports[rank]["host"]
+            port = addr_and_ports[rank]["port"]
+            worker_url = f"http://{host}:{port}"
+            response = requests.post(
+                f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers",
+                json={"url": worker_url, "worker_type": "regular"},
+            )
+            response.raise_for_status()
+            logger.info(f"Registered engine rank {rank} with router at {worker_url}")
+
+    # Extract just the engine references
+    engine_refs = [engine for _, engine in new_engines]
+
+    # Extend RolloutManager's engine list
+    ray.get(rollout_manager.extend_engines.remote(engine_refs))
+
+    logger.info(f"Successfully added {num_engines} new engines (ranks {start_rank} to {start_rank + num_engines - 1})")
+
+    return engine_refs
+
+
+def remove_engines_internal(rollout_manager, count: int) -> int:
+    """
+    Remove engines from the rollout manager.
+
+    Removes the last `count` engines, unregisters them from the router,
+    and shuts them down (terminates SGLang server processes and frees GPU memory).
+
+    Args:
+        rollout_manager: The RolloutManager Ray actor
+        count: Number of engines to remove
+
+    Returns:
+        Number of engines successfully removed
+    """
+    # Pop engines from RolloutManager
+    removed_engines = ray.get(rollout_manager.pop_engines.remote(count))
+
+    # Shutdown each engine (this unregisters from router and kills process)
+    for engine in removed_engines:
+        try:
+            ray.get(engine.shutdown.remote())
+        except Exception as e:
+            logger.warning(f"Error shutting down engine: {e}")
+
+        # Kill the Ray actor
+        try:
+            ray.kill(engine)
+        except Exception as e:
+            logger.warning(f"Failed to kill engine actor: {e}")
+
+    logger.info(f"Successfully removed {len(removed_engines)} engines")
+
+    return len(removed_engines)
