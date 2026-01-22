@@ -104,6 +104,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
 
+            # Elastic group arguments
+            parser.add_argument(
+                "--num-elastic-nodes",
+                type=int,
+                default=0,
+                help=(
+                    "Number of nodes for elastic group (0 = disabled). "
+                    "Elastic groups use separate Ray actors for training and inference on the same GPUs, "
+                    "avoiding torch_memory_saver conflicts."
+                ),
+            )
+            parser.add_argument(
+                "--num-elastic-gpus-per-node",
+                type=int,
+                default=None,
+                help=(
+                    "GPUs per node for elastic group (defaults to num_gpus_per_node). "
+                    "Each GPU runs both a training actor (0.4 GPU) and inference engine (0.2 GPU)."
+                ),
+            )
+
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)
 
@@ -1397,14 +1418,52 @@ def parse_args(add_custom_arguments=None):
             hf_validate_args(args, hf_config)
 
         args.rank = 0
-        args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        # Compute world_size for Megatron initialization
+        # If we have dedicated trainers, use their world_size
+        # If we only have elastic actors, use elastic world_size for Megatron
+        dedicated_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        elastic_world_size = 0
+        if getattr(args, 'num_elastic_nodes', 0) > 0:
+            if args.num_elastic_gpus_per_node is None:
+                args.num_elastic_gpus_per_node = args.num_gpus_per_node
+            elastic_world_size = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+
+        # Store both world sizes for reference
+        args.dedicated_world_size = dedicated_world_size
+        args.elastic_world_size = elastic_world_size
+
+        # For Megatron initialization: use dedicated trainers if available, otherwise elastic
+        if dedicated_world_size > 0:
+            args.world_size = dedicated_world_size
+        elif elastic_world_size > 0:
+            args.world_size = elastic_world_size
+        else:
+            # Fallback for debug modes
+            args.world_size = max(1, dedicated_world_size)
+
         args = set_default_megatron_args(args)
     else:
         from slime.backends.fsdp_utils.arguments import load_fsdp_args
 
         args = load_fsdp_args(extra_args_provider=add_slime_arguments)
         args.rank = 0  # Primary process rank for wandb initialization
-        args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        # Compute world_size for FSDP initialization
+        dedicated_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        elastic_world_size = 0
+        if getattr(args, 'num_elastic_nodes', 0) > 0:
+            if args.num_elastic_gpus_per_node is None:
+                args.num_elastic_gpus_per_node = args.num_gpus_per_node
+            elastic_world_size = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+
+        args.dedicated_world_size = dedicated_world_size
+        args.elastic_world_size = elastic_world_size
+
+        if dedicated_world_size > 0:
+            args.world_size = dedicated_world_size
+        elif elastic_world_size > 0:
+            args.world_size = elastic_world_size
+        else:
+            args.world_size = max(1, dedicated_world_size)
 
     slime_validate_args(args)
 
@@ -1604,6 +1663,22 @@ def slime_validate_args(args):
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
             if args.use_critic:
                 args.rollout_num_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
+
+    # Elastic group validation
+    if args.num_elastic_nodes > 0:
+        if args.num_elastic_gpus_per_node is None:
+            args.num_elastic_gpus_per_node = args.num_gpus_per_node
+        # Set elastic_mode flag
+        # Note: Elastic actors handle their own offloading internally via switch_to_training()/switch_to_inference()
+        # Do NOT set offload_train/offload_rollout here - those flags control DEDICATED actors/rollout
+        args.elastic_mode = True
+        logger.info(
+            f"Elastic group enabled with {args.num_elastic_nodes} nodes x "
+            f"{args.num_elastic_gpus_per_node} GPUs/node = "
+            f"{args.num_elastic_nodes * args.num_elastic_gpus_per_node} total elastic actors"
+        )
+    else:
+        args.elastic_mode = False
 
     if args.offload_train is None:
         args.offload_train = False

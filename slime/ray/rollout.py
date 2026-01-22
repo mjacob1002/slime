@@ -46,11 +46,14 @@ class RolloutManager:
 
         self.args = args
         self.pg = pg
+        print(f"DEBUG: made it to _start_router")
         _start_router(args)
         # TODO make args immutable
+        print(f"DEBUG: made it to init_tracking: ")
         init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
+        print(f"DEBUG: made it to init_http_client")
         init_http_client(args)
-
+        print(f"DEBUG: initializing data_source and all the functions")
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
 
@@ -64,6 +67,7 @@ class RolloutManager:
             self.custom_convert_samples_to_train_data_func = load_function(
                 self.args.custom_convert_samples_to_train_data_path
             )
+        print(f"Got passed the load_function calls")
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
@@ -73,10 +77,12 @@ class RolloutManager:
             num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
             num_engines = args.rollout_num_gpus // num_gpu_per_engine
             self.all_rollout_engines = [None] * num_engines
+        print(f"About to init rollout engines...")
         self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
+        print(f"Initializing the nodes per engine")
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
+        print(f"Initializing the rollout engine lock...")
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
-
         self._metric_checker = MetricChecker.maybe_create(args)
         if self.args.use_fault_tolerance:
             self._health_monitor = RolloutHealthMonitor(self, args)

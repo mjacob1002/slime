@@ -77,9 +77,13 @@ def _create_placement_group(num_gpus):
 
 
 def create_placement_groups(args):
-    """Create placement groups for actor and rollout engines."""
+    """Create placement groups for actor, rollout engines, and elastic groups."""
 
     num_gpus = 0
+    elastic_offset = 0
+    rollout_offset = 0
+    critic_offset = 0
+
     if args.debug_train_only:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
         rollout_offset = 0
@@ -97,26 +101,42 @@ def create_placement_groups(args):
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
     else:
         # might need to store this somewhere and increment it when we add the number of rollout gpus
-        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node + args.rollout_num_gpus
+        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node + (args.rollout_num_gpus or 0)
         rollout_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
         if args.use_critic:
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
             rollout_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
 
-    logger.info(f"Creating placement group with {num_gpus} GPUs...")
-    pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
+    # Add elastic GPUs to the total
+    elastic_num_gpus = 0
+    if getattr(args, 'num_elastic_nodes', 0) > 0:
+        elastic_num_gpus = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+        elastic_offset = num_gpus  # Elastic starts after other groups
+        num_gpus += elastic_num_gpus
+        logger.info(f"Adding {elastic_num_gpus} GPUs for elastic group (offset={elastic_offset})")
 
-    rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
-    rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
+    logger.info(f"Creating placement group with {num_gpus} GPUs...")
+    pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids = _create_placement_group(num_gpus)
+
+    rollout_pg_reordered_bundle_indices = pg_reordered_bundle_indices[rollout_offset:]
+    rollout_pg_reordered_gpu_ids = pg_reordered_gpu_ids[rollout_offset:]
     if args.use_critic:
-        critic_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[critic_offset:]
-        critic_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[critic_offset:]
+        critic_pg_reordered_bundle_indices = pg_reordered_bundle_indices[critic_offset:]
+        critic_pg_reordered_gpu_ids = pg_reordered_gpu_ids[critic_offset:]
+
+    # Slice bundle indices for elastic group
+    elastic_pg = None
+    if elastic_num_gpus > 0:
+        elastic_bundle_indices = pg_reordered_bundle_indices[elastic_offset:elastic_offset + elastic_num_gpus]
+        elastic_gpu_ids = pg_reordered_gpu_ids[elastic_offset:elastic_offset + elastic_num_gpus]
+        elastic_pg = (pg, elastic_bundle_indices, elastic_gpu_ids)
 
     return {
-        "actor": (pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids),
+        "actor": (pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids),
         "critic": (pg, critic_pg_reordered_bundle_indices, critic_pg_reordered_gpu_ids) if args.use_critic else None,
         "rollout": (pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
+        "elastic": elastic_pg,
     }
 
 

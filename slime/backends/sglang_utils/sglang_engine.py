@@ -181,27 +181,66 @@ class SGLangEngine(RayActor):
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
+        self.register_with_router(bootstrap_port=server_args_dict.get("disaggregation_bootstrap_port"))
 
-        if self.node_rank == 0 and self.router_ip and self.router_port:
+    def register_with_router(self, bootstrap_port: int | None = None) -> None:
+        """Register this engine with the router.
+
+        Args:
+            bootstrap_port: Optional bootstrap port for prefill workers in disaggregation mode.
+        """
+        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+            return
+
+        if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
+            assert (
+                self.worker_type == "regular"
+            ), "pd disaggregation is not supported in old router or slime router."
+            response = requests.post(
+                f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
+            )
+        else:
+            payload = {
+                "url": f"http://{self.server_host}:{self.server_port}",
+                "worker_type": self.worker_type,
+            }
+            if self.worker_type == "prefill" and bootstrap_port is not None:
+                payload["bootstrap_port"] = bootstrap_port
+            response = requests.post(
+                f"http://{self.router_ip}:{self.router_port}/workers",
+                json=payload,
+            )
+        response.raise_for_status()
+        logger.info(f"Registered with router: {self.server_host}:{self.server_port}")
+
+    def deregister_from_router(self) -> None:
+        """Deregister this engine from the router."""
+        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+            return
+
+        worker_url = f"http://{self.server_host}:{self.server_port}"
+        try:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
-                assert (
-                    self.worker_type == "regular"
-                ), "pd disaggregation is not supported in old router or slime router."
                 response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
+                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}"
                 )
+            elif parse(sglang_router.__version__) < parse("0.3.0"):
+                encoded_url = quote(worker_url, safe="")
+                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{encoded_url}")
             else:
-                payload = {
-                    "url": f"http://{self.server_host}:{self.server_port}",
-                    "worker_type": self.worker_type,
-                }
-                if self.worker_type == "prefill":
-                    payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    json=payload,
-                )
+                all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
+                for worker in all_workers:
+                    if worker["url"] == worker_url:
+                        worker_id = worker["id"]
+                        response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}")
+                        break
+                else:
+                    logger.warning(f"Worker {worker_url} not found in router during deregistration")
+                    return
             response.raise_for_status()
+            logger.info(f"Deregistered from router: {worker_url}")
+        except Exception as e:
+            logger.warning(f"Failed to deregister from router: {e}")
 
     def _make_request(self, endpoint: str, payload: dict | None = None):
         """Make a POST request to the specified endpoint with the given payload.
@@ -296,33 +335,7 @@ class SGLangEngine(RayActor):
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
-        if self.node_rank == 0:
-            worker_url = f"http://{self.server_host}:{self.server_port}"
-            response = None
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
-                )
-            elif parse(sglang_router.__version__) < parse("0.3.0"):
-                worker_url = quote(worker_url, safe="")
-                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
-            else:
-                try:
-                    all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
-                    for worker in all_workers:
-                        if worker["url"] == worker_url:
-                            worker_id = worker["id"]
-                            response = requests.delete(
-                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
-                            )
-                            break
-                    else:
-                        logger.warning(f"Worker {worker_url} not found in router during shutdown.")
-                except Exception as e:
-                    logger.warning(f"Failed to fetch workers list or remove worker: {e}")
-
-            if response is not None:
-                response.raise_for_status()
+        self.deregister_from_router()
         kill_process_tree(self.process.pid)
 
     def get_weight_version(self):

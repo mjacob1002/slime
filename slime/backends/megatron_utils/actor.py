@@ -130,14 +130,38 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-        self.weight_updater = update_weight_cls(
-            self.args,
-            self.model,
-            weights_getter=lambda: self.weights_backuper.get("actor"),
-            model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
-            quantization_config=getattr(self.hf_config, "quantization_config", None),
-        )
+        # Select weight updater based on mode
+        model_name = type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name
+        quantization_config = getattr(self.hf_config, "quantization_config", None)
+
+        if getattr(self.args, 'elastic_mode', False):
+            # Elastic mode: use ElasticUpdateWeight adapter
+            from slime.backends.megatron_utils.update_weight.elastic_update_weight import ElasticUpdateWeight
+            self.weight_updater = ElasticUpdateWeight(
+                self.args,
+                self.model,
+                weights_getter=lambda: self.weights_backuper.get("actor"),
+                model_name=model_name,
+                quantization_config=quantization_config,
+            )
+        elif self.args.colocate:
+            update_weight_cls = UpdateWeightFromTensor
+            self.weight_updater = update_weight_cls(
+                self.args,
+                self.model,
+                weights_getter=lambda: self.weights_backuper.get("actor"),
+                model_name=model_name,
+                quantization_config=quantization_config,
+            )
+        else:
+            update_weight_cls = UpdateWeightFromDistributed
+            self.weight_updater = update_weight_cls(
+                self.args,
+                self.model,
+                weights_getter=lambda: self.weights_backuper.get("actor"),
+                model_name=model_name,
+                quantization_config=quantization_config,
+            )
 
         # empty cache after initialization
         clear_memory()
@@ -160,8 +184,9 @@ class MegatronTrainRayActor(TrainRayActor):
         return start_rollout_id
 
     @timer
-    def sleep(self) -> None:
-        assert self.args.offload_train
+    def sleep(self, is_elastic: bool = False) -> None:
+        if not is_elastic:
+            assert self.args.offload_train
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
@@ -172,8 +197,9 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("after offload model")
 
     @timer
-    def wake_up(self) -> None:
-        assert self.args.offload_train
+    def wake_up(self, is_elastic: bool = False) -> None:
+        if not is_elastic:
+            assert self.args.offload_train
         print_memory("before wake_up model")
 
         torch_memory_saver.resume()
@@ -518,14 +544,22 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             reload_process_groups()
 
-        rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
-        )
-        if num_new_engines > 0:
-            self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
-            dist.barrier(group=get_gloo_group())
+        # In elastic mode, weight_updater was already connected via elastic_connect_rollout_engine
+        # Skip the rollout_manager lookup
+        if getattr(self.args, 'elastic_mode', False):
+            rollout_engines = []  # Engines already connected in elastic mode
+        else:
+            rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
+                self.rollout_manager.get_rollout_engines_and_lock.remote()
+            )
+            if num_new_engines > 0:
+                self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
+                dist.barrier(group=get_gloo_group())
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+        # Use torch_memory_saver.disable() for both offload_train and elastic_mode
+        # to ensure weight update allocations stay on GPU
+        use_memory_saver = self.args.offload_train or getattr(self.args, 'elastic_mode', False)
+        with torch_memory_saver.disable() if use_memory_saver else nullcontext():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
@@ -600,3 +634,23 @@ class MegatronTrainRayActor(TrainRayActor):
             rank=0 if self.role == "actor" else 1,
             group_name=group_name,
         )
+
+    def elastic_connect_rollout_engine(
+        self,
+        engine: ActorHandle,
+        engine_lock: ActorHandle,
+    ) -> None:
+        """
+        Connect this training actor directly to its paired inference engine.
+
+        Used in elastic mode where each training actor has exactly one paired
+        inference engine on the same GPU.
+
+        Args:
+            engine: The inference engine Ray actor for this training actor.
+            engine_lock: Lock actor for coordinating weight updates.
+        """
+        if not getattr(self.args, 'elastic_mode', False):
+            raise RuntimeError("elastic_connect_rollout_engine should only be called in elastic mode")
+
+        self.weight_updater.connect_rollout_engine(engine, engine_lock)
