@@ -346,7 +346,8 @@ class RayElasticGroup:
 
         # 2. Onload inference weights only (KV cache and CUDA graphs restored after weight update)
         from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
-        self._resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        self._resume_memory_occupation()
+        #self._resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
         # ray.get([
         #     engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
         #     for engine in self._inference_engines

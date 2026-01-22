@@ -185,6 +185,8 @@ def train(args):
                 print(f"Trying to update elastic weights...")
                 elastic_group.update_weights()
                 print(f"updated elastic weights.")
+        print(f"About to switch to inference")
+        elastic_group.switch_to_inference()
 
         # Onload remaining rollout resources (for dedicated rollout)
         #onload_rollout_remaining()
