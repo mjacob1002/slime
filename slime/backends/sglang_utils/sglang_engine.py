@@ -354,9 +354,9 @@ class SGLangEngine(RayActor):
         """Return the server port."""
         return self.server_port
 
-    def release_memory_occupation(self):
+    def release_memory_occupation(self, tags: list[str] = None):
         self.flush_cache()
-        return self._make_request("release_memory_occupation")
+        return self._make_request("release_memory_occupation", {"tags": tags})
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """

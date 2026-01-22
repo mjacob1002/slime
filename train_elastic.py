@@ -145,9 +145,12 @@ def train(args):
         elif elastic_group is not None:
             # Use elastic actors for training - they switch mode internally
             # async_train returns a list of ObjectRefs
+            print(f"DEBUG: about to swtich to training in elastic group")
             elastic_group.switch_to_training()
+            print(f"DEBUG: swtiched to training in elastic group. About to begin async training")
             train_handles = elastic_group.async_train(rollout_id, rollout_data_refs)
             ray.get(train_handles)
+            print(f"DEBUG: successfully trained")
         logger.info(f"Finished training on data from rollout {rollout_id}")
 
         # Periodic save
@@ -160,11 +163,13 @@ def train(args):
                 if args.rollout_global_dataset and rollout_manager is not None:
                     ray.get(rollout_manager.save.remote(rollout_id))
             elif elastic_group is not None:
+                print(f"Trying to save model")
                 elastic_group.save_model(rollout_id, force_sync=rollout_id == args.num_rollout - 1)
+                print(f"Saved elastic model")
 
-        # Offload training and onload rollout
-        offload_train()
-        onload_rollout()
+        # # Offload training and onload rollout
+        # offload_train()
+        # onload_rollout()
 
         # Weight update - always update after each training step in elastic mode
         # For dedicated trainers, follow the update_weights_interval
@@ -177,16 +182,19 @@ def train(args):
             if use_dedicated_trainers:
                 actor_model.update_weights()
             elif elastic_group is not None:
+                print(f"Trying to update elastic weights...")
                 elastic_group.update_weights()
+                print(f"updated elastic weights.")
 
         # Onload remaining rollout resources (for dedicated rollout)
-        onload_rollout_remaining()
+        #onload_rollout_remaining()
 
         # Onload remaining inference resources (for elastic)
         # This loads KV cache + CUDA graphs AFTER weight update completes,
         # following the colocated pattern to avoid OOM
-        if elastic_group is not None and not use_dedicated_trainers and should_update_weights:
-            elastic_group.onload_inference_remaining()
+        # NOTE: commented out below to try my fix
+        # if elastic_group is not None and not use_dedicated_trainers and should_update_weights:
+        #     elastic_group.onload_inference_remaining()
 
         # Periodic eval
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):

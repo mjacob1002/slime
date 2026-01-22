@@ -16,6 +16,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
+from typing import List
+
 logger = logging.getLogger(__name__)
 
 
@@ -273,6 +275,18 @@ class RayElasticGroup:
     
     def sleep_training_actors(self):
         ray.get([actor.sleep.remote(is_elastic=True) for actor in self._training_actors]) 
+    
+    def _release_memory_occupation(self, tags: List = None):
+        if tags is None:
+            ray.get([engine.release_memory_occupation.remote() for engine in self._inference_engines])
+        else:
+            ray.get([engine.release_memory_occupation.remote(tags) for engine in self._inference_engines])
+    
+    def _resume_memory_occupation(self, tags: List = None):
+        if tags is None:
+            ray.get([engine.resume_memory_occupation.remote() for engine in self.inference_engines])
+        else:
+            ray.get([engine.resume_memory_occupation.remote(tags=tags) for engine in self.inference_engines])
 
     def switch_to_training(self):
         """
@@ -286,31 +300,32 @@ class RayElasticGroup:
             print(f"DEBUG: already in training")
             return
 
-        logger.info("Switching elastic actors to training mode")
+        print("Switching elastic actors to training mode")
 
         # DEBUG: Log GPU memory before switch
-        logger.info("=== GPU MEMORY BEFORE SWITCH TO TRAINING ===")
+        print("=== GPU MEMORY BEFORE SWITCH TO TRAINING ===")
         subprocess.run(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory", "--format=csv"])
 
         # 1. Deregister inference engines from router (so router doesn't route to them)
         ray.get([engine.deregister_from_router.remote() for engine in self._inference_engines])
 
         # 2. Offload inference engines (release GPU memory)
-        ray.get([engine.release_memory_occupation.remote() for engine in self._inference_engines])
+        #ray.get([engine.release_memory_occupation.remote() for engine in self._inference_engines])
+        self._release_memory_occupation()
 
         # DEBUG: Log GPU memory after inference offload
-        logger.info("=== GPU MEMORY AFTER INFERENCE OFFLOAD ===")
+        print("=== GPU MEMORY AFTER INFERENCE OFFLOAD ===")
         subprocess.run(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory", "--format=csv"])
 
         # 3. Onload training actors (restore from CPU)
         ray.get([actor.wake_up.remote(is_elastic=True) for actor in self._training_actors])
 
         # DEBUG: Log GPU memory after training onload
-        logger.info("=== GPU MEMORY AFTER TRAINING ONLOAD ===")
+        print("=== GPU MEMORY AFTER TRAINING ONLOAD ===")
         subprocess.run(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory", "--format=csv"])
 
         self._mode = "training"
-        logger.info("Switched to training mode")
+        print("Switched to training mode")
 
     def switch_to_inference(self):
         """
@@ -331,10 +346,11 @@ class RayElasticGroup:
 
         # 2. Onload inference weights only (KV cache and CUDA graphs restored after weight update)
         from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
-        ray.get([
-            engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
-            for engine in self._inference_engines
-        ])
+        self._resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        # ray.get([
+        #     engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        #     for engine in self._inference_engines
+        # ])
 
         # 3. Re-register inference engines with router
         ray.get([engine.register_with_router.remote() for engine in self._inference_engines])
@@ -384,22 +400,51 @@ class RayElasticGroup:
         # In elastic mode, training and inference are in separate processes with independent
         # torch_memory_saver states. The inference engine's weights are offloaded during training,
         # so we must restore them before the weight copy can succeed.
-        ray.get([
-            engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
-            for engine in self._inference_engines
-        ])
+        if self._mode == "training":
+            print(f"about to try and resume memory for the inference engine weights")
+            self._resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+            # ray.get([
+            #     engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+            #     for engine in self._inference_engines
+            # ])
+            print("onloaded the weights f the SGLang engine")
+        else:
+            # we are in inference mode, so keep the weights on but but offload the KV cache and CUDA Graph to keep Megatron on the GPU
+            if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
+                print(f"Trying to release memory of CUDA GRAPH...")
+                self._release_memory_occupation(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+                # ray.get([
+                #     engine.release_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+                #     for engine in self._inference_engines
+                # ])
+                print("Successfully released the CUDA graph")
+            print(f"Trying to release the KVCache...")
+            # ray.get([
+            #     engine.release_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+            #     for engine in self._inference_engines
+            # ])
+            self._release_memory_occupation(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+            print(f"Successfully released the KVCache")
 
         # Perform weight update
+        print(f"Trying to perform the manual weight update for each training actor...")
         ray.get([actor.update_weights.remote() for actor in self._training_actors])
+        print("Performed the manual weight update for each training actor")
 
         # ALWAYS sleep training actors after weight update in elastic mode
         # This ensures GPU memory is free for KV cache loading regardless of offload_train setting
         # In elastic mode, training and inference share the same GPU in separate processes,
         # so training MUST be sleeping before onload_inference_remaining() loads KV cache
-        ray.get([actor.sleep.remote(is_elastic=True) for actor in self._training_actors])
+        if self._mode == "inference":
+            ray.get([actor.sleep.remote(is_elastic=True) for actor in self._training_actors])
+            self.onload_inference_remaining()
+        else:
+            # the mode was training, we need to offload the weights
+            self._release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+            #ray.get([engine.release_memory_occupation.remote(tags=[GPU_EMORY_TYPE_WEIGHTS]) for engine in self.inference_engines])
 
         # Update mode to reflect actual state - training actors are now sleeping
-        self._mode = "inference"
+        #self._mode = "inference"
 
         logger.info("Weight update completed for elastic actors")
 
