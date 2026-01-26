@@ -98,7 +98,8 @@ def execute_train(
     before_ray_job_submit=None,
     extra_env_vars=None,
     config: ExecuteTrainConfig | None = None,
-):
+    capture_output: bool = False,
+) -> str | None:
     if extra_env_vars is None:
         extra_env_vars = {}
     if config is None:
@@ -174,15 +175,18 @@ def execute_train(
             if megatron_model_type is not None
             else ""
         )
-        exec_command(
+        output = exec_command(
             f"export no_proxy=127.0.0.1 && export PYTHONBUFFERED=16 && "
             f"{cmd_megatron_model_source}"
             f'ray job submit --address="http://127.0.0.1:8265" '
             f"--runtime-env-json='{runtime_env_json}' "
             f"-- python3 {train_script} "
             f"{'${MODEL_ARGS[@]}' if megatron_model_type is not None else ''} "
-            f"{train_args}"
+            f"{train_args}",
+            capture_output=capture_output,
         )
+        return output
+    return None
 
 
 def _parse_extra_env_vars(text: str):
