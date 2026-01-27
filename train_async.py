@@ -32,6 +32,7 @@ def train(args):
 
     # async train loop.
     rollout_start_time = time.time()
+    total_train_start_time = time.time()
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         print(f"Inside rollout {rollout_id}")
@@ -83,7 +84,9 @@ def train(args):
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
-
+    total_train_end_time = time.time()
+    train_time = total_train_end_time - total_train_start_time
+    print(f"Total training time: {train_time}")
     ray.get(rollout_manager.dispose.remote())
 
 
