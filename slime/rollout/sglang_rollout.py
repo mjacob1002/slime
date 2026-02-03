@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import logging
+import time
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -214,6 +215,7 @@ async def generate_and_rm(
             return sample
 
         with state.dp_rank_context() as _:
+            gen_start = time.perf_counter()
             if args.custom_generate_function_path is not None:
                 custom_generate_func = load_function(args.custom_generate_function_path)
                 # if signature has evaluation, pass evaluation
@@ -223,6 +225,7 @@ async def generate_and_rm(
                     sample = await custom_generate_func(args, sample, sampling_params)
             else:
                 sample = await generate(args, sample, sampling_params)
+            sample.generation_latency = time.perf_counter() - gen_start
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:

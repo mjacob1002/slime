@@ -194,8 +194,6 @@ class RayElasticGroup:
         # Initialize inference engines
         self._init_inference_engines()
 
-
-
         # Training actors start in offloaded state (sleep was called in init when offload_train=True)
         # Inference engines start loaded (ready for inference)
         self._mode = "inference"
@@ -354,7 +352,9 @@ class RayElasticGroup:
         # ])
 
         # 3. Re-register inference engines with router
+        print(f"About to register with the router...")
         ray.get([engine.register_with_router.remote() for engine in self._inference_engines])
+        print(f"Registered the inference engines with the router!")
 
         self._mode = "inference"
         logger.info("Switched to inference mode")
@@ -381,7 +381,7 @@ class RayElasticGroup:
 
         NOTE: This ONLY updates weights. KV cache + CUDA graphs should be
         loaded separately via onload_inference_remaining() - following the
-        colocated pattern in train.py.
+        colocated pattern in train.py. NOTE 2: this may be outdated now.
 
         In elastic mode (separate processes), training actors must be temporarily
         woken up to extract weights, then put back to sleep so GPU memory is free
@@ -439,6 +439,10 @@ class RayElasticGroup:
         if self._mode == "inference":
             ray.get([actor.sleep.remote(is_elastic=True) for actor in self._training_actors])
             self.onload_inference_remaining()
+            print(f"About to register with the router after updating weights...")
+            ray.get([engine.register_with_router.remote() for engine in self._inference_engines])
+            print(f"Registered the inference engines with the router after updating weights!")
+            # register the inference engines with the router
         else:
             # the mode was training, we need to offload the weights
             self._release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])

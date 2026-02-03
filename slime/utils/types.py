@@ -44,6 +44,7 @@ class Sample:
     train_metadata: dict | None = None
 
     non_generation_time: float = 0.0  # time spent in non-generation steps
+    generation_latency: float = 0.0  # time spent in generation (seconds)
 
     @dataclass
     class SpecInfo:
