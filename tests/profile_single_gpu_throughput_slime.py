@@ -65,7 +65,9 @@ def main(args, num_warmups, num_trials):
     total_tokens_list = []
 
     for i in range(num_warmups + num_trials):
-        rollout_id = 0
+        # Use iteration as rollout_id to save separate debug files per iteration
+        # when --save-debug-rollout-data is set (e.g., /tmp/debug_rollout_{rollout_id}.pt)
+        rollout_id = i
         rollout_start_time = time.time()
         # This should execute an entire global batch
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))

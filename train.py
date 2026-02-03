@@ -1,3 +1,5 @@
+import time
+
 import ray
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
@@ -61,6 +63,7 @@ def train(args):
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
+    total_train_start_time = time.time()
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             ray.get(rollout_manager.eval.remote(rollout_id))
@@ -104,6 +107,9 @@ def train(args):
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
+    total_train_end_time = time.time()
+    train_time = total_train_end_time - total_train_start_time
+    print(f"Total training time: {train_time}")
     ray.get(rollout_manager.dispose.remote())
 
 
