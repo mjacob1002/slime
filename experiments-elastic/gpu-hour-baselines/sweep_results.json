@@ -1,0 +1,568 @@
+{
+  "config": {
+    "global_batch_size": 256,
+    "num_rollouts": 3000,
+    "gpu_inference_throughput": 1.0,
+    "gpu_training_throughput": 2.5,
+    "training_to_inference_cost": 1.8,
+    "inference_to_training_cost": 3.01
+  },
+  "sync": [
+    {
+      "total_gpus": 1,
+      "total_time": 1075200.0,
+      "single_rollout_time": 358.4,
+      "gpu_hours": 298.6666666666667
+    },
+    {
+      "total_gpus": 2,
+      "total_time": 537600.0,
+      "single_rollout_time": 179.2,
+      "gpu_hours": 298.6666666666667
+    },
+    {
+      "total_gpus": 3,
+      "total_time": 358400.0,
+      "single_rollout_time": 119.46666666666667,
+      "gpu_hours": 298.6666666666667
+    },
+    {
+      "total_gpus": 4,
+      "total_time": 268800.0,
+      "single_rollout_time": 89.6,
+      "gpu_hours": 298.6666666666667
+    },
+    {
+      "total_gpus": 5,
+      "total_time": 215040.00000000003,
+      "single_rollout_time": 71.68,
+      "gpu_hours": 298.66666666666674
+    },
+    {
+      "total_gpus": 6,
+      "total_time": 179200.0,
+      "single_rollout_time": 59.733333333333334,
+      "gpu_hours": 298.6666666666667
+    },
+    {
+      "total_gpus": 7,
+      "total_time": 153600.0,
+      "single_rollout_time": 51.199999999999996,
+      "gpu_hours": 298.6666666666667
+    },
+    {
+      "total_gpus": 8,
+      "total_time": 134400.0,
+      "single_rollout_time": 44.8,
+      "gpu_hours": 298.6666666666667
+    }
+  ],
+  "elastic": [
+    {
+      "total_gpus": 2,
+      "num_dedicated_inference": 1,
+      "num_elastic": 1,
+      "total_time": 544866.8050000538,
+      "single_rollout_time": 181.60500000000002,
+      "gpu_hours": 302.70378055558547
+    },
+    {
+      "total_gpus": 2,
+      "num_dedicated_inference": 0,
+      "num_elastic": 2,
+      "total_time": 552028.2000000196,
+      "single_rollout_time": 184.01,
+      "gpu_hours": 306.6823333333442
+    },
+    {
+      "total_gpus": 3,
+      "num_dedicated_inference": 2,
+      "num_elastic": 1,
+      "total_time": 363279.67333331297,
+      "single_rollout_time": 121.07000000000001,
+      "gpu_hours": 302.7330611110942
+    },
+    {
+      "total_gpus": 3,
+      "num_dedicated_inference": 1,
+      "num_elastic": 2,
+      "total_time": 368036.87000000715,
+      "single_rollout_time": 122.67333333333335,
+      "gpu_hours": 306.6973916666727
+    },
+    {
+      "total_gpus": 3,
+      "num_dedicated_inference": 0,
+      "num_elastic": 3,
+      "total_time": 372828.200000007,
+      "single_rollout_time": 124.27666666666666,
+      "gpu_hours": 310.6901666666725
+    },
+    {
+      "total_gpus": 4,
+      "num_dedicated_inference": 3,
+      "num_elastic": 1,
+      "total_time": 321692.19999999844,
+      "single_rollout_time": 107.21000000000001,
+      "gpu_hours": 357.435777777776
+    },
+    {
+      "total_gpus": 4,
+      "num_dedicated_inference": 2,
+      "num_elastic": 2,
+      "total_time": 276041.2050000016,
+      "single_rollout_time": 92.005,
+      "gpu_hours": 306.71245000000175
+    },
+    {
+      "total_gpus": 4,
+      "num_dedicated_inference": 1,
+      "num_elastic": 3,
+      "total_time": 279630.4358333162,
+      "single_rollout_time": 93.2075,
+      "gpu_hours": 310.7004842592402
+    },
+    {
+      "total_gpus": 4,
+      "num_dedicated_inference": 0,
+      "num_elastic": 4,
+      "total_time": 283228.2000000021,
+      "single_rollout_time": 94.41,
+      "gpu_hours": 314.69800000000237
+    },
+    {
+      "total_gpus": 5,
+      "num_dedicated_inference": 4,
+      "num_elastic": 1,
+      "total_time": 321679.39999999845,
+      "single_rollout_time": 107.21000000000001,
+      "gpu_hours": 446.77694444444234
+    },
+    {
+      "total_gpus": 5,
+      "num_dedicated_inference": 3,
+      "num_elastic": 2,
+      "total_time": 220843.80600001832,
+      "single_rollout_time": 73.604,
+      "gpu_hours": 306.72750833335874
+    },
+    {
+      "total_gpus": 5,
+      "num_dedicated_inference": 2,
+      "num_elastic": 3,
+      "total_time": 223711.77733331796,
+      "single_rollout_time": 74.566,
+      "gpu_hours": 310.7108018518305
+    },
+    {
+      "total_gpus": 5,
+      "num_dedicated_inference": 1,
+      "num_elastic": 4,
+      "total_time": 226588.2819999952,
+      "single_rollout_time": 75.528,
+      "gpu_hours": 314.7059472222155
+    },
+    {
+      "total_gpus": 5,
+      "num_dedicated_inference": 0,
+      "num_elastic": 5,
+      "total_time": 229468.20000001928,
+      "single_rollout_time": 76.49000000000001,
+      "gpu_hours": 318.7058333333601
+    },
+    {
+      "total_gpus": 6,
+      "num_dedicated_inference": 5,
+      "num_elastic": 1,
+      "total_time": 321670.8666666651,
+      "single_rollout_time": 107.21000000000001,
+      "gpu_hours": 536.1181111111085
+    },
+    {
+      "total_gpus": 6,
+      "num_dedicated_inference": 4,
+      "num_elastic": 2,
+      "total_time": 184045.53999999192,
+      "single_rollout_time": 61.336666666666666,
+      "gpu_hours": 306.7425666666532
+    },
+    {
+      "total_gpus": 6,
+      "num_dedicated_inference": 3,
+      "num_elastic": 3,
+      "total_time": 186432.67166667304,
+      "single_rollout_time": 62.138333333333335,
+      "gpu_hours": 310.72111944445504
+    },
+    {
+      "total_gpus": 6,
+      "num_dedicated_inference": 2,
+      "num_elastic": 4,
+      "total_time": 188828.3366666713,
+      "single_rollout_time": 62.94,
+      "gpu_hours": 314.71389444445214
+    },
+    {
+      "total_gpus": 6,
+      "num_dedicated_inference": 1,
+      "num_elastic": 5,
+      "total_time": 191227.414999993,
+      "single_rollout_time": 63.741666666666674,
+      "gpu_hours": 318.7123583333216
+    },
+    {
+      "total_gpus": 6,
+      "num_dedicated_inference": 0,
+      "num_elastic": 6,
+      "total_time": 193628.20000000336,
+      "single_rollout_time": 64.54333333333334,
+      "gpu_hours": 322.7136666666723
+    },
+    {
+      "total_gpus": 7,
+      "num_dedicated_inference": 6,
+      "num_elastic": 1,
+      "total_time": 321664.7714285699,
+      "single_rollout_time": 107.21000000000001,
+      "gpu_hours": 625.4592777777748
+    },
+    {
+      "total_gpus": 7,
+      "num_dedicated_inference": 5,
+      "num_elastic": 2,
+      "total_time": 168064.77142857225,
+      "single_rollout_time": 56.01,
+      "gpu_hours": 326.7926111111127
+    },
+    {
+      "total_gpus": 7,
+      "num_dedicated_inference": 4,
+      "num_elastic": 3,
+      "total_time": 159804.73904760848,
+      "single_rollout_time": 53.26142857142857,
+      "gpu_hours": 310.73143703701646
+    },
+    {
+      "total_gpus": 7,
+      "num_dedicated_inference": 3,
+      "num_elastic": 4,
+      "total_time": 161856.94714285576,
+      "single_rollout_time": 53.94857142857143,
+      "gpu_hours": 314.721841666664
+    },
+    {
+      "total_gpus": 7,
+      "num_dedicated_inference": 2,
+      "num_elastic": 5,
+      "total_time": 163912.56857141884,
+      "single_rollout_time": 54.635714285714286,
+      "gpu_hours": 318.71888333331447
+    },
+    {
+      "total_gpus": 7,
+      "num_dedicated_inference": 1,
+      "num_elastic": 6,
+      "total_time": 165969.89666666216,
+      "single_rollout_time": 55.322857142857146,
+      "gpu_hours": 322.71924351850976
+    },
+    {
+      "total_gpus": 7,
+      "num_dedicated_inference": 0,
+      "num_elastic": 7,
+      "total_time": 168028.19999999864,
+      "single_rollout_time": 56.01,
+      "gpu_hours": 326.7214999999974
+    },
+    {
+      "total_gpus": 8,
+      "num_dedicated_inference": 7,
+      "num_elastic": 1,
+      "total_time": 321660.19999999844,
+      "single_rollout_time": 107.21000000000001,
+      "gpu_hours": 714.8004444444409
+    },
+    {
+      "total_gpus": 8,
+      "num_dedicated_inference": 6,
+      "num_elastic": 2,
+      "total_time": 168060.2000000008,
+      "single_rollout_time": 56.01,
+      "gpu_hours": 373.4671111111129
+    },
+    {
+      "total_gpus": 8,
+      "num_dedicated_inference": 5,
+      "num_elastic": 3,
+      "total_time": 139833.78958332867,
+      "single_rollout_time": 46.60375,
+      "gpu_hours": 310.74175462961927
+    },
+    {
+      "total_gpus": 8,
+      "num_dedicated_inference": 4,
+      "num_elastic": 4,
+      "total_time": 141628.40500000544,
+      "single_rollout_time": 47.205,
+      "gpu_hours": 314.729788888901
+    },
+    {
+      "total_gpus": 8,
+      "num_dedicated_inference": 3,
+      "num_elastic": 5,
+      "total_time": 143426.4337499957,
+      "single_rollout_time": 47.806250000000006,
+      "gpu_hours": 318.72540833332374
+    },
+    {
+      "total_gpus": 8,
+      "num_dedicated_inference": 2,
+      "num_elastic": 6,
+      "total_time": 145226.16916666878,
+      "single_rollout_time": 48.4075,
+      "gpu_hours": 322.7248203703751
+    },
+    {
+      "total_gpus": 8,
+      "num_dedicated_inference": 1,
+      "num_elastic": 7,
+      "total_time": 147026.8798214334,
+      "single_rollout_time": 49.00875,
+      "gpu_hours": 326.7263996031853
+    },
+    {
+      "total_gpus": 8,
+      "num_dedicated_inference": 0,
+      "num_elastic": 8,
+      "total_time": 148828.19999999984,
+      "single_rollout_time": 49.61,
+      "gpu_hours": 330.729333333333
+    }
+  ],
+  "one_step_overlap": [
+    {
+      "total_gpus": 2,
+      "num_inference_gpus": 1,
+      "num_training_gpus": 1,
+      "total_time": 768102.4,
+      "single_rollout_time": 256.0,
+      "gpu_hours": 426.72355555555555
+    },
+    {
+      "total_gpus": 3,
+      "num_inference_gpus": 1,
+      "num_training_gpus": 2,
+      "total_time": 768051.2,
+      "single_rollout_time": 256.0,
+      "gpu_hours": 640.0426666666666
+    },
+    {
+      "total_gpus": 3,
+      "num_inference_gpus": 2,
+      "num_training_gpus": 1,
+      "total_time": 384102.4,
+      "single_rollout_time": 128.0,
+      "gpu_hours": 320.0853333333334
+    },
+    {
+      "total_gpus": 4,
+      "num_inference_gpus": 1,
+      "num_training_gpus": 3,
+      "total_time": 768034.1333333333,
+      "single_rollout_time": 256.0,
+      "gpu_hours": 853.3712592592592
+    },
+    {
+      "total_gpus": 4,
+      "num_inference_gpus": 2,
+      "num_training_gpus": 2,
+      "total_time": 384051.2,
+      "single_rollout_time": 128.0,
+      "gpu_hours": 426.72355555555555
+    },
+    {
+      "total_gpus": 4,
+      "num_inference_gpus": 3,
+      "num_training_gpus": 1,
+      "total_time": 307285.3333333334,
+      "single_rollout_time": 102.4,
+      "gpu_hours": 341.4281481481482
+    },
+    {
+      "total_gpus": 5,
+      "num_inference_gpus": 1,
+      "num_training_gpus": 4,
+      "total_time": 768025.6,
+      "single_rollout_time": 256.0,
+      "gpu_hours": 1066.7022222222222
+    },
+    {
+      "total_gpus": 5,
+      "num_inference_gpus": 2,
+      "num_training_gpus": 3,
+      "total_time": 384034.13333333336,
+      "single_rollout_time": 128.0,
+      "gpu_hours": 533.3807407407407
+    },
+    {
+      "total_gpus": 5,
+      "num_inference_gpus": 3,
+      "num_training_gpus": 2,
+      "total_time": 256051.19999999998,
+      "single_rollout_time": 85.33333333333333,
+      "gpu_hours": 355.62666666666667
+    },
+    {
+      "total_gpus": 5,
+      "num_inference_gpus": 4,
+      "num_training_gpus": 1,
+      "total_time": 307264.00000000006,
+      "single_rollout_time": 102.4,
+      "gpu_hours": 426.75555555555565
+    },
+    {
+      "total_gpus": 6,
+      "num_inference_gpus": 1,
+      "num_training_gpus": 5,
+      "total_time": 768020.48,
+      "single_rollout_time": 256.0,
+      "gpu_hours": 1280.0341333333333
+    },
+    {
+      "total_gpus": 6,
+      "num_inference_gpus": 2,
+      "num_training_gpus": 4,
+      "total_time": 384025.6,
+      "single_rollout_time": 128.0,
+      "gpu_hours": 640.0426666666666
+    },
+    {
+      "total_gpus": 6,
+      "num_inference_gpus": 3,
+      "num_training_gpus": 3,
+      "total_time": 256034.13333333333,
+      "single_rollout_time": 85.33333333333333,
+      "gpu_hours": 426.72355555555555
+    },
+    {
+      "total_gpus": 6,
+      "num_inference_gpus": 4,
+      "num_training_gpus": 2,
+      "total_time": 192051.2,
+      "single_rollout_time": 64.0,
+      "gpu_hours": 320.0853333333334
+    },
+    {
+      "total_gpus": 6,
+      "num_inference_gpus": 5,
+      "num_training_gpus": 1,
+      "total_time": 307251.2,
+      "single_rollout_time": 102.4,
+      "gpu_hours": 512.0853333333334
+    },
+    {
+      "total_gpus": 7,
+      "num_inference_gpus": 1,
+      "num_training_gpus": 6,
+      "total_time": 768017.0666666667,
+      "single_rollout_time": 256.0,
+      "gpu_hours": 1493.3665185185187
+    },
+    {
+      "total_gpus": 7,
+      "num_inference_gpus": 2,
+      "num_training_gpus": 5,
+      "total_time": 384020.48,
+      "single_rollout_time": 128.0,
+      "gpu_hours": 746.7064888888889
+    },
+    {
+      "total_gpus": 7,
+      "num_inference_gpus": 3,
+      "num_training_gpus": 4,
+      "total_time": 256025.59999999998,
+      "single_rollout_time": 85.33333333333333,
+      "gpu_hours": 497.8275555555555
+    },
+    {
+      "total_gpus": 7,
+      "num_inference_gpus": 4,
+      "num_training_gpus": 3,
+      "total_time": 192034.13333333333,
+      "single_rollout_time": 64.0,
+      "gpu_hours": 373.3997037037037
+    },
+    {
+      "total_gpus": 7,
+      "num_inference_gpus": 5,
+      "num_training_gpus": 2,
+      "total_time": 153651.2,
+      "single_rollout_time": 51.2,
+      "gpu_hours": 298.76622222222227
+    },
+    {
+      "total_gpus": 7,
+      "num_inference_gpus": 6,
+      "num_training_gpus": 1,
+      "total_time": 307242.6666666667,
+      "single_rollout_time": 102.4,
+      "gpu_hours": 597.4162962962964
+    },
+    {
+      "total_gpus": 8,
+      "num_inference_gpus": 1,
+      "num_training_gpus": 7,
+      "total_time": 768014.6285714286,
+      "single_rollout_time": 256.0,
+      "gpu_hours": 1706.6991746031747
+    },
+    {
+      "total_gpus": 8,
+      "num_inference_gpus": 2,
+      "num_training_gpus": 6,
+      "total_time": 384017.06666666665,
+      "single_rollout_time": 128.0,
+      "gpu_hours": 853.3712592592592
+    },
+    {
+      "total_gpus": 8,
+      "num_inference_gpus": 3,
+      "num_training_gpus": 5,
+      "total_time": 256020.47999999998,
+      "single_rollout_time": 85.33333333333333,
+      "gpu_hours": 568.9344
+    },
+    {
+      "total_gpus": 8,
+      "num_inference_gpus": 4,
+      "num_training_gpus": 4,
+      "total_time": 192025.6,
+      "single_rollout_time": 64.0,
+      "gpu_hours": 426.72355555555555
+    },
+    {
+      "total_gpus": 8,
+      "num_inference_gpus": 5,
+      "num_training_gpus": 3,
+      "total_time": 153634.13333333336,
+      "single_rollout_time": 51.2,
+      "gpu_hours": 341.40918518518527
+    },
+    {
+      "total_gpus": 8,
+      "num_inference_gpus": 6,
+      "num_training_gpus": 2,
+      "total_time": 153642.6666666667,
+      "single_rollout_time": 51.2,
+      "gpu_hours": 341.4281481481482
+    },
+    {
+      "total_gpus": 8,
+      "num_inference_gpus": 7,
+      "num_training_gpus": 1,
+      "total_time": 307236.5714285715,
+      "single_rollout_time": 102.4,
+      "gpu_hours": 682.7479365079366
+    }
+  ]
+}

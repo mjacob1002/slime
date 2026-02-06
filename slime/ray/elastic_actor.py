@@ -52,6 +52,8 @@ class RayElasticGroup:
         self._mode = "inference"  # Start in inference mode
         self._weight_updaters_connected = False
         self._engine_lock = None
+        self._profiler = None
+        self._pg_info = pg  # Store for GPU ID extraction
 
         # Extract placement group info
         placement_group, reordered_bundle_indices, reordered_gpu_ids = pg
@@ -298,6 +300,11 @@ class RayElasticGroup:
             print(f"DEBUG: already in training")
             return
 
+        # Profile: log switch start
+        profile_start_time = None
+        if self._profiler:
+            profile_start_time = self._profiler.log_switch_to_training_start()
+
         print("Switching elastic actors to training mode")
 
         # DEBUG: Log GPU memory before switch
@@ -323,6 +330,11 @@ class RayElasticGroup:
         subprocess.run(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory", "--format=csv"])
 
         self._mode = "training"
+
+        # Profile: log switch end
+        if self._profiler and profile_start_time is not None:
+            self._profiler.log_switch_to_training_end(profile_start_time)
+
         print("Switched to training mode")
 
     def switch_to_inference(self):
@@ -335,6 +347,11 @@ class RayElasticGroup:
         """
         if self._mode == "inference":
             return
+
+        # Profile: log switch start
+        profile_start_time = None
+        if self._profiler:
+            profile_start_time = self._profiler.log_switch_to_inference_start()
 
         logger.info("Switching elastic actors to inference mode")
 
@@ -357,6 +374,11 @@ class RayElasticGroup:
         print(f"Registered the inference engines with the router!")
 
         self._mode = "inference"
+
+        # Profile: log switch end
+        if self._profiler and profile_start_time is not None:
+            self._profiler.log_switch_to_inference_end(profile_start_time)
+
         logger.info("Switched to inference mode")
 
     def _connect_weight_updaters(self):
@@ -388,6 +410,11 @@ class RayElasticGroup:
         for KV cache loading.
         """
         from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
+        # Profile: log weight update start
+        profile_start_time = None
+        if self._profiler:
+            profile_start_time = self._profiler.log_weight_update_start()
 
         # Connect weight updaters if not done
         self._connect_weight_updaters()
@@ -451,6 +478,10 @@ class RayElasticGroup:
         # Update mode to reflect actual state - training actors are now sleeping
         #self._mode = "inference"
 
+        # Profile: log weight update end
+        if self._profiler and profile_start_time is not None:
+            self._profiler.log_weight_update_end(profile_start_time)
+
         logger.info("Weight update completed for elastic actors")
 
     def onload_inference_remaining(self):
@@ -478,6 +509,32 @@ class RayElasticGroup:
         ])
 
         logger.info("Inference KV cache and CUDA graphs restored")
+
+    def enable_profiling(self, output_dir: str, gpu_poll_interval_ms: int = 100):
+        """Enable profiling for this elastic group."""
+        from slime.utils.elastic_profile_utils import ElasticProfiler
+        _, _, reordered_gpu_ids = self._pg_info
+        elastic_gpu_ids = [int(gid) for gid in reordered_gpu_ids]
+        self._profiler = ElasticProfiler(
+            output_dir=output_dir,
+            elastic_gpu_ids=elastic_gpu_ids,
+            enable_sglang_profiler=True,
+            enable_gpu_monitoring=True,
+            gpu_poll_interval_ms=gpu_poll_interval_ms,
+        )
+        self._profiler.start()
+        logger.info(f"Enabled elastic profiling, output_dir={output_dir}")
+
+    def disable_profiling(self):
+        """Disable profiling and save results."""
+        if self._profiler:
+            self._profiler.stop()
+            self._profiler = None
+
+    @property
+    def profiler(self):
+        """Access the profiler instance."""
+        return self._profiler
 
     def async_train(self, rollout_id: int, rollout_data_refs):
         """
