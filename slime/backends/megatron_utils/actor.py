@@ -635,6 +635,70 @@ class MegatronTrainRayActor(TrainRayActor):
             group_name=group_name,
         )
 
+    def start_chrome_profile(
+        self,
+        output_dir: str,
+        record_shapes: bool = True,
+        with_stack: bool = False,
+        profile_memory: bool = False,
+        with_flops: bool = True,
+    ) -> None:
+        """
+        Start a torch.profiler Chrome trace capture.
+
+        Creates a continuous profiler (no schedule) that records all CPU and CUDA
+        activity until stop_chrome_profile() is called. The profiler spans
+        sleep/wake cycles — during sleep, no GPU activity is recorded, producing
+        visible gaps in the trace timeline.
+
+        Args:
+            output_dir: Directory where the trace JSON will be written.
+            record_shapes: Record tensor shapes (moderate overhead).
+            with_stack: Capture Python call stacks (high overhead, large traces).
+            profile_memory: Track memory allocations (high overhead, large traces).
+            with_flops: Estimate FLOPs for matrix ops.
+        """
+        import torch.profiler
+
+        os.makedirs(output_dir, exist_ok=True)
+        self._chrome_trace_output_dir = output_dir
+        self._chrome_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=record_shapes,
+            with_stack=with_stack,
+            profile_memory=profile_memory,
+            with_flops=with_flops,
+        )
+        self._chrome_profiler.__enter__()
+        logger.info(f"Started Chrome trace profiler, output_dir={output_dir}")
+
+    def stop_chrome_profile(self) -> str:
+        """
+        Stop the Chrome trace profiler and export the trace.
+
+        Returns:
+            Path to the exported Chrome trace JSON file.
+        """
+        if not hasattr(self, '_chrome_profiler') or self._chrome_profiler is None:
+            raise RuntimeError("Chrome profiler not started — call start_chrome_profile() first")
+
+        self._chrome_profiler.__exit__(None, None, None)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        trace_path = os.path.join(
+            self._chrome_trace_output_dir,
+            f"train_actor_rank{rank}_trace.json",
+        )
+        self._chrome_profiler.export_chrome_trace(trace_path)
+        logger.info(f"Exported Chrome trace to {trace_path}")
+
+        self._chrome_profiler = None
+        self._chrome_trace_output_dir = None
+        return trace_path
+
     def elastic_connect_rollout_engine(
         self,
         engine: ActorHandle,

@@ -18,7 +18,200 @@ experiments-elastic/gpu-hour-baselines/simulation_functions_token_based.py
 (Created in slime root due to permission issues)
 """
 
+from abc import ABC, abstractmethod
+
 import numpy as np
+
+
+# =============================================================================
+# Response Length Distribution Classes
+# =============================================================================
+
+
+class ResponseLengthDistribution(ABC):
+    """Abstract base class for response length distributions."""
+
+    @abstractmethod
+    def sample(self, num_samples: int) -> np.ndarray:
+        """
+        Generate response length samples from the distribution.
+
+        Args:
+            num_samples: Number of samples to generate
+
+        Returns:
+            Array of response lengths (integers) with shape (num_samples,)
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Name of the distribution for logging/display."""
+        pass
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.name})"
+
+
+class LogNormalDistribution(ResponseLengthDistribution):
+    """
+    Log-normal distribution for response lengths.
+
+    Creates realistic long-tail distributions commonly seen in LLM outputs.
+    """
+
+    def __init__(
+        self,
+        mean_tokens: float = 10700,
+        std_tokens: float = 5000,
+        max_tokens: int = 32000,
+        seed: int | None = None,
+    ):
+        """
+        Initialize log-normal distribution.
+
+        Args:
+            mean_tokens: Desired mean of response lengths
+            std_tokens: Desired std of response lengths
+            max_tokens: Maximum response length (truncate above this)
+            seed: Random seed for reproducibility
+        """
+        self.mean_tokens = mean_tokens
+        self.std_tokens = std_tokens
+        self.max_tokens = max_tokens
+        self.seed = seed
+
+        # Pre-compute log-normal parameters
+        # For log-normal: E[X] = exp(μ + σ²/2), Var[X] = (exp(σ²) - 1) * exp(2μ + σ²)
+        variance = std_tokens ** 2
+        sigma_squared = np.log(1 + variance / (mean_tokens ** 2))
+        self._sigma = np.sqrt(sigma_squared)
+        self._mu = np.log(mean_tokens) - sigma_squared / 2
+
+    @property
+    def name(self) -> str:
+        return f"LogNormal(μ={self.mean_tokens}, σ={self.std_tokens}, max={self.max_tokens})"
+
+    def sample(self, num_samples: int) -> np.ndarray:
+        if self.seed is not None:
+            np.random.seed(self.seed)
+
+        # Generate samples from log-normal distribution
+        response_lengths = np.random.lognormal(self._mu, self._sigma, num_samples)
+
+        # Truncate at maximum
+        response_lengths = np.minimum(response_lengths, self.max_tokens)
+
+        # Convert to integers and ensure minimum of 1 token
+        response_lengths = np.maximum(response_lengths.astype(int), 1)
+
+        return response_lengths
+
+
+class UniformDistribution(ResponseLengthDistribution):
+    """Uniform distribution where all responses have the same length."""
+
+    def __init__(self, tokens: int):
+        """
+        Initialize uniform distribution.
+
+        Args:
+            tokens: Fixed token count for all samples
+        """
+        self.tokens = tokens
+
+    @property
+    def name(self) -> str:
+        return f"Uniform({self.tokens})"
+
+    def sample(self, num_samples: int) -> np.ndarray:
+        return np.full(num_samples, self.tokens, dtype=int)
+
+
+class BimodalDistribution(ResponseLengthDistribution):
+    """
+    Bimodal distribution with short and long responses.
+
+    Useful for modeling scenarios where responses are either brief or detailed.
+    """
+
+    def __init__(
+        self,
+        short_tokens: int,
+        long_tokens: int,
+        long_fraction: float = 0.5,
+        seed: int | None = None,
+    ):
+        """
+        Initialize bimodal distribution.
+
+        Args:
+            short_tokens: Token count for short responses
+            long_tokens: Token count for long responses
+            long_fraction: Fraction of samples that are long (0.0 to 1.0)
+            seed: Random seed for reproducibility
+        """
+        self.short_tokens = short_tokens
+        self.long_tokens = long_tokens
+        self.long_fraction = long_fraction
+        self.seed = seed
+
+    @property
+    def name(self) -> str:
+        return f"Bimodal(short={self.short_tokens}, long={self.long_tokens}, frac={self.long_fraction})"
+
+    def sample(self, num_samples: int) -> np.ndarray:
+        if self.seed is not None:
+            np.random.seed(self.seed)
+
+        num_long = int(num_samples * self.long_fraction)
+        num_short = num_samples - num_long
+
+        samples = np.concatenate([
+            np.full(num_short, self.short_tokens, dtype=int),
+            np.full(num_long, self.long_tokens, dtype=int),
+        ])
+
+        np.random.shuffle(samples)
+        return samples
+
+
+class UniformRangeDistribution(ResponseLengthDistribution):
+    """Uniform distribution over a range of token lengths."""
+
+    def __init__(
+        self,
+        min_tokens: int,
+        max_tokens: int,
+        seed: int | None = None,
+    ):
+        """
+        Initialize uniform range distribution.
+
+        Args:
+            min_tokens: Minimum token count
+            max_tokens: Maximum token count
+            seed: Random seed for reproducibility
+        """
+        self.min_tokens = min_tokens
+        self.max_tokens = max_tokens
+        self.seed = seed
+
+    @property
+    def name(self) -> str:
+        return f"UniformRange({self.min_tokens}-{self.max_tokens})"
+
+    def sample(self, num_samples: int) -> np.ndarray:
+        if self.seed is not None:
+            np.random.seed(self.seed)
+
+        return np.random.randint(self.min_tokens, self.max_tokens + 1, num_samples)
+
+
+# =============================================================================
+# Legacy function for backwards compatibility
+# =============================================================================
 
 
 def generate_response_length_distribution(
@@ -30,6 +223,9 @@ def generate_response_length_distribution(
 ) -> np.ndarray:
     """
     Generate response lengths from log-normal distribution.
+
+    This is a convenience function that wraps LogNormalDistribution for
+    backwards compatibility.
 
     Args:
         num_samples: Number of samples in batch (global_batch_size)
@@ -47,27 +243,13 @@ def generate_response_length_distribution(
         - Returns integer token counts
         - After truncation, actual mean may be slightly lower than target
     """
-    if seed is not None:
-        np.random.seed(seed)
-
-    # Calculate log-normal parameters from desired mean/std
-    # For log-normal: E[X] = exp(μ + σ²/2), Var[X] = (exp(σ²) - 1) * exp(2μ + σ²)
-    # Solving for μ and σ given mean and std:
-    variance = std_tokens ** 2
-    sigma_squared = np.log(1 + variance / (mean_tokens ** 2))
-    sigma = np.sqrt(sigma_squared)
-    mu = np.log(mean_tokens) - sigma_squared / 2
-
-    # Generate samples from log-normal distribution
-    response_lengths = np.random.lognormal(mu, sigma, num_samples)
-
-    # Truncate at maximum
-    response_lengths = np.minimum(response_lengths, max_tokens)
-
-    # Convert to integers and ensure minimum of 1 token
-    response_lengths = np.maximum(response_lengths.astype(int), 1)
-
-    return response_lengths
+    dist = LogNormalDistribution(
+        mean_tokens=mean_tokens,
+        std_tokens=std_tokens,
+        max_tokens=max_tokens,
+        seed=seed,
+    )
+    return dist.sample(num_samples)
 
 
 def simulate_sync_total_time_token_based(
@@ -332,6 +514,106 @@ def simulate_total_elastic_time_token_based(
     return time
 
 
+def simulate_streaming_sync_progressive_redistribution(
+    global_batch_size: int,
+    total_gpus_used: int,
+    gpu_inference_throughput: float,  # tokens/second per GPU
+    gpu_training_throughput: float,   # tokens/second per GPU
+    response_length_distribution: np.ndarray,
+    num_rollouts: int = 5,
+    single_rollout: bool = False,
+) -> float:
+    """
+    Streaming sync with progressive redistribution (timeline-based simulation).
+
+    Model streaming sync training where each GPU starts training immediately
+    after finishing inference, and redistributes training work among all GPUs
+    that have finished inference.
+
+    Timeline Example (3 GPUs):
+        t=0:    All GPUs start inference
+        t=50:   GPU_0 finishes (fewest tokens) → starts training its samples ALONE
+        t=80:   GPU_1 finishes → remaining work + GPU_1's samples redistributed
+        t=100:  GPU_2 finishes → remaining work + GPU_2's samples redistributed
+        t=???:  All training complete, gradient sync
+
+    Args:
+        global_batch_size: Total samples per batch
+        total_gpus_used: Total number of GPUs
+        gpu_inference_throughput: Tokens/second per GPU for inference
+        gpu_training_throughput: Tokens/second per GPU for training
+        response_length_distribution: Pre-generated response lengths for each sample
+        num_rollouts: Number of training iterations
+        single_rollout: If True, return time for a single rollout
+
+    Returns:
+        Total time in seconds (or single rollout time if single_rollout=True)
+
+    Algorithm:
+        1. Distribute samples round-robin and compute per-GPU tokens
+        2. Calculate per-GPU inference completion times
+        3. Sort GPUs by inference completion time
+        4. Event-driven simulation:
+           - At each inference completion event:
+             a) Compute work done by training GPUs since last event
+             b) Add new GPU's samples to the pool
+             c) Redistribute all remaining work evenly among available GPUs
+        5. After last GPU finishes inference, compute final training time
+    """
+    assert len(response_length_distribution) == global_batch_size
+
+    # 1. Distribute samples round-robin and compute per-GPU tokens
+    gpu_token_counts = np.zeros(total_gpus_used)
+    for sample_idx in range(global_batch_size):
+        gpu_idx = sample_idx % total_gpus_used
+        gpu_token_counts[gpu_idx] += response_length_distribution[sample_idx]
+
+    # 2. Calculate per-GPU inference completion times
+    inference_times = gpu_token_counts / gpu_inference_throughput
+
+    # 3. Sort GPUs by inference completion time
+    sorted_indices = np.argsort(inference_times)
+    sorted_inference_times = inference_times[sorted_indices]
+    sorted_tokens = gpu_token_counts[sorted_indices]
+
+    # 4. Event-driven simulation
+    # Track remaining training work for GPUs that have finished inference
+    # (indexed by position in sorted order, not original GPU index)
+    training_remaining = np.zeros(total_gpus_used)
+    current_time = 0.0
+
+    for i in range(total_gpus_used):
+        event_time = sorted_inference_times[i]
+        time_elapsed = event_time - current_time
+
+        # During time_elapsed, GPUs 0..i-1 (in sorted order) were training
+        # Each GPU reduces its remaining work by time_elapsed * throughput
+        if i > 0 and time_elapsed > 0:
+            work_done_per_gpu = time_elapsed * gpu_training_throughput
+            training_remaining[:i] = np.maximum(0, training_remaining[:i] - work_done_per_gpu)
+
+        # GPU i just finished inference - add its tokens to training pool
+        new_tokens = sorted_tokens[i]
+
+        # Redistribute: total remaining work split evenly among GPUs 0..i
+        total_remaining = training_remaining[:i].sum() + new_tokens
+        num_available = i + 1
+        work_per_gpu = total_remaining / num_available
+        training_remaining[:num_available] = work_per_gpu
+
+        current_time = event_time
+
+    # 5. After last GPU finishes inference, all GPUs train remaining work
+    # All GPUs have equal remaining work after final redistribution
+    final_training_time = training_remaining[0] / gpu_training_throughput
+    single_rollout_time = current_time + final_training_time
+
+    if single_rollout:
+        return single_rollout_time
+
+    return num_rollouts * single_rollout_time
+
+
 # Token-based throughput constants (example values - should be measured from profiling)
 GPU_INFERENCE_THROUGHPUT_TOKENS = 6800  # tokens/sec per GPU
 GPU_TRAINING_THROUGHPUT_TOKENS = 6800 * 2.5   # tokens/sec per GPU
@@ -354,15 +636,15 @@ if __name__ == "__main__":
     num_rollouts = 3000
     seed = 42
 
-    # Generate response length distribution
+    # Generate response length distribution using the class
     print("\n1. Generating response length distribution...")
-    dist = generate_response_length_distribution(
-        global_batch_size,
+    log_normal_dist = LogNormalDistribution(
         mean_tokens=DEFAULT_MEAN_TOKENS,
         std_tokens=DEFAULT_STD_TOKENS,
         max_tokens=DEFAULT_MAX_TOKENS,
-        seed=seed
+        seed=seed,
     )
+    dist = log_normal_dist.sample(global_batch_size)
 
     print(f"   Distribution statistics:")
     print(f"   - Mean: {dist.mean():.1f} tokens (target: {DEFAULT_MEAN_TOKENS})")
@@ -446,24 +728,47 @@ if __name__ == "__main__":
     )
     print(f"   Elastic (1 dedicated inf, 1 elastic): {elastic_time:.2f}s total, {elastic_single:.2f}s per rollout")
 
+    # Test streaming sync progressive redistribution
+    print("\n5. Testing streaming sync progressive redistribution...")
+    streaming_time = simulate_streaming_sync_progressive_redistribution(
+        global_batch_size=global_batch_size,
+        total_gpus_used=2,
+        gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+        gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+        response_length_distribution=dist,
+        num_rollouts=num_rollouts,
+    )
+    streaming_single = simulate_streaming_sync_progressive_redistribution(
+        global_batch_size=global_batch_size,
+        total_gpus_used=2,
+        gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+        gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+        response_length_distribution=dist,
+        single_rollout=True,
+    )
+    print(f"   Streaming progressive (2 GPUs): {streaming_time:.2f}s total, {streaming_single:.2f}s per rollout")
+
     # Summary comparison
     print("\n" + "=" * 80)
     print("Summary (2 GPUs, 3000 rollouts):")
     print("=" * 80)
-    print(f"Synchronous:       {sync_time:.2f}s ({sync_single:.2f}s per rollout)")
-    print(f"One-step overlap:  {overlap_time:.2f}s ({overlap_single:.2f}s per rollout)")
-    print(f"Elastic:           {elastic_time:.2f}s ({elastic_single:.2f}s per rollout)")
+    print(f"Synchronous:                {sync_time:.2f}s ({sync_single:.2f}s per rollout)")
+    print(f"One-step overlap:           {overlap_time:.2f}s ({overlap_single:.2f}s per rollout)")
+    print(f"Elastic:                    {elastic_time:.2f}s ({elastic_single:.2f}s per rollout)")
+    print(f"Streaming progressive:      {streaming_time:.2f}s ({streaming_single:.2f}s per rollout)")
     print()
     print(f"Speedup vs Sync:")
-    print(f"  One-step overlap: {sync_time/overlap_time:.2f}x")
-    print(f"  Elastic:          {sync_time/elastic_time:.2f}x")
+    print(f"  One-step overlap:       {sync_time/overlap_time:.2f}x")
+    print(f"  Elastic:                {sync_time/elastic_time:.2f}x")
+    print(f"  Streaming progressive:  {sync_time/streaming_time:.2f}x")
     print()
 
     # Test with uniform distribution as sanity check
     print("=" * 80)
     print("Sanity Check: Uniform Distribution (all samples same length)")
     print("=" * 80)
-    uniform_dist = np.full(global_batch_size, DEFAULT_MEAN_TOKENS)
+    uniform_distribution = UniformDistribution(tokens=DEFAULT_MEAN_TOKENS)
+    uniform_dist = uniform_distribution.sample(global_batch_size)
     sync_uniform = simulate_sync_total_time_token_based(
         global_batch_size=global_batch_size,
         total_gpus_used=2,
@@ -485,3 +790,102 @@ if __name__ == "__main__":
 
     dist3 = generate_response_length_distribution(global_batch_size, seed=123)
     print(f"Different seed produces different distribution: {not np.array_equal(dist1, dist3)}")
+
+    # Verification tests for streaming progressive redistribution
+    print("\n" + "=" * 80)
+    print("Streaming Progressive Redistribution Verification Tests")
+    print("=" * 80)
+
+    # Test 1: Uniform distribution - streaming progressive should equal sync
+    print("\n1. Uniform distribution test (streaming_progressive ≈ sync):")
+    uniform_sync = simulate_sync_total_time_token_based(
+        global_batch_size=global_batch_size,
+        total_gpus_used=4,
+        gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+        gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+        response_length_distribution=uniform_dist,
+        single_rollout=True,
+    )
+    uniform_streaming = simulate_streaming_sync_progressive_redistribution(
+        global_batch_size=global_batch_size,
+        total_gpus_used=4,
+        gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+        gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+        response_length_distribution=uniform_dist,
+        single_rollout=True,
+    )
+    print(f"   Sync (uniform):              {uniform_sync:.2f}s")
+    print(f"   Streaming progressive:       {uniform_streaming:.2f}s")
+    print(f"   Difference:                  {abs(uniform_sync - uniform_streaming):.4f}s")
+    # With uniform distribution, all GPUs finish inference at same time,
+    # so redistribution behavior should be similar to sync
+
+    # Test 2: Single GPU - all methods should produce identical results
+    print("\n2. Single GPU test (all methods identical):")
+    single_gpu_sync = simulate_sync_total_time_token_based(
+        global_batch_size=global_batch_size,
+        total_gpus_used=1,
+        gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+        gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+        response_length_distribution=dist,
+        single_rollout=True,
+    )
+    single_gpu_streaming = simulate_streaming_sync_progressive_redistribution(
+        global_batch_size=global_batch_size,
+        total_gpus_used=1,
+        gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+        gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+        response_length_distribution=dist,
+        single_rollout=True,
+    )
+    print(f"   Sync (1 GPU):                {single_gpu_sync:.2f}s")
+    print(f"   Streaming progressive:       {single_gpu_streaming:.2f}s")
+    print(f"   Equal: {np.isclose(single_gpu_sync, single_gpu_streaming)}")
+
+    # Test 3: High variance distribution - compare streaming vs sync
+    print("\n3. High variance distribution comparison:")
+    high_var_dist = generate_response_length_distribution(
+        global_batch_size, mean_tokens=10000, std_tokens=8000, seed=99
+    )
+    print(f"   Distribution: mean={high_var_dist.mean():.0f}, std={high_var_dist.std():.0f}")
+
+    high_var_sync = simulate_sync_total_time_token_based(
+        global_batch_size=global_batch_size,
+        total_gpus_used=4,
+        gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+        gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+        response_length_distribution=high_var_dist,
+        single_rollout=True,
+    )
+    high_var_streaming = simulate_streaming_sync_progressive_redistribution(
+        global_batch_size=global_batch_size,
+        total_gpus_used=4,
+        gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+        gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+        response_length_distribution=high_var_dist,
+        single_rollout=True,
+    )
+    print(f"   Sync:                        {high_var_sync:.2f}s")
+    print(f"   Streaming progressive:       {high_var_streaming:.2f}s")
+    print(f"   Streaming vs Sync ratio:     {high_var_streaming/high_var_sync:.3f}")
+
+    # Test 4: Multi-GPU scaling behavior
+    print("\n4. Multi-GPU scaling test:")
+    for num_gpus in [2, 4, 8]:
+        streaming_t = simulate_streaming_sync_progressive_redistribution(
+            global_batch_size=global_batch_size,
+            total_gpus_used=num_gpus,
+            gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+            gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+            response_length_distribution=dist,
+            single_rollout=True,
+        )
+        sync_t = simulate_sync_total_time_token_based(
+            global_batch_size=global_batch_size,
+            total_gpus_used=num_gpus,
+            gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+            gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+            response_length_distribution=dist,
+            single_rollout=True,
+        )
+        print(f"   {num_gpus} GPUs: Streaming={streaming_t:.2f}s, Sync={sync_t:.2f}s, Ratio={streaming_t/sync_t:.3f}")
