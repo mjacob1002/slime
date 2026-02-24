@@ -638,6 +638,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def start_chrome_profile(
         self,
         output_dir: str,
+        cycle_id: int | None = None,
         record_shapes: bool = True,
         with_stack: bool = False,
         profile_memory: bool = False,
@@ -653,6 +654,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         Args:
             output_dir: Directory where the trace JSON will be written.
+            cycle_id: Optional cycle identifier for per-cycle trace filenames.
             record_shapes: Record tensor shapes (moderate overhead).
             with_stack: Capture Python call stacks (high overhead, large traces).
             profile_memory: Track memory allocations (high overhead, large traces).
@@ -662,6 +664,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         os.makedirs(output_dir, exist_ok=True)
         self._chrome_trace_output_dir = output_dir
+        self._chrome_trace_cycle_id = cycle_id
         self._chrome_profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -673,7 +676,7 @@ class MegatronTrainRayActor(TrainRayActor):
             with_flops=with_flops,
         )
         self._chrome_profiler.__enter__()
-        logger.info(f"Started Chrome trace profiler, output_dir={output_dir}")
+        logger.info(f"Started Chrome trace profiler, output_dir={output_dir}, cycle_id={cycle_id}")
 
     def stop_chrome_profile(self) -> str:
         """
@@ -688,15 +691,21 @@ class MegatronTrainRayActor(TrainRayActor):
         self._chrome_profiler.__exit__(None, None, None)
 
         rank = dist.get_rank() if dist.is_initialized() else 0
+        cycle_id = getattr(self, '_chrome_trace_cycle_id', None)
+        if cycle_id is not None:
+            filename = f"train_actor_rank{rank}_cycle{cycle_id}_trace.json"
+        else:
+            filename = f"train_actor_rank{rank}_trace.json"
         trace_path = os.path.join(
             self._chrome_trace_output_dir,
-            f"train_actor_rank{rank}_trace.json",
+            filename,
         )
         self._chrome_profiler.export_chrome_trace(trace_path)
         logger.info(f"Exported Chrome trace to {trace_path}")
 
         self._chrome_profiler = None
         self._chrome_trace_output_dir = None
+        self._chrome_trace_cycle_id = None
         return trace_path
 
     def elastic_connect_rollout_engine(

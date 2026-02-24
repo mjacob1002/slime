@@ -260,6 +260,7 @@ def simulate_sync_total_time_token_based(
     response_length_distribution: np.ndarray,  # shape: (global_batch_size,)
     num_rollouts: int = 5,
     single_rollout: bool = False,
+    use_throughput_model: bool = False,
 ):
     """
     Simulate synchronous training with token-based accounting.
@@ -290,14 +291,21 @@ def simulate_sync_total_time_token_based(
     assert len(response_length_distribution) == global_batch_size, \
         f"Distribution size {len(response_length_distribution)} != global_batch_size {global_batch_size}"
 
-    # Distribute samples round-robin to GPUs
-    gpu_token_counts = np.zeros(total_gpus_used)
+    # Distribute samples round-robin to GPUs — collect response lengths per GPU
+    gpu_response_lengths = [[] for _ in range(total_gpus_used)]
     for sample_idx in range(global_batch_size):
         gpu_idx = sample_idx % total_gpus_used
-        gpu_token_counts[gpu_idx] += response_length_distribution[sample_idx]
+        gpu_response_lengths[gpu_idx].append(response_length_distribution[sample_idx])
 
-    # Calculate per-GPU inference time
-    per_gpu_inference_times = gpu_token_counts / gpu_inference_throughput
+    if use_throughput_model:
+        from inference_throughput_model import predict_batch_time
+        per_gpu_inference_times = np.array([
+            predict_batch_time(len(lengths), np.array(lengths))
+            for lengths in gpu_response_lengths
+        ])
+    else:
+        gpu_token_counts = np.array([sum(lengths) for lengths in gpu_response_lengths])
+        per_gpu_inference_times = gpu_token_counts / gpu_inference_throughput
 
     # Bottleneck is the GPU with most tokens
     inference_time = per_gpu_inference_times.max()
@@ -522,6 +530,7 @@ def simulate_streaming_sync_progressive_redistribution(
     response_length_distribution: np.ndarray,
     num_rollouts: int = 5,
     single_rollout: bool = False,
+    use_throughput_model: bool = False,
 ) -> float:
     """
     Streaming sync with progressive redistribution (timeline-based simulation).
@@ -545,6 +554,8 @@ def simulate_streaming_sync_progressive_redistribution(
         response_length_distribution: Pre-generated response lengths for each sample
         num_rollouts: Number of training iterations
         single_rollout: If True, return time for a single rollout
+        use_throughput_model: If True, use physics-based inference throughput model
+            (predict_batch_time) instead of constant throughput
 
     Returns:
         Total time in seconds (or single rollout time if single_rollout=True)
@@ -562,14 +573,23 @@ def simulate_streaming_sync_progressive_redistribution(
     """
     assert len(response_length_distribution) == global_batch_size
 
-    # 1. Distribute samples round-robin and compute per-GPU tokens
-    gpu_token_counts = np.zeros(total_gpus_used)
+    # 1. Distribute samples round-robin — collect response lengths per GPU
+    gpu_response_lengths = [[] for _ in range(total_gpus_used)]
     for sample_idx in range(global_batch_size):
         gpu_idx = sample_idx % total_gpus_used
-        gpu_token_counts[gpu_idx] += response_length_distribution[sample_idx]
+        gpu_response_lengths[gpu_idx].append(response_length_distribution[sample_idx])
+
+    gpu_token_counts = np.array([sum(lengths) for lengths in gpu_response_lengths])
 
     # 2. Calculate per-GPU inference completion times
-    inference_times = gpu_token_counts / gpu_inference_throughput
+    if use_throughput_model:
+        from inference_throughput_model import predict_batch_time
+        inference_times = np.array([
+            predict_batch_time(len(lengths), np.array(lengths))
+            for lengths in gpu_response_lengths
+        ])
+    else:
+        inference_times = gpu_token_counts / gpu_inference_throughput
 
     # 3. Sort GPUs by inference completion time
     sorted_indices = np.argsort(inference_times)
@@ -889,3 +909,35 @@ if __name__ == "__main__":
             single_rollout=True,
         )
         print(f"   {num_gpus} GPUs: Streaming={streaming_t:.2f}s, Sync={sync_t:.2f}s, Ratio={streaming_t/sync_t:.3f}")
+
+    # Test 5: Throughput model comparison (constant vs model-based)
+    print("\n" + "=" * 80)
+    print("Throughput Model Comparison: Constant vs Model-Based Inference Time")
+    print("=" * 80)
+    print(f"Constant throughput: {GPU_INFERENCE_THROUGHPUT_TOKENS} tok/s per GPU")
+    print(f"Model: predict_batch_time() from inference_throughput_model.py")
+    print()
+    print(f"{'GPUs':>4}  {'Constant (s)':>12}  {'Model (s)':>10}  {'Ratio':>7}  {'Note'}")
+    print("-" * 65)
+    for num_gpus in [1, 2, 4, 8]:
+        sync_constant = simulate_sync_total_time_token_based(
+            global_batch_size=global_batch_size,
+            total_gpus_used=num_gpus,
+            gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+            gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+            response_length_distribution=dist,
+            single_rollout=True,
+            use_throughput_model=False,
+        )
+        sync_model = simulate_sync_total_time_token_based(
+            global_batch_size=global_batch_size,
+            total_gpus_used=num_gpus,
+            gpu_inference_throughput=GPU_INFERENCE_THROUGHPUT_TOKENS,
+            gpu_training_throughput=GPU_TRAINING_THROUGHPUT_TOKENS,
+            response_length_distribution=dist,
+            single_rollout=True,
+            use_throughput_model=True,
+        )
+        ratio = sync_model / sync_constant
+        note = "model slower (KV cache overhead)" if ratio > 1 else "model faster"
+        print(f"{num_gpus:>4}  {sync_constant:>12.2f}  {sync_model:>10.2f}  {ratio:>6.2f}x  {note}")

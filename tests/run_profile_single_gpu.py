@@ -40,14 +40,15 @@ def run_profiling_experiment(
     # SGLang parameters
     sglang_decode_log_interval: int = 100,
     sglang_mem_fraction_static: float = 0.8,
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, str]:
     """
     Run a profiling experiment with the given parameters.
 
     Returns:
-        tuple[dict, dict]: (params, results)
+        tuple[dict, dict, str]: (params, results, raw_output)
             - params: Dictionary of experiment parameters
             - results: Dictionary of measurement results
+            - raw_output: Full raw stdout from the Ray job
     """
     # Build params dict
     params = {
@@ -122,7 +123,7 @@ def run_profiling_experiment(
     # Parse results from output
     results = _parse_profiling_results(output)
 
-    return params, results
+    return params, results, output or ""
 
 
 def _parse_profiling_results(output: str | None) -> dict:
@@ -147,6 +148,6 @@ if __name__ == "__main__":
     prepare()
     for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(proxy_var, None)
-    params, results = run_profiling_experiment()
+    params, results, _raw_output = run_profiling_experiment()
     print(f"\nParams: {json.dumps(params, indent=2)}")
     print(f"\nResults: {json.dumps(results, indent=2)}")
