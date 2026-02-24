@@ -6,10 +6,16 @@ elastic and async strategies against the sync baseline.
 """
 
 import json
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 
+_DIR = Path(__file__).parent
+_DATA = _DIR.parent / "data"
+_OUTPUT = _DIR.parent / "output"
+
 # Load results
-with open('sweep_results_token_based.json', 'r') as f:
+with open(_DATA / 'sweep_results_token_based.json', 'r') as f:
     data = json.load(f)
 
 # Create a plot for each GPU count
@@ -57,7 +63,7 @@ for total_gpus in range(2, 9):
     plt.tight_layout()
 
     # Save plot
-    output_file = f'gpu_hours_{total_gpus}gpus.png'
+    output_file = _OUTPUT / f'gpu_hours_{total_gpus}gpus.png'
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"Saved: {output_file}")
     plt.close()

@@ -9,6 +9,7 @@ allowing for more flexible resource utilization. This training loop supports:
 3. A hybrid mode with both dedicated and elastic actors
 """
 import logging
+import time
 
 import ray
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
@@ -108,6 +109,7 @@ def train(args):
             ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE]))
 
     # Training loop
+    total_train_start_time = time.time()
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         logger.info(f"Starting rollout {rollout_id}")
 
@@ -120,6 +122,7 @@ def train(args):
                 elastic_group.eval(rollout_id)
 
         # Generate rollout data
+        rollout_start_time = time.time()
         if rollout_manager is not None:
             rollout_data_refs = ray.get(rollout_manager.generate.remote(rollout_id))
         elif elastic_group is not None:
@@ -127,12 +130,15 @@ def train(args):
             rollout_data_refs = elastic_group.generate(rollout_id)
         else:
             raise RuntimeError("No rollout source available")
+        rollout_elapsed = time.time() - rollout_start_time
+        print(f"Rollout {rollout_id} took {rollout_elapsed:.2f}s")
 
         # Offload rollout engines before training
         if args.offload_rollout and rollout_manager is not None:
             ray.get(rollout_manager.offload.remote())
 
         # Train
+        train_start_time = time.time()
         logger.info(f"Training on data from rollout {rollout_id}")
         if use_dedicated_trainers:
             if args.use_critic:
@@ -151,7 +157,9 @@ def train(args):
             train_handles = elastic_group.async_train(rollout_id, rollout_data_refs)
             ray.get(train_handles)
             print(f"DEBUG: successfully trained")
+        train_elapsed = time.time() - train_start_time
         logger.info(f"Finished training on data from rollout {rollout_id}")
+        print(f"Training on rollout {rollout_id} took {train_elapsed:.2f}s")
 
         # Periodic save
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
@@ -204,6 +212,9 @@ def train(args):
                 ray.get(rollout_manager.eval.remote(rollout_id))
             elif elastic_group is not None:
                 elastic_group.eval(rollout_id)
+
+    total_train_time = time.time() - total_train_start_time
+    print(f"Total training time: {total_train_time}")
 
     # Cleanup
     if rollout_manager is not None:

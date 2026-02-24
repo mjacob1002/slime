@@ -6,10 +6,16 @@ Pareto-optimal configurations that are not dominated on both metrics.
 """
 
 import json
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 
+_DIR = Path(__file__).parent
+_DATA = _DIR.parent / "data"
+_OUTPUT = _DIR.parent / "output"
+
 # Load data
-with open('sweep_results_token_based.json', 'r') as f:
+with open(_DATA / 'sweep_results_token_based.json', 'r') as f:
     data = json.load(f)
 
 # Extract all configurations
@@ -148,8 +154,8 @@ ax.text(0.98, 0.02, config_text, transform=ax.transAxes,
        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
 
 plt.tight_layout()
-plt.savefig('pareto_frontier_analysis.png', dpi=200, bbox_inches='tight')
-print("Saved: pareto_frontier_analysis.png")
+plt.savefig(_OUTPUT / 'pareto_frontier_analysis.png', dpi=200, bbox_inches='tight')
+print(f"Saved: {_OUTPUT / 'pareto_frontier_analysis.png'}")
 
 # Print Pareto-optimal configurations
 print("\n" + "="*80)

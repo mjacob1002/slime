@@ -6,11 +6,17 @@ Helps identify patterns in resource utilization across different approaches.
 """
 
 import json
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 
+_DIR = Path(__file__).parent
+_DATA = _DIR.parent / "data"
+_OUTPUT = _DIR.parent / "output"
+
 # Load data
-with open('sweep_results_token_based.json', 'r') as f:
+with open(_DATA / 'sweep_results_token_based.json', 'r') as f:
     data = json.load(f)
 
 fig, ax = plt.subplots(figsize=(12, 8))
@@ -42,5 +48,5 @@ ax.legend(fontsize=11)
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('strategy_efficiency_comparison.png', dpi=150, bbox_inches='tight')
-print("Saved: strategy_efficiency_comparison.png")
+plt.savefig(_OUTPUT / 'strategy_efficiency_comparison.png', dpi=150, bbox_inches='tight')
+print(f"Saved: {_OUTPUT / 'strategy_efficiency_comparison.png'}")

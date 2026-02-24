@@ -207,7 +207,7 @@ for total_gpus in range(2, 9):
         print(f"Async {total_gpus} GPUs ({num_inference_gpus}i/{num_training_gpus}t): {total_time:.2f}s total, {single_rollout_time:.2f}s/rollout, {gpu_hours:.2f} GPU-hours")
 
 # Save results to JSON
-output_file = "sweep_results_token_based.json"
+output_file = "data/sweep_results_token_based.json"
 with open(output_file, 'w') as f:
     json.dump(results, f, indent=2)
 

@@ -6,10 +6,16 @@ comparing elastic and async strategies against the sync baseline.
 """
 
 import json
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 
+_DIR = Path(__file__).parent
+_DATA = _DIR.parent / "data"
+_OUTPUT = _DIR.parent / "output"
+
 # Load results
-with open('sweep_results_token_based.json', 'r') as f:
+with open(_DATA / 'sweep_results_token_based.json', 'r') as f:
     data = json.load(f)
 
 # Create subplot grid (2x4 for 7 GPU counts + 1 legend)
@@ -76,7 +82,7 @@ axes[7].text(0.1, 0.5, config_text, transform=axes[7].transAxes,
 plt.tight_layout()
 
 # Save combined plot
-output_file = 'gpu_hours_combined.png'
+output_file = _OUTPUT / 'gpu_hours_combined.png'
 plt.savefig(output_file, dpi=200, bbox_inches='tight')
 print(f"Saved: {output_file}")
 plt.close()
