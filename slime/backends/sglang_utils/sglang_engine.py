@@ -346,6 +346,10 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response.json()["weight_version"]
 
+    def get_server_info(self) -> tuple[str, int]:
+        """Return (server_host, server_port) for direct engine access."""
+        return (self.server_host, self.server_port)
+
     def get_server_host(self):
         """Return the server host address."""
         return self.server_host
