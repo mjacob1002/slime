@@ -38,6 +38,7 @@ class RayElasticGroup:
         args,
         pg: tuple[PlacementGroup, list[int], list[int]],
         rollout_manager=None,
+        streaming: bool = False,
     ) -> None:
         """
         Create paired training + inference actors on the same GPUs.
@@ -46,9 +47,11 @@ class RayElasticGroup:
             args: Arguments namespace with elastic configuration.
             pg: Tuple of (placement_group, bundle_indices, gpu_ids) for elastic actors.
             rollout_manager: Optional RolloutManager for coordinating with dedicated rollout engines.
+            streaming: If True, use StreamingMegatronTrainRayActor and lightweight sleep/wake.
         """
         self.args = args
         self._rollout_manager = rollout_manager
+        self._streaming = streaming
         self._mode = "inference"  # Start in inference mode
         self._weight_updaters_connected = False
         self._engine_lock = None
@@ -99,8 +102,12 @@ class RayElasticGroup:
 
         # Get training actor implementation
         if args.train_backend == "megatron":
-            from slime.backends.megatron_utils.actor import MegatronTrainRayActor
-            actor_impl = MegatronTrainRayActor
+            if self._streaming:
+                from slime.backends.megatron_utils.streaming_actor import StreamingMegatronTrainRayActor
+                actor_impl = StreamingMegatronTrainRayActor
+            else:
+                from slime.backends.megatron_utils.actor import MegatronTrainRayActor
+                actor_impl = MegatronTrainRayActor
         else:
             from slime.backends.fsdp_utils import FSDPTrainRayActor
             actor_impl = FSDPTrainRayActor
@@ -186,7 +193,10 @@ class RayElasticGroup:
             for actor in self._training_actors
         ])
         # for the sake of initializing the engine
-        self.sleep_training_actors()
+        if self._streaming:
+            self.sleep_training_actors_lightweight()
+        else:
+            self.sleep_training_actors()
 
         assert len(set(start_rollout_ids)) == 1, f"Inconsistent start_rollout_ids: {start_rollout_ids}"
         start_rollout_id = start_rollout_ids[0]
@@ -539,3 +549,106 @@ class RayElasticGroup:
                 "Elastic group without rollout_manager not yet supported. "
                 "Please provide a rollout_manager for evaluation."
             )
+
+    # ── Streaming synchronous training methods ──────────────────────────
+
+    def sleep_training_actors_lightweight(self):
+        """Sleep training actors using lightweight offload (NCCL stays alive)."""
+        ray.get([actor.sleep_lightweight.remote() for actor in self._training_actors])
+
+    def get_engine_urls(self) -> list[str]:
+        """Get HTTP URLs for each inference engine.
+
+        Returns:
+            List of URLs like "http://host:port" for each engine.
+        """
+        infos = ray.get([engine.get_server_info.remote() for engine in self._inference_engines])
+        return [f"http://{host}:{port}" for host, port in infos]
+
+    def switch_engine_to_training(self, engine_rank: int):
+        """Switch a single engine from inference to training mode.
+
+        Per-engine, non-collective:
+        1. Deregister engine from router
+        2. Release engine GPU memory
+        3. Wake up the paired training actor (lightweight)
+
+        Args:
+            engine_rank: Index of the engine to switch.
+        """
+        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): starting")
+        engine = self._inference_engines[engine_rank]
+        actor = self._training_actors[engine_rank]
+
+        # 1. Deregister from router so it doesn't receive new requests
+        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): deregistering from router...")
+        ray.get(engine.deregister_from_router.remote())
+
+        # 2. Release inference GPU memory
+        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): releasing memory...")
+        ray.get(engine.release_memory_occupation.remote())
+
+        # 3. Wake up training actor (non-collective, NCCL already alive)
+        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): waking up training actor...")
+        ray.get(actor.wake_up_lightweight.remote())
+
+        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): DONE")
+
+    def start_local_train(self, engine_rank: int, rollout_id: int, data_ref) -> "ray.ObjectRef":
+        """Start local forward+backward on a single training actor.
+
+        Non-blocking: returns a Ray ObjectRef (future).
+
+        Args:
+            engine_rank: Index of the training actor.
+            rollout_id: Current rollout ID.
+            data_ref: Box containing the training data reference.
+
+        Returns:
+            Ray ObjectRef for the training future.
+        """
+        logger.info(f"[ELASTIC] start_local_train(engine_rank={engine_rank}, rollout_id={rollout_id})")
+        actor = self._training_actors[engine_rank]
+        return actor.train_forward_backward_local.remote(rollout_id, data_ref)
+
+    def sync_all_and_step(self, rollout_id: int):
+        """Collective gradient sync + optimizer step on ALL training actors.
+
+        This is the barrier: all ranks must have completed their local
+        forward+backward before this is called.
+
+        Args:
+            rollout_id: Current rollout ID.
+        """
+        logger.info(f"[ELASTIC] sync_all_and_step(rollout_id={rollout_id}): starting")
+        ray.get([
+            actor.sync_gradients_and_step.remote(rollout_id)
+            for actor in self._training_actors
+        ])
+        logger.info(f"[ELASTIC] sync_all_and_step(rollout_id={rollout_id}): DONE")
+
+    def switch_all_to_inference(self):
+        """Switch all actors back to inference mode after training.
+
+        1. Sleep all training actors (lightweight)
+        2. Resume inference engine memory
+        3. Re-register engines with router
+        """
+        if self._mode == "inference":
+            logger.info("[ELASTIC] switch_all_to_inference: already in inference mode, skipping")
+            return
+
+        # 1. Sleep training actors (lightweight — keep NCCL alive)
+        logger.info("[ELASTIC] switch_all_to_inference: sleeping training actors (lightweight)...")
+        self.sleep_training_actors_lightweight()
+
+        # 2. Resume inference engine memory
+        logger.info("[ELASTIC] switch_all_to_inference: resuming inference engine memory...")
+        ray.get([engine.resume_memory_occupation.remote() for engine in self._inference_engines])
+
+        # 3. Re-register with router
+        logger.info("[ELASTIC] switch_all_to_inference: registering engines with router...")
+        ray.get([engine.register_with_router.remote() for engine in self._inference_engines])
+
+        self._mode = "inference"
+        logger.info("[ELASTIC] switch_all_to_inference: DONE")
