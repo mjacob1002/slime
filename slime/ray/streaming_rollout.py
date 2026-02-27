@@ -240,6 +240,10 @@ class StreamingRolloutManager:
 
         return raw_rewards, raw_rewards
 
+    def dispose(self):
+        """Cleanup resources."""
+        pass
+
     def _convert_samples_to_train_data(self, samples: list[Sample]) -> dict:
         """Convert samples to training data dict.
 
