@@ -133,6 +133,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             # 3a. Ref model log probs (for KL penalty)
             if "ref" in self.weights_backuper.backup_tags:
                 self._switch_model("ref")
+                # does the forward pass here for the KL, but you need to do ANOTHER forward pass (with gradients enabled) eventually in order to do backprop. You need this log_probs for the loss
                 rollout_data.update(
                     self.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")
                 )

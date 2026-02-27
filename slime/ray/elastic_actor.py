@@ -625,6 +625,7 @@ class RayElasticGroup:
             actor.sync_gradients_and_step.remote(rollout_id)
             for actor in self._training_actors
         ])
+        self._mode = "training"  # All actors are now in training state
         logger.info(f"[ELASTIC] sync_all_and_step(rollout_id={rollout_id}): DONE")
 
     def switch_all_to_inference(self):
