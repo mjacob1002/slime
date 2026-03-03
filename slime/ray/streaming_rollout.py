@@ -1,8 +1,11 @@
 """StreamingRolloutManager for streaming synchronous training.
 
-Sends prompts directly to elastic engines by URL, detects per-engine
-completion, and pushes results to the event queue incrementally.
+Sends prompts directly to elastic engines by URL, detects per-group
+completion, and pushes results to the work queue incrementally.
 Does NOT start a router. Does NOT create dedicated rollout engines.
+
+V1: Per-group push — each prompt group is pushed to the work queue as soon
+as it completes inference, rather than waiting for the entire engine.
 """
 import itertools
 import logging
@@ -28,8 +31,8 @@ logger = logging.getLogger(__name__)
 class StreamingRolloutManager:
     """Rollout manager for streaming synchronous training.
 
-    Sends prompts directly to elastic engines by URL, detects per-engine
-    completion, and pushes results to the event queue incrementally.
+    Sends prompts directly to elastic engines by URL, detects per-group
+    completion, and pushes results to the work queue incrementally.
     Does NOT start a router. Does NOT create dedicated rollout engines.
     """
 
@@ -62,18 +65,18 @@ class StreamingRolloutManager:
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
 
-    def generate_per_engine(self, rollout_id: int, engine_urls: list[str], event_queue):
-        """Generate per-engine, pushing to event_queue as each finishes.
+    def generate_per_engine(self, rollout_id: int, engine_urls: list[str], work_queue):
+        """Generate per-engine with per-group push to work queue.
 
-        1. Get prompt groups from data source, split across engines
-        2. Launch per-engine generation tasks concurrently (asyncio)
-        3. As EACH engine completes: convert samples -> ray.put() -> event_queue.put()
-        4. Returns when all engines are done
+        V1: Flattens to one asyncio task per prompt group. As each group
+        completes, converts to train data and pushes to work_queue immediately.
+        Calls engine_completed() when ALL groups for an engine finish.
+        Calls mark_generation_complete() when everything is done.
 
         Args:
             rollout_id: Current rollout ID.
             engine_urls: List of engine URLs.
-            event_queue: StreamingEventQueue actor handle.
+            work_queue: StreamingWorkQueue actor handle.
         """
         num_engines = len(engine_urls)
         logger.info(f"generate_per_engine called: rollout_id={rollout_id}, num_engines={num_engines}, urls={engine_urls}")
@@ -87,68 +90,116 @@ class StreamingRolloutManager:
         for i, s in enumerate(samples_per_engine):
             logger.info(f"Engine {i}: {len(s)} samples")
 
-        from slime.rollout.per_engine_rollout import generate_for_single_engine, GenerateState
         from slime.rollout.sglang_rollout import GenerateState as SGGenerateState
 
         # In streaming mode, rollout_num_gpus may be 0 (all GPUs are elastic).
-        # Both SGGenerateState (semaphore) and init_http_client (client creation)
-        # use rollout_num_gpus, so we must set it to the actual number of engines.
         import copy
         init_args = copy.copy(self.args)
         if init_args.rollout_num_gpus == 0:
             init_args.rollout_num_gpus = num_engines
             logger.info(f"[ROLLOUT] Overriding rollout_num_gpus from 0 to {num_engines} for streaming mode")
-        # Re-initialize HTTP client with corrected args (it skips if rollout_num_gpus=0)
         init_http_client(init_args)
         state = SGGenerateState(init_args)
         logger.info(f"[ROLLOUT] SGGenerateState initialized, semaphore permits={state.semaphore._value}")
 
         async def _run_all():
             import asyncio
-            from slime.rollout.per_engine_rollout import generate_for_single_engine
+            from slime.rollout.sglang_rollout import generate_and_rm_group
 
             sampling_params = self._get_sampling_params()
             logger.info(f"[ROLLOUT] _run_all: sampling_params={sampling_params}")
 
-            # Create one task per engine
-            tasks = {}
+            # Build per-engine, per-group structure
+            n_spp = self.args.n_samples_per_prompt
+            engine_prompt_groups = {}
             for engine_rank, url in enumerate(engine_urls):
-                # Each engine gets its portion of samples as groups of n_samples_per_prompt
                 engine_samples = samples_per_engine[engine_rank]
-                # Group by n_samples_per_prompt
-                n_spp = self.args.n_samples_per_prompt
-                prompt_groups = [engine_samples[i:i + n_spp] for i in range(0, len(engine_samples), n_spp)]
+                groups = [engine_samples[i:i + n_spp] for i in range(0, len(engine_samples), n_spp)]
+                engine_prompt_groups[engine_rank] = groups
 
-                logger.info(f"[ROLLOUT] Creating task for engine {engine_rank} -> {url}, {len(prompt_groups)} prompt groups")
-                task = asyncio.create_task(
-                    generate_for_single_engine(self.args, url, prompt_groups, sampling_params)
-                )
-                tasks[task] = engine_rank
+            # Parse engine URLs for per-group routing
+            engine_local_args = {}
+            for engine_rank, url in enumerate(engine_urls):
+                local_args = copy.copy(self.args)
+                url_parts = url.replace("http://", "").replace("https://", "")
+                if ":" in url_parts:
+                    host, port_str = url_parts.rsplit(":", 1)
+                    local_args.sglang_router_ip = host
+                    local_args.sglang_router_port = int(port_str)
+                else:
+                    local_args.sglang_router_ip = url_parts
+                    local_args.sglang_router_port = 80
+                engine_local_args[engine_rank] = local_args
 
-            # Wait for engines to complete one at a time
+            # Flatten to one asyncio task per prompt group
+            tasks = {}  # task -> (engine_rank, group_idx)
+            groups_per_engine = {}  # engine_rank -> total groups
+            completed_per_engine = {}  # engine_rank -> completed count
+
+            for engine_rank, groups in engine_prompt_groups.items():
+                groups_per_engine[engine_rank] = len(groups)
+                completed_per_engine[engine_rank] = 0
+                local_args = engine_local_args[engine_rank]
+
+                for group_idx, group in enumerate(groups):
+                    logger.info(
+                        f"[ROLLOUT] Creating task: engine={engine_rank}, "
+                        f"group={group_idx}/{len(groups)}, {len(group)} samples"
+                    )
+                    task = asyncio.create_task(
+                        generate_and_rm_group(
+                            local_args, group, sampling_params.copy(), evaluation=False
+                        )
+                    )
+                    tasks[task] = (engine_rank, group_idx)
+
+            total_groups = len(tasks)
+            logger.info(f"[ROLLOUT] _run_all: {total_groups} per-group tasks across {num_engines} engines")
+
+            # Wait for groups to complete one at a time (FIRST_COMPLETED)
             pending = set(tasks.keys())
-            logger.info(f"[ROLLOUT] _run_all: waiting for {len(pending)} tasks")
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
-                    engine_rank = tasks[task]
+                    engine_rank, group_idx = tasks[task]
                     try:
-                        completed_groups = task.result()
+                        completed_samples = task.result()
                     except Exception as e:
-                        logger.error(f"[ROLLOUT] Engine {engine_rank} generation FAILED: {e}", exc_info=True)
+                        logger.error(
+                            f"[ROLLOUT] Engine {engine_rank} group {group_idx} FAILED: {e}",
+                            exc_info=True,
+                        )
                         raise
-                    # Flatten groups to list of samples
-                    flat_samples = list(itertools.chain.from_iterable(completed_groups))
-                    logger.info(f"[ROLLOUT] Engine {engine_rank} done, {len(flat_samples)} flat samples, converting to train data...")
-                    # Convert to training data
+
+                    # Convert group samples to training data
+                    if isinstance(completed_samples, list) and len(completed_samples) > 0:
+                        # completed_samples is the group result from generate_and_rm_group
+                        flat_samples = completed_samples if isinstance(completed_samples[0], Sample) else list(itertools.chain.from_iterable(completed_samples))
+                    else:
+                        flat_samples = []
+
                     train_data = self._convert_samples_to_train_data(flat_samples)
-                    logger.info(f"[ROLLOUT] Engine {engine_rank} train_data keys={list(train_data.keys())}, putting to object store...")
-                    # Put into Ray object store and notify event queue
                     data_ref = Box(ray.put(train_data))
-                    ray.get(event_queue.put.remote(engine_rank, data_ref))
+
+                    # Push per-group data to the shared work queue
+                    ray.get(work_queue.push_data.remote(data_ref))
                     logger.info(
-                        f"[ROLLOUT] Engine {engine_rank} completed: {len(flat_samples)} samples pushed to event queue"
+                        f"[ROLLOUT] Engine {engine_rank} group {group_idx} pushed: "
+                        f"{len(flat_samples)} samples"
                     )
+
+                    # Track per-engine completion
+                    completed_per_engine[engine_rank] += 1
+                    if completed_per_engine[engine_rank] == groups_per_engine[engine_rank]:
+                        ray.get(work_queue.engine_completed.remote(engine_rank))
+                        logger.info(
+                            f"[ROLLOUT] Engine {engine_rank} ALL {groups_per_engine[engine_rank]} "
+                            f"groups done → engine_completed"
+                        )
+
+            # Signal that all generation is complete
+            ray.get(work_queue.mark_generation_complete.remote())
+            logger.info(f"[ROLLOUT] All generation complete, mark_generation_complete called")
 
         logger.info("[ROLLOUT] About to call run(_run_all())")
         run(_run_all())

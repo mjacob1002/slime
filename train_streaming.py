@@ -1,5 +1,5 @@
 """
-Streaming synchronous training loop.
+Streaming synchronous training loop (V1: work-stealing with weighted gradient averaging).
 
 In the standard elastic training loop (train_elastic.py), all GPUs generate
 inference together, then all switch to training together. Long-tail inference
@@ -8,10 +8,17 @@ samples cause idle GPUs.
 The streaming approach: GPUs that finish inference early switch to training
 immediately, overlapping slow inference with fast training.
 
+V1 improvements over V0:
+- Per-group push: completed prompt groups are pushed to a shared work queue
+  as they finish (not waiting for the entire engine)
+- Work-stealing: GPUs grab data from the queue, train, grab more, repeat
+- Weighted gradient averaging: dynamic_global_batch_size = num_samples * dp
+  ensures correct per-sample gradient contribution regardless of chunk size
+
 Timeline (3 GPUs):
-  GPU0: Infer ────|switch|── train(N0) ──────────| wait | sync | opt step |
-  GPU1: Infer ──────────|switch|── train(N1) ────| wait | sync | opt step |
-  GPU2: Infer ──────────────────|switch|── train(N2) ──| sync | opt step |
+  GPU0: Infer ────|switch|── train(grab→process→grab→...) ──| sync | opt step |
+  GPU1: Infer ──────────|switch|── train(grab→process→...) ─| sync | opt step |
+  GPU2: Infer ──────────────────|switch|── train(grab→...) ─| sync | opt step |
 
 Constraints:
   - Colocated mode (training + inference share GPU)
@@ -26,7 +33,7 @@ import ray
 
 from slime.ray.elastic_actor import RayElasticGroup
 from slime.ray.placement_group import create_placement_groups
-from slime.ray.streaming_event_queue import StreamingEventQueue
+from slime.ray.streaming_work_queue import StreamingWorkQueue
 from slime.ray.streaming_rollout import StreamingRolloutManager
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
@@ -58,7 +65,7 @@ def validate_streaming_args(args):
 def train(args):
     configure_logger()
     validate_streaming_args(args)
-    logger.info("[DRIVER] Starting streaming training")
+    logger.info("[DRIVER] Starting streaming training (V1: work-stealing)")
 
     logger.info("[DRIVER] Creating placement groups...")
     pgs = create_placement_groups(args)
@@ -86,7 +93,6 @@ def train(args):
     world_size = args.num_elastic_nodes * args.num_elastic_gpus_per_node
     logger.info(f"[DRIVER] Setting train_parallel_config with dp_size={world_size}")
     elastic_group.set_train_parallel_config({"dp_size": world_size})
-    # ray.get(streaming_rollout_mgr.set_train_parallel_config.remote({"dp_size": world_size})); don't need this line because it is already propogated
     logger.info("[DRIVER] train_parallel_config set")
 
     # Switch to inference mode (registers with router)
@@ -101,23 +107,32 @@ def train(args):
     # Training loop
     total_train_start = time.time()
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        logger.info(f"[DRIVER] === Streaming rollout {rollout_id} ===")
+        logger.info(f"[DRIVER] === Streaming rollout {rollout_id} (V1 work-stealing) ===")
         rollout_start = time.time()
 
-        # Create event queue for this rollout
-        logger.info(f"[DRIVER] Creating StreamingEventQueue for rollout {rollout_id}...")
-        event_queue = StreamingEventQueue.remote(world_size)
+        # Create shared work queue for this rollout
+        # Use a small per-grab cap so the work-stealing loop iterates frequently.
+        # Small chunks let GPUs interleave grabs: when engines finish at different
+        # times, the early GPU takes more turns and naturally absorbs more work.
+        # When engines finish together, both GPUs interleave grabs and stay balanced.
+        n_groups = args.rollout_batch_size // args.n_samples_per_prompt
+        max_items_per_grab = max(1, n_groups // (world_size * 2))
+        logger.info(
+            f"[DRIVER] Creating StreamingWorkQueue for rollout {rollout_id} "
+            f"(max_items_per_grab={max_items_per_grab})"
+        )
+        work_queue = StreamingWorkQueue.remote(world_size, max_items_per_grab=max_items_per_grab)
 
-        # Kick off per-engine generation (runs asynchronously inside rollout manager)
+        # Kick off per-engine generation with per-group push
         logger.info(f"[DRIVER] Calling generate_per_engine.remote(rollout_id={rollout_id})...")
         gen_ref = streaming_rollout_mgr.generate_per_engine.remote(
-            rollout_id, engine_urls, event_queue
+            rollout_id, engine_urls, work_queue
         )
         logger.info(f"[DRIVER] generate_per_engine.remote() submitted, entering poll loop")
 
-        # Poll loop: as each engine finishes, switch it to training immediately
+        # Poll loop: as each engine finishes, switch it to training with work-stealing
         completed = set()
-        local_train_futures = {}
+        work_stealing_futures = {}
         poll_count = 0
 
         while len(completed) < world_size:
@@ -125,6 +140,7 @@ def train(args):
             poll_count += 1
             if poll_count % 50 == 0:
                 logger.info(f"[DRIVER] Poll #{poll_count}, {len(completed)}/{world_size} completed, elapsed={time.time() - rollout_start:.1f}s")
+
             # Check if gen task crashed (non-blocking)
             ready, _ = ray.wait([gen_ref], timeout=0)
             if ready:
@@ -133,18 +149,19 @@ def train(args):
                 except Exception as e:
                     logger.error(f"[DRIVER] generate_per_engine FAILED: {e}")
                     raise
-            newly_done = ray.get(event_queue.get_completed.remote())
 
-            for engine_rank, data_ref in newly_done.items():
+            newly_done = ray.get(work_queue.get_newly_completed_engines.remote())
+
+            for engine_rank in newly_done:
                 switch_start = time.time()
                 logger.info(f"[DRIVER] Engine {engine_rank} completed generation, switching to training...")
                 # Switch this engine to training (non-collective, per-engine)
                 elastic_group.switch_engine_to_training(engine_rank)
 
-                # Start local fwd+bwd (non-blocking Ray future)
-                logger.info(f"[DRIVER] Starting local train for engine {engine_rank}...")
-                local_train_futures[engine_rank] = elastic_group.start_local_train(
-                    engine_rank, rollout_id, data_ref
+                # Start work-stealing training loop (non-blocking Ray future)
+                logger.info(f"[DRIVER] Starting work-stealing train for engine {engine_rank}...")
+                work_stealing_futures[engine_rank] = elastic_group.start_work_stealing_train(
+                    engine_rank, rollout_id, work_queue
                 )
                 completed.add(engine_rank)
                 logger.info(
@@ -158,10 +175,16 @@ def train(args):
         ray.get(gen_ref)
         logger.info("[DRIVER] generate_per_engine finished")
 
-        # Wait for all local forward+backward to finish
-        logger.info("[DRIVER] Waiting for all local forward+backward futures...")
-        ray.get(list(local_train_futures.values()))
-        logger.info(f"[DRIVER] All {world_size} engines completed local forward+backward")
+        # Wait for all work-stealing training loops to finish
+        logger.info("[DRIVER] Waiting for all work-stealing training futures...")
+        results = ray.get(list(work_stealing_futures.values()))
+        for engine_rank, result in zip(work_stealing_futures.keys(), results):
+            logger.info(
+                f"[DRIVER] Engine {engine_rank} work-stealing done: "
+                f"samples={result['total_samples_processed']}, "
+                f"chunks={result['num_chunks_processed']}"
+            )
+        logger.info(f"[DRIVER] All {world_size} engines completed work-stealing training")
 
         # Collective gradient sync + optimizer step (ALL ranks participate)
         sync_start = time.time()
