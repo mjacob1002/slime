@@ -668,6 +668,25 @@ class RayElasticGroup:
         actor = self._training_actors[engine_rank]
         return actor.train_forward_backward_local.remote(rollout_id, data_ref)
 
+    def start_work_stealing_train(self, engine_rank: int, rollout_id: int, work_queue) -> "ray.ObjectRef":
+        """Start work-stealing training loop on a single training actor.
+
+        Non-blocking: returns a Ray ObjectRef (future). The actor will
+        grab data from the shared work queue, train, and repeat until done.
+
+        Args:
+            engine_rank: Index of the training actor.
+            rollout_id: Current rollout ID.
+            work_queue: StreamingWorkQueue actor handle.
+
+        Returns:
+            Ray ObjectRef for the training future.
+        """
+        logger.info(f"[ELASTIC] start_work_stealing_train(engine_rank={engine_rank}, rollout_id={rollout_id})")
+        actor = self._training_actors[engine_rank]
+        dp_size = self._world_size
+        return actor.train_work_stealing.remote(work_queue, dp_size)
+
     def sync_all_and_step(self, rollout_id: int):
         """Collective gradient sync + optimizer step on ALL training actors.
 

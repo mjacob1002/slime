@@ -4,8 +4,10 @@ Subclass of MegatronTrainRayActor that supports:
 - Lightweight sleep/wake (torch_memory_saver only, NCCL stays alive)
 - Local forward+backward without collective gradient sync
 - Collective gradient sync + optimizer step as a separate phase
+- Work-stealing: train_work_stealing grabs data from shared queue
 """
 import logging
+import time
 from functools import partial
 
 import torch
@@ -37,6 +39,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
       gradient sync (finalize_model_grads is suppressed).
     - sync_gradients_and_step: Collective gradient allreduce + optimizer step,
       must be called by ALL ranks simultaneously.
+    - train_work_stealing: Buffered work-stealing loop over a shared queue.
     """
 
     @timer
@@ -97,48 +100,138 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
         return rollout_data
 
-    def train_forward_backward_local(self, rollout_id: int, rollout_data_ref: Box) -> dict:
-        """Run forward+backward locally with NO collective gradient sync.
+    # ── Extracted helpers ─────────────────────────────────────────────────
 
-        This method:
-        1. Fetches data via inherited _get_rollout_data()
-        2. Creates local iterator via get_data_iterator_local() (no collective)
-        3. Computes advantages via compute_advantages_and_returns()
-        4. Suppresses finalize_model_grads during forward+backward
-        5. Runs forward_backward_func(forward_only=False)
-        6. Restores the original finalize_model_grads_func
+    def _zero_grads(self):
+        """Zero gradient buffers on model and optimizer."""
+        for model_chunk in self.model:
+            model_chunk.zero_grad_buffer()
+        self.optimizer.zero_grad()
+
+    def _setup_training_config(self):
+        """Setup training config and suppress collective gradient sync.
+
+        Returns:
+            Tuple of (config, original_finalize_func) for later restoration.
+        """
+        for model_module in self.model:
+            model_module.train()
+
+        config = get_model_config(self.model[0])
+        config.grad_scale_func = self.optimizer.scale_loss
+        config.timers = None
+
+        # CRITICAL: Suppress collective gradient sync during forward+backward.
+        original_finalize_func = config.finalize_model_grads_func
+        config.finalize_model_grads_func = None
+        config.no_sync_func = None
+        config.grad_sync_func = None
+
+        return config, original_finalize_func
+
+    def _restore_training_config(self, config, original_finalize_func):
+        """Restore the original finalize_model_grads_func."""
+        config.finalize_model_grads_func = original_finalize_func
+
+    @staticmethod
+    def _merge_rollout_data(items: list[dict]) -> dict:
+        """Merge multiple rollout data dicts by concatenating their lists.
+
+        Args:
+            items: List of rollout data dicts with matching keys containing lists.
+
+        Returns:
+            Single merged dict with concatenated lists.
+        """
+        if len(items) == 1:
+            return items[0]
+
+        merged = {}
+        for key in items[0]:
+            merged[key] = []
+            for item in items:
+                if key in item:
+                    val = item[key]
+                    if isinstance(val, list):
+                        merged[key].extend(val)
+                    else:
+                        # Non-list values (e.g. scalars) — keep from last item
+                        merged[key] = val
+        return merged
+
+    def _ensure_tensors_on_device(self, rollout_data: dict) -> None:
+        """Ensure tokens, loss_masks, and rollout_log_probs are tensors on GPU.
+
+        When data comes from the work queue (via _merge_rollout_data), these
+        fields are raw lists. This method converts them in-place.
+        """
+        needs_conversion = (
+            (rollout_data.get("tokens") and not isinstance(rollout_data["tokens"][0], torch.Tensor))
+            or (rollout_data.get("loss_masks") and not isinstance(rollout_data["loss_masks"][0], torch.Tensor))
+            or (rollout_data.get("rollout_log_probs") and rollout_data["rollout_log_probs"] is not None
+                and rollout_data["rollout_log_probs"] and not isinstance(rollout_data["rollout_log_probs"][0], torch.Tensor))
+        )
+        if not needs_conversion:
+            return
+
+        device = torch.cuda.current_device()
+
+        if rollout_data.get("tokens") and not isinstance(rollout_data["tokens"][0], torch.Tensor):
+            rollout_data["tokens"] = [
+                torch.tensor(t, dtype=torch.long, device=device)
+                for t in rollout_data["tokens"]
+            ]
+
+        if rollout_data.get("loss_masks") and not isinstance(rollout_data["loss_masks"][0], torch.Tensor):
+            rollout_data["loss_masks"] = [
+                torch.tensor(t, dtype=torch.int, device=device)
+                for t in rollout_data["loss_masks"]
+            ]
+
+        if rollout_data.get("rollout_log_probs") and rollout_data["rollout_log_probs"] is not None:
+            rollout_data["rollout_log_probs"] = [
+                torch.tensor(lp, dtype=torch.float32, device=device)
+                if not isinstance(lp, torch.Tensor) else lp.to(device=device)
+                for lp in rollout_data["rollout_log_probs"]
+            ]
+
+    def _process_chunk(self, rollout_data: dict, dp_size: int) -> dict:
+        """Process a chunk of rollout data: forward+backward with no collective sync.
+
+        Sets dynamic_global_batch_size = num_samples * dp_size to ensure
+        equal per-sample gradient contribution regardless of chunk size.
+
+        Args:
+            rollout_data: Dict of training data (tokens, loss_masks, etc.)
+            dp_size: Data parallel world size.
 
         Returns:
             dict with 'num_local_samples' and 'num_microbatches'
         """
         args = get_args()
 
-        # 1. Fetch and preprocess rollout data
-        with timer("data_preprocess"):
-            rollout_data = self._get_rollout_data(rollout_data_ref)
+        # Ensure data is on GPU (work-stealing path may have raw lists)
+        self._ensure_tensors_on_device(rollout_data)
 
-        # 2. Create local data iterator (NO collective all_reduce)
+        # Set dynamic_global_batch_size for correct gradient scaling
+        num_local_samples = len(rollout_data["total_lengths"])
+        rollout_data["dynamic_global_batch_size"] = num_local_samples * dp_size
+
+        # Create local data iterator (NO collective all_reduce)
         data_iterator, num_microbatches = get_data_iterator_local(args, self.model, rollout_data)
 
-        num_local_samples = len(rollout_data["total_lengths"])
         if num_local_samples == 0 or num_microbatches == [0]:
-            logger.warning(f"Rank has 0 local samples, skipping forward+backward")
+            logger.warning("Rank has 0 local samples, skipping forward+backward")
             return {"num_local_samples": 0, "num_microbatches": [0]}
 
-        # 3. Compute log probs and advantages
-        # Previously forced rollout logprobs because streaming had no forward pass for
-        # Megatron log probs. Now we recompute them below (matching train_actor behavior),
-        # so we respect the user's --use-rollout-logprobs setting instead.
+        # Compute log probs and advantages
         if args.compute_advantages_and_returns:
-            # 3a. Ref model log probs (for KL penalty)
             if "ref" in self.weights_backuper.backup_tags:
                 self._switch_model("ref")
-                # does the forward pass here for the KL, but you need to do ANOTHER forward pass (with gradients enabled) eventually in order to do backprop. You need this log_probs for the loss
                 rollout_data.update(
                     self.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")
                 )
 
-            # 3b. Actor log probs (unless user opted into rollout logprobs)
             self._switch_model("actor")
             if not args.use_rollout_logprobs:
                 rollout_data.update(
@@ -151,31 +244,13 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         for iterator in data_iterator:
             iterator.reset()
 
-        # 4. Setup training config
-        for model_module in self.model:
-            model_module.train()
+        # Setup training config with suppressed collective sync
+        config, original_finalize_func = self._setup_training_config()
 
-        config = get_model_config(self.model[0])
-        config.grad_scale_func = self.optimizer.scale_loss
-        config.timers = None
-
-        # CRITICAL: Suppress collective gradient sync during forward+backward.
-        # When overlap_grad_reduce=False, finalize_model_grads is the only collective.
-        # By setting it to None, the forward_backward_func skips the allreduce.
-        original_finalize_func = config.finalize_model_grads_func
-        config.finalize_model_grads_func = None
-
-        # Ensure no_sync_func and grad_sync_func are None (no overlap_grad_reduce)
-        config.no_sync_func = None
-        config.grad_sync_func = None
-
-        # 5. Zero grads and run forward+backward
-        for model_chunk in self.model:
-            model_chunk.zero_grad_buffer()
-        self.optimizer.zero_grad()
+        # Zero grads and run forward+backward
+        self._zero_grads()
 
         def forward_step(data_iterator, model, return_schedule_plan=False):
-            """Forward step reusing the pattern from model.py train_one_step."""
             assert not return_schedule_plan
             batch = get_batch(
                 data_iterator,
@@ -225,18 +300,98 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             forward_only=False,
         )
 
-        # 6. Restore original finalize_model_grads_func
-        config.finalize_model_grads_func = original_finalize_func
+        # Restore original finalize_model_grads_func
+        self._restore_training_config(config, original_finalize_func)
 
         logger.info(
-            f"Completed local forward+backward: "
+            f"Completed _process_chunk: "
             f"num_local_samples={num_local_samples}, "
-            f"num_microbatches={num_microbatches}"
+            f"num_microbatches={num_microbatches}, "
+            f"dynamic_global_batch_size={rollout_data['dynamic_global_batch_size']}"
         )
 
         return {
             "num_local_samples": num_local_samples,
             "num_microbatches": num_microbatches,
+        }
+
+    def train_forward_backward_local(self, rollout_id: int, rollout_data_ref: Box) -> dict:
+        """Run forward+backward locally with NO collective gradient sync.
+
+        Thin wrapper around _process_chunk for backwards compatibility
+        with the V0 streaming path.
+
+        Returns:
+            dict with 'num_local_samples' and 'num_microbatches'
+        """
+        with timer("data_preprocess"):
+            rollout_data = self._get_rollout_data(rollout_data_ref)
+
+        # Use dp_size=1 for V0 path (no dynamic scaling)
+        return self._process_chunk(rollout_data, dp_size=1)
+
+    def train_work_stealing(self, work_queue_handle, dp_size: int) -> dict:
+        """Buffered work-stealing loop: grab data from shared queue, train, repeat.
+
+        Args:
+            work_queue_handle: Ray actor handle for StreamingWorkQueue.
+            dp_size: Data parallel world size (for dynamic_global_batch_size).
+
+        Returns:
+            dict with 'total_samples_processed' and 'num_chunks_processed'
+        """
+        import ray
+
+        total_samples = 0
+        num_chunks = 0
+        buffer = []
+
+        logger.info("[WORK_STEAL] Starting work-stealing loop")
+
+        while True:
+            # Grab available data from the shared queue
+            new_items = ray.get(work_queue_handle.grab_available.remote())
+            if new_items:
+                # Resolve ray refs to actual data
+                for item in new_items:
+                    if isinstance(item, Box):
+                        data = ray.get(item.inner)
+                    else:
+                        data = item
+                    buffer.append(data)
+                logger.info(f"[WORK_STEAL] Grabbed {len(new_items)} items, buffer={len(buffer)}")
+
+            # Process buffer if we have data
+            if buffer:
+                merged = self._merge_rollout_data(buffer)
+                buffer = []
+
+                result = self._process_chunk(merged, dp_size=dp_size)
+                total_samples += result["num_local_samples"]
+                num_chunks += 1
+                logger.info(
+                    f"[WORK_STEAL] Processed chunk {num_chunks}: "
+                    f"{result['num_local_samples']} samples, "
+                    f"total={total_samples}"
+                )
+
+            # Check if all generation is done and queue is drained
+            done = ray.get(work_queue_handle.is_done.remote())
+            if done and not buffer:
+                break
+
+            # Brief sleep to avoid busy-waiting when queue is empty
+            if not new_items and not buffer:
+                time.sleep(0.05)
+
+        logger.info(
+            f"[WORK_STEAL] Loop finished: "
+            f"total_samples={total_samples}, num_chunks={num_chunks}"
+        )
+
+        return {
+            "total_samples_processed": total_samples,
+            "num_chunks_processed": num_chunks,
         }
 
     def sync_gradients_and_step(self, rollout_id: int) -> None:

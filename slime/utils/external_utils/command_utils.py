@@ -133,6 +133,9 @@ def execute_train(
             f"export PYTHONBUFFERED=16 && "
             f"ray start --head --node-ip-address {master_addr} --num-gpus {num_gpus_per_node} --disable-usage-stats"
         )
+        # Wait for Ray dashboard agent to register its port, otherwise
+        # ray job submit hits InvalidURL: http://...:None/api/job_agent/jobs/
+        time.sleep(10)
 
     if (f := before_ray_job_submit) is not None:
         f()
