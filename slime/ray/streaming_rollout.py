@@ -221,7 +221,7 @@ class StreamingRolloutManager:
         In streaming mode, generation happens per-engine in generate_per_engine.
         This method only fetches prompts from the data source.
         """
-        num_prompt_groups = self.args.rollout_batch_size // self.args.n_samples_per_prompt
+        num_prompt_groups = self.args.rollout_batch_size
         logger.info(f"[ROLLOUT] _get_rollout_data: requesting {num_prompt_groups} prompt groups (batch_size={self.args.rollout_batch_size}, n_spp={self.args.n_samples_per_prompt})")
         samples = self.data_source.get_samples(num_prompt_groups)
         logger.info(f"[ROLLOUT] _get_rollout_data: got {len(samples)} groups from data source")

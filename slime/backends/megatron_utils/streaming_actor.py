@@ -42,6 +42,19 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
     - train_work_stealing: Buffered work-stealing loop over a shared queue.
     """
 
+    def _log_memory(self, label: str):
+        """Log PyTorch + system-level GPU memory stats."""
+        stats = torch.cuda.memory_stats()
+        allocated = stats['allocated_bytes.all.current'] / 1e9
+        reserved = stats['reserved_bytes.all.current'] / 1e9
+        peak = stats['allocated_bytes.all.peak'] / 1e9
+        free, total = torch.cuda.mem_get_info()
+        used = (total - free) / 1e9
+        logger.info(
+            f"[MEM {label}] alloc={allocated:.2f}GB reserved={reserved:.2f}GB "
+            f"peak={peak:.2f}GB | sys_used={used:.2f}GB sys_free={free/1e9:.2f}GB"
+        )
+
     @timer
     def sleep_lightweight(self) -> None:
         """Offload model tensors but keep NCCL alive.
@@ -50,9 +63,13 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         calls torch_memory_saver.pause() to offload tensors to CPU.
         NCCL groups remain initialized for the final collective sync.
         """
+        self._log_memory("sleep_lightweight:before")
         clear_memory(clear_host_memory=True)
+        self._log_memory("sleep_lightweight:after_clear")
         print_memory("before lightweight offload")
         torch_memory_saver.pause()
+        # clear_memory()  # TODO: Release blocks freed by pause() so SGLang can reclaim them
+        self._log_memory("sleep_lightweight:after_pause")
         print_memory("after lightweight offload")
 
     @timer
@@ -63,9 +80,12 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         calls torch_memory_saver.resume() to restore tensors from CPU.
         Non-collective — can be called independently per rank.
         """
+        self._log_memory("wake_up_lightweight:before_resume")
         print_memory("before lightweight wake_up")
         torch_memory_saver.resume()
+        self._log_memory("wake_up_lightweight:after_resume")
         clear_memory()
+        self._log_memory("wake_up_lightweight:after_clear")
         print_memory("after lightweight wake_up")
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> dict:
@@ -210,6 +230,9 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         """
         args = get_args()
 
+        torch.cuda.reset_peak_memory_stats()
+        self._log_memory("_process_chunk:start")
+
         # Ensure data is on GPU (work-stealing path may have raw lists)
         self._ensure_tensors_on_device(rollout_data)
 
@@ -227,18 +250,26 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         # Compute log probs and advantages
         if args.compute_advantages_and_returns:
             if "ref" in self.weights_backuper.backup_tags:
+                self._log_memory("_process_chunk:before_ref_logprob")
                 self._switch_model("ref")
                 rollout_data.update(
                     self.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")
                 )
+                self._log_memory("_process_chunk:after_ref_logprob")
+                # clear_memory()  # TODO: reclaim between phases
 
             self._switch_model("actor")
             if not args.use_rollout_logprobs:
+                self._log_memory("_process_chunk:before_actor_logprob")
                 rollout_data.update(
                     self.compute_log_prob(data_iterator, num_microbatches, store_prefix="")
                 )
+                self._log_memory("_process_chunk:after_actor_logprob")
+                clear_memory()  # reclaim between phases to avoid fragmentation
 
             compute_advantages_and_returns(args, rollout_data)
+            self._log_memory("_process_chunk:after_advantages")
+            clear_memory()  # reclaim between phases to avoid fragmentation
 
         # Reset data iterator after log prob forward passes consumed it
         for iterator in data_iterator:
@@ -288,6 +319,8 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             output_tensor = model(**forward_kwargs)
             return output_tensor, partial(loss_function, args, batch, num_microbatches[0])
 
+        self._log_memory("_process_chunk:before_fwd_bwd")
+
         forward_backward_func = get_forward_backward_func()
         forward_backward_func(
             forward_step_func=forward_step,
@@ -300,6 +333,8 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             forward_only=False,
         )
 
+        self._log_memory("_process_chunk:after_fwd_bwd")
+
         # Restore original finalize_model_grads_func
         self._restore_training_config(config, original_finalize_func)
 
@@ -309,6 +344,9 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             f"num_microbatches={num_microbatches}, "
             f"dynamic_global_batch_size={rollout_data['dynamic_global_batch_size']}"
         )
+
+        # clear_memory()  # TODO: reclaim at end of chunk
+        self._log_memory("_process_chunk:end")
 
         return {
             "num_local_samples": num_local_samples,
@@ -347,6 +385,21 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         buffer = []
 
         logger.info("[WORK_STEAL] Starting work-stealing loop")
+        self._log_memory("work_steal:loop_start")
+
+        # Opt-in memory profiling (set SLIME_MEMORY_SNAPSHOT_DIR to enable)
+        snapshot_dir = os.environ.get("SLIME_MEMORY_SNAPSHOT_DIR")
+        if snapshot_dir:
+            os.makedirs(snapshot_dir, exist_ok=True)
+            rank = torch.distributed.get_rank()
+            snapshot_path = f"{snapshot_dir}/memory_snapshot_rank{rank}_t{time.time()}.pickle"
+            torch.cuda.memory._record_memory_history(max_entries=1000000, stacks="all")
+
+            def _oom_observer(device, alloc, device_alloc, device_free):
+                logger.info(f"[WORK_STEAL] OOM observed, dumping snapshot to {snapshot_path}")
+                torch.cuda.memory._dump_snapshot(snapshot_path)
+
+            torch._C._cuda_attach_out_of_memory_observer(_oom_observer)
 
         while True:
             # Grab available data from the shared queue
@@ -367,8 +420,11 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                 buffer = []
 
                 result = self._process_chunk(merged, dp_size=dp_size)
+                del merged
+                clear_memory()  # reclaim reserved memory between chunks to avoid fragmentation
                 total_samples += result["num_local_samples"]
                 num_chunks += 1
+                self._log_memory(f"work_steal:after_chunk_{num_chunks}")
                 logger.info(
                     f"[WORK_STEAL] Processed chunk {num_chunks}: "
                     f"{result['num_local_samples']} samples, "
@@ -384,6 +440,12 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             if not new_items and not buffer:
                 time.sleep(0.05)
 
+        if snapshot_dir:
+            logger.info(f"[WORK_STEAL] Dumping memory snapshot to {snapshot_path}")
+            torch.cuda.memory._dump_snapshot(snapshot_path)
+            torch.cuda.memory._record_memory_history(enabled=None)
+
+        self._log_memory("work_steal:loop_end")
         logger.info(
             f"[WORK_STEAL] Loop finished: "
             f"total_samples={total_samples}, num_chunks={num_chunks}"
@@ -411,6 +473,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
         # 1. Collective gradient allreduce
         finalize_model_grads_with_empty_cache(self.model)
+        self._log_memory("sync_grads:after_finalize")
 
         # 2. Optimizer step
         valid_step = True
@@ -428,6 +491,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
         if valid_step:
             update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+            self._log_memory("sync_grads:after_optimizer_step")
             assert update_successful
 
             # 3. Step the learning rate scheduler
