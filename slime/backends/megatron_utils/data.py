@@ -274,6 +274,7 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    print(f"[DEBUG] Entering the get_data_iterator function")
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     dp_group = mpu.get_data_parallel_group()
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -338,6 +339,9 @@ def get_data_iterator(
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             samples = rollout_data["total_lengths"][start:end]
             partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
+            # Sort partitions by descending max sample length to reduce CUDA memory
+            # fragmentation: longest samples run first when the allocator cache is clean.
+            #partitions.sort(key=lambda indices: max(samples[i] for i in indices), reverse=True)
             for j in range(num_mbs):
                 for k in range(len(partitions[j])):
                     partitions[j][k] += start

@@ -61,7 +61,7 @@ class RolloutDataSource(DataSource):
                 tokenizer.save_pretrained(Path(d) / "tokenizer")
                 if processor:
                     processor.save_pretrained(Path(d) / "processor")
-
+            print(f"Prompt data: {args.prompt_data}")
             self.dataset = Dataset(
                 args.prompt_data,
                 tokenizer=tokenizer,
@@ -97,6 +97,11 @@ class RolloutDataSource(DataSource):
                 self.sample_offset = num_samples
         else:
             prompt_samples = [Sample() for _ in range(num_samples)]
+
+        # Log prompts for cross-run comparison
+        for i, ps in enumerate(prompt_samples):
+            prompt_text = ps.prompt if isinstance(ps.prompt, str) else str(ps.prompt)
+            logger.info(f"[DATA] get_samples: prompt {i}/{num_samples}: {prompt_text[:80]!r}")
 
         samples = []
         for prompt_sample in prompt_samples:
