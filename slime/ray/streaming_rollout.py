@@ -159,6 +159,7 @@ class StreamingRolloutManager:
             logger.info(f"[ROLLOUT] _run_all: {total_groups} per-group tasks across {num_engines} engines")
 
             # Wait for groups to complete one at a time (FIRST_COMPLETED)
+            all_samples = []  # Accumulate per-sample info for rollout logging
             pending = set(tasks.keys())
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -179,6 +180,26 @@ class StreamingRolloutManager:
                         flat_samples = completed_samples if isinstance(completed_samples[0], Sample) else list(itertools.chain.from_iterable(completed_samples))
                     else:
                         flat_samples = []
+
+                    # Accumulate sample info for per-rollout logging
+                    for si, sample in enumerate(flat_samples):
+                        prompt_str = sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
+                        reward_val = sample.reward
+                        if isinstance(reward_val, dict):
+                            reward_val = reward_val.get(self.args.reward_key, None) if self.args.reward_key else None
+                        all_samples.append({
+                            "engine_rank": engine_rank,
+                            "group_idx": group_idx,
+                            "sample_index": sample.index,
+                            "response_length": sample.response_length,
+                            "total_length": len(sample.tokens),
+                            "status": sample.status.value,
+                            "reward": float(reward_val) if reward_val is not None else None,
+                            "truncated": sample.status == Sample.Status.TRUNCATED,
+                            "generation_latency": sample.generation_latency,
+                            "prompt_preview": prompt_str[:200],
+                            "response_preview": sample.response[:500],
+                        })
 
                     train_data = self._convert_samples_to_train_data(flat_samples)
                     data_ref = Box(ray.put(train_data))
@@ -203,9 +224,41 @@ class StreamingRolloutManager:
             ray.get(work_queue.mark_generation_complete.remote())
             logger.info(f"[ROLLOUT] All generation complete, mark_generation_complete called")
 
+            # Write per-rollout output log
+            try:
+                log_dir = "/tmp/slime_rollout_logs"
+                os.makedirs(log_dir, exist_ok=True)
+
+                response_lengths = [s["response_length"] for s in all_samples]
+                rewards = [s["reward"] for s in all_samples if s["reward"] is not None]
+                num_truncated = sum(1 for s in all_samples if s["truncated"])
+                num_completed = sum(1 for s in all_samples if s["status"] == "completed")
+
+                summary = {
+                    "rollout_id": rollout_id,
+                    "num_engines": num_engines,
+                    "num_samples": len(all_samples),
+                    "mean_response_length": sum(response_lengths) / len(response_lengths) if response_lengths else 0,
+                    "max_response_length": max(response_lengths) if response_lengths else 0,
+                    "min_response_length": min(response_lengths) if response_lengths else 0,
+                    "num_truncated": num_truncated,
+                    "num_completed": num_completed,
+                    "mean_reward": sum(rewards) / len(rewards) if rewards else None,
+                }
+
+                log_data = {"summary": summary, "samples": all_samples}
+                log_path = os.path.join(log_dir, f"rollout_{rollout_id}.json")
+                with open(log_path, "w") as f:
+                    json.dump(log_data, f, indent=2)
+                logger.info(f"[ROLLOUT] Wrote rollout log to {log_path} ({len(all_samples)} samples)")
+                return summary
+            except Exception as e:
+                logger.warning(f"[ROLLOUT] Failed to write rollout log: {e}")
+
         logger.info("[ROLLOUT] About to call run(_run_all())")
-        run(_run_all())
+        result = run(_run_all())
         logger.info(f"[ROLLOUT] All {num_engines} engines completed generation for rollout {rollout_id}")
+        return result
 
     def eval(self, rollout_id: int):
         """Eval delegates to the existing eval function."""
