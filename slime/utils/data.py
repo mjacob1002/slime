@@ -183,7 +183,9 @@ class Dataset:
         apply_chat_template_kwargs=None,
     ):
         origin_samples = []
+        #print(f'DATA.PY DEBUG: path={path}')
         for data in read_file(path):
+            #print(f"DEBUG: data in path is data={data}, path={path}")
             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
             as_conversation = apply_chat_template or (multimodal_keys is not None)
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
