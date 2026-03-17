@@ -494,6 +494,74 @@ class RayElasticGroup:
 
         logger.info("Weight update completed for elastic actors")
 
+    def update_weights_and_switch_to_inference(self):
+        """
+        TEMP: Combined weight update + switch to inference that avoids the
+        destructive release->resume cycle.
+
+        Normal flow (broken without CPU backup):
+          update_weights():  resume_weights -> push fresh -> release_weights (DESTROYS fresh weights)
+          switch_to_inference(): resume_all (restores STALE weights from CPU backup)
+
+        This flow:
+          resume_weights -> push fresh -> sleep training actors -> onload KV cache + CUDA graphs -> register
+          (weights stay on GPU the entire time, never released)
+        """
+        from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE
+        try:
+            from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+        except ImportError:
+            GPU_MEMORY_TYPE_CUDA_GRAPH = None
+
+        self._connect_weight_updaters()
+
+        # Step 1: Resume inference engine weights (they were offloaded during training)
+        print("[update_weights_and_switch] Resuming inference engine weights...")
+        self._resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+
+        # Verification: record weight checksums + versions before push
+        checksums_before = ray.get([engine.get_weights_checksum.remote() for engine in self._inference_engines])
+        versions_before = ray.get([engine.get_weight_version.remote() for engine in self._inference_engines])
+        print(f"[update_weights_and_switch] Before push - versions: {versions_before}, checksums: {checksums_before}")
+
+        # Step 2: Push fresh weights from training actors
+        print("[update_weights_and_switch] Pushing fresh weights via update_weights_from_tensor...")
+        ray.get([actor.update_weights.remote() for actor in self._training_actors])
+        print("[update_weights_and_switch] Fresh weights pushed successfully")
+
+        # Verification: record weight checksums + versions after push
+        checksums_after = ray.get([engine.get_weights_checksum.remote() for engine in self._inference_engines])
+        versions_after = ray.get([engine.get_weight_version.remote() for engine in self._inference_engines])
+        print(f"[update_weights_and_switch] After push  - versions: {versions_after}, checksums: {checksums_after}")
+        if checksums_before and checksums_after and checksums_before != checksums_after:
+            print("[update_weights_and_switch] VERIFIED: weights changed after update")
+        elif checksums_before and checksums_after and checksums_before == checksums_after:
+            print("[update_weights_and_switch] WARNING: weight checksums unchanged after update!")
+
+        # Step 3: Sleep training actors (free GPU memory for KV cache)
+        print("[update_weights_and_switch] Sleeping training actors...")
+        self.sleep_training_actors_lightweight()
+
+        # Step 4: Onload remaining inference resources (KV cache, CUDA graphs)
+        # Weights are ALREADY on GPU -- only need KV cache + CUDA graphs
+        print("[update_weights_and_switch] Loading KV cache and CUDA graphs...")
+        if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
+            ray.get([
+                engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+                for engine in self._inference_engines
+            ])
+        ray.get([
+            engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+            for engine in self._inference_engines
+        ])
+
+        # Step 5: Register engines with router
+        print("[update_weights_and_switch] Registering engines with router...")
+        ray.get([engine.register_with_router.remote() for engine in self._inference_engines])
+
+        self._mode = "inference"
+        logger.info("[ELASTIC] update_weights_and_switch_to_inference: DONE")
+
     def onload_inference_remaining(self):
         """
         Load remaining inference resources (KV cache, CUDA graphs).
