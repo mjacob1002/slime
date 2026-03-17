@@ -38,20 +38,28 @@ def exec_command(cmd: str, capture_output: bool = False) -> str | None:
     print(f"EXEC: {cmd}", flush=True)
 
     try:
-        result = subprocess.run(
-            ["bash", "-c", cmd],
-            shell=False,
-            check=True,
-            capture_output=capture_output,
-            **(dict(text=True) if capture_output else {}),
-        )
+        if capture_output:
+            result = subprocess.run(
+                ["bash", "-c", cmd],
+                shell=False,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        else:
+            result = subprocess.run(
+                ["bash", "-c", cmd],
+                shell=False,
+                check=True,
+            )
     except subprocess.CalledProcessError as e:
         if capture_output:
-            print(f"{e.stdout=} {e.stderr=}")
+            print(f"{e.stdout=}")
         raise
 
     if capture_output:
-        print(f"Captured stdout={result.stdout} stderr={result.stderr}")
+        print(f"Captured stdout={result.stdout}")
         return result.stdout
 
 
