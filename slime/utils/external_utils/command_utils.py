@@ -133,9 +133,20 @@ def execute_train(
             f"export PYTHONBUFFERED=16 && "
             f"ray start --head --node-ip-address {master_addr} --num-gpus {num_gpus_per_node} --disable-usage-stats"
         )
-        # Wait for Ray dashboard agent to register its port, otherwise
-        # ray job submit hits InvalidURL: http://...:None/api/job_agent/jobs/
-        time.sleep(10)
+        # Wait for Ray dashboard agent to be ready for job submission
+        import time
+        import urllib.request
+        import json as _json
+        for _attempt in range(90):
+            try:
+                resp = urllib.request.urlopen("http://127.0.0.1:8265/api/jobs/", timeout=2)
+                if resp.status == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            print("WARNING: Ray job submission API not ready after 90s, attempting job submit anyway")
 
     if (f := before_ray_job_submit) is not None:
         f()
