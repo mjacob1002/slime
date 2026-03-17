@@ -593,6 +593,11 @@ class RayElasticGroup:
         if self._mode != "inference":
             self.switch_to_inference()
 
+        # Verify model weights hash before starting rollout
+        checksums = ray.get([engine.get_weights_checksum.remote() for engine in self._inference_engines])
+        versions = ray.get([engine.get_weight_version.remote() for engine in self._inference_engines])
+        print(f"[generate] Rollout {rollout_id} starting - weight versions: {versions}, checksums: {checksums}")
+
         if self._rollout_manager is not None:
             return ray.get(self._rollout_manager.generate.remote(rollout_id))
         else:
@@ -723,7 +728,8 @@ class RayElasticGroup:
         3. Re-register engines with router
         """
         if self._mode == "inference":
-            logger.info("[ELASTIC] switch_all_to_inference: already in inference mode, skipping")
+            #logger.info("[ELASTIC] switch_all_to_inference: already in inference mode, skipping")
+            print("[ELASTIC] switch_all_to_inference: already in inference mode, skipping")
             return
 
         # 1. Sleep training actors (lightweight — keep NCCL alive)

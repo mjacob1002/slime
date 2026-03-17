@@ -374,6 +374,24 @@ class SGLangEngine(RayActor):
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
+    def get_weights_checksum(self, param_name: str = None) -> float | None:
+        """Compute a hash of model weights via /get_weights_hash endpoint.
+        Works for ALL models including Qwen3.
+        """
+        if self.node_rank != 0:
+            return None
+        try:
+            payload = {}
+            if param_name is not None:
+                payload["param_name"] = param_name
+            result = self._make_request("get_weights_hash", payload)
+            if result and result.get("hash_value") is not None:
+                return result["hash_value"]
+            return None
+        except Exception as e:
+            print(f"[get_weights_checksum] Failed: {e}")
+            return None
+
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
         return self._make_request(
             "init_weights_update_group",
@@ -482,6 +500,12 @@ def _compute_server_args(
         "random_seed": args.seed + rank,
         # memory
         "enable_memory_saver": args.offload_rollout,
+        # >>> FIX: Enable CPU backup for main model weights during offload/onload <<<
+        # Without this, release_memory_occupation() frees GPU weights without
+        # backing them up to CPU, so resume_memory_occupation() restores garbage.
+        # (enable_draft_weights_cpu_backup only covers MTP draft weights, not main weights)
+        # "enable_weights_cpu_backup": args.offload_rollout,  # TEMPORARILY DISABLED to test update_weights override
+        # >>> END FIX <<<
         # distributed
         "host": host,
         "port": port,
