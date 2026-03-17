@@ -7,6 +7,7 @@ Subclass of MegatronTrainRayActor that supports:
 - Work-stealing: train_work_stealing grabs data from shared queue
 """
 import logging
+import os
 import time
 from functools import partial
 

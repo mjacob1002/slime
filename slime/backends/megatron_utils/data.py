@@ -417,6 +417,10 @@ def get_data_iterator_local(
         # Balance the micro batches
         samples = rollout_data["total_lengths"]
         partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
+        # Sort partitions by descending max sample length to reduce CUDA memory
+        # fragmentation: longest samples run first when the allocator cache is clean,
+        # shorter samples then reuse existing cached blocks.
+        partitions.sort(key=lambda indices: max(samples[i] for i in indices), reverse=True)
         micro_batch_indices = partitions
 
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
