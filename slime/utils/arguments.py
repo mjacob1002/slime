@@ -1138,6 +1138,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="torch",
             )
             parser.add_argument("--check-weight-update-equal", action="store_true")
+            parser.add_argument(
+                "--profiling-record-lengths-path",
+                type=str,
+                default=None,
+                help="Record per-sample response lengths to this JSON file for profiling determinism.",
+            )
+            parser.add_argument(
+                "--profiling-replay-lengths-path",
+                type=str,
+                default=None,
+                help="Replay recorded response lengths from this JSON file with ignore_eos=True.",
+            )
             return parser
 
         def add_network_arguments(parser):

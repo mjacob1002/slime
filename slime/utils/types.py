@@ -45,6 +45,9 @@ class Sample:
 
     non_generation_time: float = 0.0  # time spent in non-generation steps
     generation_latency: float = 0.0  # time spent in generation (seconds)
+    generation_start_time: float = 0.0  # SLIME_TIMELINE: wall-clock time.time()
+    generation_end_time: float = 0.0    # SLIME_TIMELINE: wall-clock time.time()
+    engine_rank: int = -1               # SLIME_TIMELINE: which engine/GPU processed this
 
     @dataclass
     class SpecInfo:

@@ -1,6 +1,8 @@
 import itertools
+import json as _json
 import logging
 import multiprocessing
+import os
 import random
 import time
 from pathlib import Path
@@ -109,6 +111,7 @@ class RolloutManager:
         start_time = time.time()
         try:
             data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+            _write_timeline(rollout_id, data)  # SLIME_TIMELINE
             self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
             _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
             data = self._convert_samples_to_train_data(data)
@@ -414,6 +417,27 @@ class RolloutManager:
                 rollout_data["dynamic_global_batch_size"] = self._dynamic_global_batch_size
             rollout_data_refs.append(Box(ray.put(rollout_data)))
         return rollout_data_refs
+
+
+def _write_timeline(rollout_id, samples):  # SLIME_TIMELINE
+    """Write per-sample timeline JSON for Gantt-chart visualization."""
+    log_dir = "/tmp/slime_rollout_logs"
+    os.makedirs(log_dir, exist_ok=True)
+    timeline = []
+    for sample in samples:
+        timeline.append({
+            "sample_index": sample.index,
+            "engine_rank": sample.engine_rank,
+            "generation_start_time": sample.generation_start_time,
+            "generation_end_time": sample.generation_end_time,
+            "generation_latency": sample.generation_latency,
+            "response_length": sample.response_length,
+            "status": sample.status.value,
+        })
+    path = f"{log_dir}/timeline_rollout_{rollout_id}.json"
+    with open(path, "w") as f:
+        _json.dump(timeline, f)
+    logger.info(f"SLIME_TIMELINE: wrote {len(timeline)} samples to {path}")
 
 
 def init_rollout_engines(args, pg, all_rollout_engines):
