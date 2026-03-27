@@ -109,6 +109,15 @@ class StreamingRolloutManager:
             from slime.rollout.sglang_rollout import generate_and_rm_group
 
             sampling_params = self._get_sampling_params()
+
+            # Inject replay lengths if configured
+            if getattr(self.args, "profiling_replay_lengths_path", None):
+                from slime.utils.profiling_lengths import load_replay_lengths
+
+                replay_lengths = load_replay_lengths(self.args.profiling_replay_lengths_path)
+                sampling_params["__replay_lengths"] = replay_lengths
+                sampling_params["__replay_rollout_id"] = rollout_id
+
             logger.info(f"[ROLLOUT] _run_all: sampling_params={sampling_params}")
 
             # Build per-engine, per-group structure
@@ -219,6 +228,12 @@ class StreamingRolloutManager:
                             f"[ROLLOUT] Engine {engine_rank} ALL {groups_per_engine[engine_rank]} "
                             f"groups done → engine_completed"
                         )
+
+            # Record response lengths if configured
+            if getattr(self.args, "profiling_record_lengths_path", None):
+                from slime.utils.profiling_lengths import record_lengths
+
+                record_lengths(self.args.profiling_record_lengths_path, rollout_id, all_samples)
 
             # Signal that all generation is complete
             ray.get(work_queue.mark_generation_complete.remote())
