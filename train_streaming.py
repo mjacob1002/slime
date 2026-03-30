@@ -106,6 +106,11 @@ def train(args):
     engine_urls = elastic_group.get_engine_urls()
     logger.info(f"[DRIVER] Streaming training initialized with {world_size} GPUs, engine URLs: {engine_urls}")
 
+    # Initialize router with engine URLs (once, before training loop)
+    logger.info("[DRIVER] Setting engine URLs on StreamingRolloutManager...")
+    ray.get(streaming_rollout_mgr.set_engine_urls.remote(engine_urls))
+    logger.info("[DRIVER] Engine URLs set, StreamingRouter ready")
+
     # Training loop
     total_train_start = time.time()
     n_groups = args.rollout_batch_size // args.n_samples_per_prompt
@@ -141,12 +146,10 @@ def train(args):
         versions = ray.get([engine.get_weight_version.remote() for engine in elastic_group.inference_engines])
         print(f"[DRIVER] Rollout {rollout_id} starting - weight versions: {versions}, checksums: {checksums}")
 
-        # Kick off per-engine generation with per-group push
-        logger.info(f"[DRIVER] Calling generate_per_engine.remote(rollout_id={rollout_id})...")
-        gen_ref = streaming_rollout_mgr.generate_per_engine.remote(
-            rollout_id, engine_urls, work_queue
-        )
-        logger.info(f"[DRIVER] generate_per_engine.remote() submitted, entering poll loop")
+        # Kick off generation — router decides where requests go
+        logger.info(f"[DRIVER] Calling generate.remote(rollout_id={rollout_id})...")
+        gen_ref = streaming_rollout_mgr.generate.remote(rollout_id, work_queue)
+        logger.info(f"[DRIVER] generate.remote() submitted, entering poll loop")
 
         # Poll loop: as each engine finishes, switch it to training with work-stealing
         completed = set()
@@ -167,7 +170,7 @@ def train(args):
                 try:
                     ray.get(ready[0])
                 except Exception as e:
-                    logger.error(f"[DRIVER] generate_per_engine FAILED: {e}")
+                    logger.error(f"[DRIVER] generate FAILED: {e}")
                     raise
 
             newly_done = ray.get(work_queue.get_newly_completed_engines.remote())
@@ -203,9 +206,9 @@ def train(args):
         print(f"Inference {rollout_id} took {inference_elapsed:.2f}s")
 
         # Ensure generation task is fully done (cleanup)
-        logger.info("[DRIVER] Waiting for generate_per_engine to finish (ray.get(gen_ref))...")
+        logger.info("[DRIVER] Waiting for generate to finish (ray.get(gen_ref))...")
         gen_result = ray.get(gen_ref)
-        logger.info("[DRIVER] generate_per_engine finished")
+        logger.info("[DRIVER] generate finished")
 
         # Wait for all work-stealing training loops to finish
         logger.info("[DRIVER] Waiting for all work-stealing training futures...")

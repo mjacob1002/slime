@@ -124,6 +124,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Each GPU runs both a training actor (0.4 GPU) and inference engine (0.2 GPU)."
                 ),
             )
+            parser.add_argument(
+                "--migration-policy",
+                type=str,
+                choices=["none", "long-tail"],
+                default="none",
+                help=(
+                    "Request migration policy for streaming training. "
+                    "'none' keeps all requests on their assigned engine. "
+                    "'long-tail' migrates truncated requests to engine 0."
+                ),
+            )
 
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)

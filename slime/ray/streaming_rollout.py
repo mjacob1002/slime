@@ -1,29 +1,26 @@
 """StreamingRolloutManager for streaming synchronous training.
 
-Sends prompts directly to elastic engines by URL, detects per-group
-completion, and pushes results to the work queue incrementally.
-Does NOT start a router. Does NOT create dedicated rollout engines.
-
-V1: Per-group push — each prompt group is pushed to the work queue as soon
-as it completes inference, rather than waiting for the entire engine.
+Delegates request dispatch to StreamingRouter, which handles per-group
+completion detection and pushes results to the work queue incrementally.
+Does NOT start an HTTP router. Does NOT create dedicated rollout engines.
 """
+import copy
 import itertools
 import json
 import logging
 import os
-import time
 from typing import Any
 
 import ray
 import torch
 
 from slime.rollout.base_types import call_rollout_fn
+from slime.router.migration_policy import NoMigrationPolicy
+from slime.router.streaming_router import StreamingRouter
 from slime.utils.async_utils import run
 from slime.utils.http_utils import init_http_client
 from slime.utils.logging_utils import configure_logger
 from slime.utils.misc import load_function
-from slime.utils.ray_utils import Box
-from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -33,9 +30,9 @@ logger = logging.getLogger(__name__)
 class StreamingRolloutManager:
     """Rollout manager for streaming synchronous training.
 
-    Sends prompts directly to elastic engines by URL, detects per-group
-    completion, and pushes results to the work queue incrementally.
-    Does NOT start a router. Does NOT create dedicated rollout engines.
+    Delegates request dispatch to StreamingRouter, which handles per-group
+    completion detection and pushes results to the work queue incrementally.
+    Does NOT start an HTTP router. Does NOT create dedicated rollout engines.
     """
 
     def __init__(self, args):
@@ -62,40 +59,30 @@ class StreamingRolloutManager:
             )
 
         self.train_parallel_config = None
+        self.engine_urls: list[str] = []
+        self.router: StreamingRouter | None = None
         logger.info("StreamingRolloutManager initialized")
 
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
 
-    def generate_per_engine(self, rollout_id: int, engine_urls: list[str], work_queue):
-        """Generate per-engine with per-group push to work queue.
+    def set_engine_urls(self, engine_urls: list[str]):
+        """Set engine URLs and initialize the generation state + router.
 
-        V1: Flattens to one asyncio task per prompt group. As each group
-        completes, converts to train data and pushes to work_queue immediately.
-        Calls engine_completed() when ALL groups for an engine finish.
-        Calls mark_generation_complete() when everything is done.
-
-        Args:
-            rollout_id: Current rollout ID.
-            engine_urls: List of engine URLs.
-            work_queue: StreamingWorkQueue actor handle.
+        Called once during setup after engines are ready. Initializes
+        SGGenerateState (singleton that holds the tokenizer and concurrency
+        semaphore needed by generate_and_rm_group) and creates the
+        StreamingRouter that will handle all dispatch.
         """
-        num_engines = len(engine_urls)
-        logger.info(f"generate_per_engine called: rollout_id={rollout_id}, num_engines={num_engines}, urls={engine_urls}")
-
-        # Get all prompt data
-        data, metrics = self._get_rollout_data(rollout_id)
-        logger.info(f"Got {len(data)} samples from data source")
-
-        # Split samples across engines
-        samples_per_engine = self._split_samples_across_engines(data, num_engines)
-        for i, s in enumerate(samples_per_engine):
-            logger.info(f"Engine {i}: {len(s)} samples")
-
         from slime.rollout.sglang_rollout import GenerateState as SGGenerateState
 
-        # In streaming mode, rollout_num_gpus may be 0 (all GPUs are elastic).
-        import copy
+        self.engine_urls = engine_urls
+        num_engines = len(engine_urls)
+
+        # SGGenerateState is a singleton needed by generate_and_rm_group().
+        # It holds the tokenizer and a semaphore that controls HTTP concurrency.
+        # In streaming mode rollout_num_gpus is 0 (all GPUs are elastic),
+        # so we override it to the actual engine count for correct semaphore sizing.
         init_args = copy.copy(self.args)
         if init_args.rollout_num_gpus == 0:
             init_args.rollout_num_gpus = num_engines
@@ -104,10 +91,47 @@ class StreamingRolloutManager:
         state = SGGenerateState(init_args)
         logger.info(f"[ROLLOUT] SGGenerateState initialized, semaphore permits={state.semaphore._value}")
 
-        async def _run_all():
-            import asyncio
-            from slime.rollout.sglang_rollout import generate_and_rm_group
+        # Build migration policy
+        policy_name = getattr(self.args, "migration_policy", "none")
+        if policy_name == "none":
+            migration_policy = NoMigrationPolicy()
+        else:
+            raise ValueError(f"Unknown migration policy: {policy_name}")
 
+        # Create the router (reused across rollouts)
+        self.router = StreamingRouter(
+            engine_urls=engine_urls,
+            work_queue=None,  # set per-rollout in generate()
+            migration_policy=migration_policy,
+            args=self.args,
+            convert_samples_fn=self._convert_samples_to_train_data,
+        )
+        logger.info(f"[ROLLOUT] StreamingRouter created with {num_engines} engines, policy={policy_name}")
+
+    def generate(self, rollout_id: int, work_queue):
+        """Dispatch all requests through the StreamingRouter.
+
+        The router handles round-robin distribution, per-group completion,
+        work_queue pushes, engine_completed signals, and
+        mark_generation_complete.
+
+        Args:
+            rollout_id: Current rollout ID.
+            work_queue: StreamingWorkQueue actor handle.
+        """
+        assert self.router is not None, "Must call set_engine_urls() before generate()"
+
+        num_engines = len(self.engine_urls)
+        logger.info(f"generate called: rollout_id={rollout_id}, num_engines={num_engines}")
+
+        # Get all prompt data
+        data, metrics = self._get_rollout_data(rollout_id)
+        logger.info(f"Got {len(data)} samples from data source")
+
+        # Point router at this rollout's work queue
+        self.router.work_queue = work_queue
+
+        async def _run_all():
             sampling_params = self._get_sampling_params()
 
             # Inject replay lengths if configured
@@ -118,162 +142,51 @@ class StreamingRolloutManager:
                 sampling_params["__replay_lengths"] = replay_lengths
                 sampling_params["__replay_rollout_id"] = rollout_id
 
-            logger.info(f"[ROLLOUT] _run_all: sampling_params={sampling_params}")
+            logger.info(f"[ROLLOUT] sampling_params={sampling_params}")
 
-            # Build per-engine, per-group structure
-            n_spp = self.args.n_samples_per_prompt
-            engine_prompt_groups = {}
-            for engine_rank, url in enumerate(engine_urls):
-                engine_samples = samples_per_engine[engine_rank]
-                groups = [engine_samples[i:i + n_spp] for i in range(0, len(engine_samples), n_spp)]
-                engine_prompt_groups[engine_rank] = groups
-
-            # Parse engine URLs for per-group routing
-            engine_local_args = {}
-            for engine_rank, url in enumerate(engine_urls):
-                local_args = copy.copy(self.args)
-                url_parts = url.replace("http://", "").replace("https://", "")
-                if ":" in url_parts:
-                    host, port_str = url_parts.rsplit(":", 1)
-                    local_args.sglang_router_ip = host
-                    local_args.sglang_router_port = int(port_str)
-                else:
-                    local_args.sglang_router_ip = url_parts
-                    local_args.sglang_router_port = 80
-                engine_local_args[engine_rank] = local_args
-
-            # Flatten to one asyncio task per prompt group
-            tasks = {}  # task -> (engine_rank, group_idx)
-            groups_per_engine = {}  # engine_rank -> total groups
-            completed_per_engine = {}  # engine_rank -> completed count
-
-            for engine_rank, groups in engine_prompt_groups.items():
-                groups_per_engine[engine_rank] = len(groups)
-                completed_per_engine[engine_rank] = 0
-                local_args = engine_local_args[engine_rank]
-
-                for group_idx, group in enumerate(groups):
-                    logger.info(
-                        f"[ROLLOUT] Creating task: engine={engine_rank}, "
-                        f"group={group_idx}/{len(groups)}, {len(group)} samples"
-                    )
-                    task = asyncio.create_task(
-                        generate_and_rm_group(
-                            local_args, group, sampling_params.copy(), evaluation=False
-                        )
-                    )
-                    tasks[task] = (engine_rank, group_idx)
-
-            total_groups = len(tasks)
-            logger.info(f"[ROLLOUT] _run_all: {total_groups} per-group tasks across {num_engines} engines")
-
-            # Wait for groups to complete one at a time (FIRST_COMPLETED)
-            all_samples = []  # Accumulate per-sample info for rollout logging
-            pending = set(tasks.keys())
-            while pending:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    engine_rank, group_idx = tasks[task]
-                    try:
-                        completed_samples = task.result()
-                    except Exception as e:
-                        logger.error(
-                            f"[ROLLOUT] Engine {engine_rank} group {group_idx} FAILED: {e}",
-                            exc_info=True,
-                        )
-                        raise
-
-                    # Convert group samples to training data
-                    if isinstance(completed_samples, list) and len(completed_samples) > 0:
-                        # completed_samples is the group result from generate_and_rm_group
-                        flat_samples = completed_samples if isinstance(completed_samples[0], Sample) else list(itertools.chain.from_iterable(completed_samples))
-                    else:
-                        flat_samples = []
-
-                    # Accumulate sample info for per-rollout logging
-                    for si, sample in enumerate(flat_samples):
-                        prompt_str = sample.prompt if isinstance(sample.prompt, str) else str(sample.prompt)
-                        reward_val = sample.reward
-                        if isinstance(reward_val, dict):
-                            reward_val = reward_val.get(self.args.reward_key, None) if self.args.reward_key else None
-                        all_samples.append({
-                            "engine_rank": engine_rank,
-                            "group_idx": group_idx,
-                            "sample_index": sample.index,
-                            "response_length": sample.response_length,
-                            "total_length": len(sample.tokens),
-                            "status": sample.status.value,
-                            "reward": float(reward_val) if reward_val is not None else None,
-                            "truncated": sample.status == Sample.Status.TRUNCATED,
-                            "generation_latency": sample.generation_latency,
-                            "prompt_preview": prompt_str[:200],
-                            "response_preview": sample.response[:500],
-                        })
-
-                    train_data = self._convert_samples_to_train_data(flat_samples)
-                    data_ref = Box(ray.put(train_data))
-
-                    # Push per-group data to the shared work queue
-                    ray.get(work_queue.push_data.remote(data_ref))
-                    logger.info(
-                        f"[ROLLOUT] Engine {engine_rank} group {group_idx} pushed: "
-                        f"{len(flat_samples)} samples"
-                    )
-
-                    # Track per-engine completion
-                    completed_per_engine[engine_rank] += 1
-                    if completed_per_engine[engine_rank] == groups_per_engine[engine_rank]:
-                        ray.get(work_queue.engine_completed.remote(engine_rank))
-                        logger.info(
-                            f"[ROLLOUT] Engine {engine_rank} ALL {groups_per_engine[engine_rank]} "
-                            f"groups done → engine_completed"
-                        )
-
-            # Record response lengths if configured
-            if getattr(self.args, "profiling_record_lengths_path", None):
-                from slime.utils.profiling_lengths import record_lengths
-
-                record_lengths(self.args.profiling_record_lengths_path, rollout_id, all_samples)
-
-            # Signal that all generation is complete
-            ray.get(work_queue.mark_generation_complete.remote())
-            logger.info(f"[ROLLOUT] All generation complete, mark_generation_complete called")
+            # Dispatch all requests — router decides where they go
+            all_samples = await self.router.dispatch_and_collect(rollout_id, data, sampling_params)
 
             # Write per-rollout output log
-            try:
-                log_dir = "/tmp/slime_rollout_logs"
-                os.makedirs(log_dir, exist_ok=True)
-
-                response_lengths = [s["response_length"] for s in all_samples]
-                rewards = [s["reward"] for s in all_samples if s["reward"] is not None]
-                num_truncated = sum(1 for s in all_samples if s["truncated"])
-                num_completed = sum(1 for s in all_samples if s["status"] == "completed")
-
-                summary = {
-                    "rollout_id": rollout_id,
-                    "num_engines": num_engines,
-                    "num_samples": len(all_samples),
-                    "mean_response_length": sum(response_lengths) / len(response_lengths) if response_lengths else 0,
-                    "max_response_length": max(response_lengths) if response_lengths else 0,
-                    "min_response_length": min(response_lengths) if response_lengths else 0,
-                    "num_truncated": num_truncated,
-                    "num_completed": num_completed,
-                    "mean_reward": sum(rewards) / len(rewards) if rewards else None,
-                }
-
-                log_data = {"summary": summary, "samples": all_samples}
-                log_path = os.path.join(log_dir, f"rollout_{rollout_id}.json")
-                with open(log_path, "w") as f:
-                    json.dump(log_data, f, indent=2)
-                logger.info(f"[ROLLOUT] Wrote rollout log to {log_path} ({len(all_samples)} samples)")
-                return summary
-            except Exception as e:
-                logger.warning(f"[ROLLOUT] Failed to write rollout log: {e}")
+            return self._write_rollout_log(rollout_id, num_engines, all_samples)
 
         logger.info("[ROLLOUT] About to call run(_run_all())")
         result = run(_run_all())
         logger.info(f"[ROLLOUT] All {num_engines} engines completed generation for rollout {rollout_id}")
         return result
+
+    def _write_rollout_log(self, rollout_id: int, num_engines: int, all_samples: list[dict]) -> dict | None:
+        """Write per-rollout output log and return summary."""
+        try:
+            log_dir = "/tmp/slime_rollout_logs"
+            os.makedirs(log_dir, exist_ok=True)
+
+            response_lengths = [s["response_length"] for s in all_samples]
+            rewards = [s["reward"] for s in all_samples if s["reward"] is not None]
+            num_truncated = sum(1 for s in all_samples if s["truncated"])
+            num_completed = sum(1 for s in all_samples if s["status"] == "completed")
+
+            summary = {
+                "rollout_id": rollout_id,
+                "num_engines": num_engines,
+                "num_samples": len(all_samples),
+                "mean_response_length": sum(response_lengths) / len(response_lengths) if response_lengths else 0,
+                "max_response_length": max(response_lengths) if response_lengths else 0,
+                "min_response_length": min(response_lengths) if response_lengths else 0,
+                "num_truncated": num_truncated,
+                "num_completed": num_completed,
+                "mean_reward": sum(rewards) / len(rewards) if rewards else None,
+            }
+
+            log_data = {"summary": summary, "samples": all_samples}
+            log_path = os.path.join(log_dir, f"rollout_{rollout_id}.json")
+            with open(log_path, "w") as f:
+                json.dump(log_data, f, indent=2)
+            logger.info(f"[ROLLOUT] Wrote rollout log to {log_path} ({len(all_samples)} samples)")
+            return summary
+        except Exception as e:
+            logger.warning(f"[ROLLOUT] Failed to write rollout log: {e}")
+            return None
 
     def eval(self, rollout_id: int):
         """Eval delegates to the existing eval function."""
@@ -298,26 +211,6 @@ class StreamingRolloutManager:
         # Flatten groups to flat list of samples
         flat_samples = list(itertools.chain.from_iterable(samples))
         return flat_samples, {}
-
-    def _split_samples_across_engines(self, samples: list[Sample], num_engines: int) -> list[list[Sample]]:
-        """Split samples evenly across engines.
-
-        For MVP: simple round-robin by prompt groups.
-        Each engine gets samples that are a multiple of n_samples_per_prompt.
-        """
-        n_spp = self.args.n_samples_per_prompt
-
-        # Group samples by prompt (groups of n_samples_per_prompt)
-        prompt_groups = [samples[i:i + n_spp] for i in range(0, len(samples), n_spp)]
-        num_groups = len(prompt_groups)
-
-        # Distribute groups round-robin across engines
-        engine_samples = [[] for _ in range(num_engines)]
-        for i, group in enumerate(prompt_groups):
-            engine_rank = i % num_engines
-            engine_samples[engine_rank].extend(group)
-
-        return engine_samples
 
     def _get_sampling_params(self) -> dict[str, Any]:
         """Get sampling parameters from args."""
