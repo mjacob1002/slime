@@ -513,51 +513,56 @@ class RayElasticGroup:
         except ImportError:
             GPU_MEMORY_TYPE_CUDA_GRAPH = None
 
-        self._connect_weight_updaters()
+        from slime.utils.perfetto_tracer import get_tracer
+        _tracer = get_tracer()
+
+        with _tracer.event("connect_weight_updaters", device="all"):
+            self._connect_weight_updaters()
 
         # Step 1: Resume inference engine weights (they were offloaded during training)
-        print("[update_weights_and_switch] Resuming inference engine weights...")
-        self._resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        with _tracer.event("resume_weights", device="all"):
+            self._resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
         # Verification: record weight checksums + versions before push
-        checksums_before = ray.get([engine.get_weights_checksum.remote() for engine in self._inference_engines])
-        versions_before = ray.get([engine.get_weight_version.remote() for engine in self._inference_engines])
+        with _tracer.event("checksum_before", device="all"):
+            checksums_before = ray.get([engine.get_weights_checksum.remote() for engine in self._inference_engines])
+            versions_before = ray.get([engine.get_weight_version.remote() for engine in self._inference_engines])
         print(f"[update_weights_and_switch] Before push - versions: {versions_before}, checksums: {checksums_before}")
 
         # Step 2: Push fresh weights from training actors
-        print("[update_weights_and_switch] Pushing fresh weights via update_weights_from_tensor...")
-        ray.get([actor.update_weights.remote() for actor in self._training_actors])
-        print("[update_weights_and_switch] Fresh weights pushed successfully")
+        with _tracer.event("push_weights", device="all"):
+            ray.get([actor.update_weights.remote() for actor in self._training_actors])
 
         # Verification: record weight checksums + versions after push
-        checksums_after = ray.get([engine.get_weights_checksum.remote() for engine in self._inference_engines])
-        versions_after = ray.get([engine.get_weight_version.remote() for engine in self._inference_engines])
-        print(f"[update_weights_and_switch] After push  - versions: {versions_after}, checksums: {checksums_after}")
+        with _tracer.event("checksum_after", device="all"):
+            checksums_after = ray.get([engine.get_weights_checksum.remote() for engine in self._inference_engines])
+            versions_after = ray.get([engine.get_weight_version.remote() for engine in self._inference_engines])
         if checksums_before and checksums_after and checksums_before != checksums_after:
             print("[update_weights_and_switch] VERIFIED: weights changed after update")
         elif checksums_before and checksums_after and checksums_before == checksums_after:
             print("[update_weights_and_switch] WARNING: weight checksums unchanged after update!")
 
         # Step 3: Sleep training actors (free GPU memory for KV cache)
-        print("[update_weights_and_switch] Sleeping training actors...")
-        self.sleep_training_actors_lightweight()
+        with _tracer.event("sleep_training_actors", device="all"):
+            self.sleep_training_actors_lightweight()
 
         # Step 4: Onload remaining inference resources (KV cache, CUDA graphs)
         # Weights are ALREADY on GPU -- only need KV cache + CUDA graphs
-        print("[update_weights_and_switch] Loading KV cache and CUDA graphs...")
         if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
+            with _tracer.event("resume_cuda_graphs", device="all"):
+                ray.get([
+                    engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+                    for engine in self._inference_engines
+                ])
+        with _tracer.event("resume_kv_cache", device="all"):
             ray.get([
-                engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+                engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE])
                 for engine in self._inference_engines
             ])
-        ray.get([
-            engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE])
-            for engine in self._inference_engines
-        ])
 
         # Step 5: Register engines with router
-        print("[update_weights_and_switch] Registering engines with router...")
-        ray.get([engine.register_with_router.remote() for engine in self._inference_engines])
+        with _tracer.event("register_with_router", device="all"):
+            ray.get([engine.register_with_router.remote() for engine in self._inference_engines])
 
         self._mode = "inference"
         logger.info("[ELASTIC] update_weights_and_switch_to_inference: DONE")

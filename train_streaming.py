@@ -39,6 +39,7 @@ from slime.ray.streaming_rollout import StreamingRolloutManager
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.perfetto_tracer import get_tracer, init_tracer
 from slime.utils.tracking_utils import init_tracking
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,9 @@ def train(args):
     ray.get(streaming_rollout_mgr.set_engine_urls.remote(engine_urls))
     logger.info("[DRIVER] Engine URLs set, StreamingRouter ready")
 
+    # Initialize Perfetto tracer
+    init_tracer(getattr(args, "perfetto_trace_path", None))
+
     # Training loop
     total_train_start = time.time()
     n_groups = args.rollout_batch_size // args.n_samples_per_prompt
@@ -151,6 +155,10 @@ def train(args):
         gen_ref = streaming_rollout_mgr.generate.remote(rollout_id, work_queue)
         logger.info(f"[DRIVER] generate.remote() submitted, entering poll loop")
 
+        # Track inference start time per-engine for Perfetto tracing
+        inference_start_time = time.perf_counter()
+        engine_inference_start = {rank: inference_start_time for rank in range(world_size)}
+
         # Poll loop: as each engine finishes, switch it to training with work-stealing
         completed = set()
         work_stealing_futures = {}
@@ -176,6 +184,12 @@ def train(args):
             newly_done = ray.get(work_queue.get_newly_completed_engines.remote())
 
             for engine_rank in newly_done:
+                # Record per-engine inference duration
+                engine_inference_end = time.perf_counter()
+                get_tracer().emit("inference", device=engine_rank,
+                            start=engine_inference_start[engine_rank],
+                            end=engine_inference_end, rollout_id=rollout_id)
+
                 switch_start = time.time()
                 if first_engine_switch_time is None:
                     first_engine_switch_time = switch_start
@@ -187,8 +201,10 @@ def train(args):
                 # Start work-stealing training loop (non-blocking Ray future)
                 logger.info(f"[DRIVER] Starting work-stealing train for engine {engine_rank}...")
                 #NOTE: below is commented out for blations, restore this
-                work_stealing_futures[engine_rank] = elastic_group.start_work_stealing_train(
-                   engine_rank, rollout_id, work_queue
+                engine_training_start = time.perf_counter()
+                work_stealing_futures[engine_rank] = (
+                    elastic_group.start_work_stealing_train(engine_rank, rollout_id, work_queue),
+                    engine_training_start,
                 )
                 completed.add(engine_rank)
                 last_engine_done_time = time.time()
@@ -214,8 +230,17 @@ def train(args):
         logger.info("[DRIVER] Waiting for all work-stealing training futures...")
         print("[DRIVER] Waiting for all work-stealing training futures...")
         # NOTE: the below is commented out for ablations, restore this code later
-        results = ray.get(list(work_stealing_futures.values()))
-        for engine_rank, result in zip(work_stealing_futures.keys(), results):
+        refs = {rank: ref for rank, (ref, _) in work_stealing_futures.items()}
+        results = ray.get(list(refs.values()))
+        training_done_time = time.perf_counter()
+        for engine_rank, result in zip(refs.keys(), results):
+            # Emit per-engine training event
+            _, train_start = work_stealing_futures[engine_rank]
+            get_tracer().emit("training", device=engine_rank,
+                        start=train_start, end=training_done_time,
+                        rollout_id=rollout_id,
+                        samples=result['total_samples_processed'],
+                        chunks=result['num_chunks_processed'])
             logger.info(
                 f"[DRIVER] Engine {engine_rank} work-stealing done: "
                 f"samples={result['total_samples_processed']}, "
@@ -236,7 +261,8 @@ def train(args):
         # Collective gradient sync + optimizer step (ALL ranks participate)
         sync_start = time.time()
         logger.info("[DRIVER] Calling sync_all_and_step()...")
-        elastic_group.sync_all_and_step(rollout_id)
+        with get_tracer().event("gradient_sync", device="all", rollout_id=rollout_id):
+            elastic_group.sync_all_and_step(rollout_id)
         sync_elapsed = time.time() - sync_start
         logger.info(f"[DRIVER] Gradient sync + optimizer step took {sync_elapsed:.2f}s")
         print(f"Gradient sync {rollout_id} took {sync_elapsed:.2f}s")
@@ -248,7 +274,8 @@ def train(args):
         # Weight update + switch all back to inference
         wu_start = time.time()
         logger.info("[DRIVER] Calling update_weights_and_switch_to_inference()...")
-        elastic_group.update_weights_and_switch_to_inference()
+        with get_tracer().event("weight_update", device="all", rollout_id=rollout_id):
+            elastic_group.update_weights_and_switch_to_inference()
         wu_elapsed = time.time() - wu_start
         logger.info("[DRIVER] switch_all_to_inference() done")
         print(f"Weight update {rollout_id} took {wu_elapsed:.2f}s")
@@ -296,6 +323,9 @@ def train(args):
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
     print(f"[REPORT] Written to {report_path}")
+
+    # Write Perfetto trace
+    get_tracer().write()
 
     # Cleanup
     ray.get(streaming_rollout_mgr.dispose.remote())

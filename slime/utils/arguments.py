@@ -125,6 +125,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--perfetto-trace-path",
+                type=str,
+                default=None,
+                help=(
+                    "Write a Perfetto-compatible Chrome Trace Event JSON to this path "
+                    "at the end of the run. If not set, tracing is disabled (zero overhead)."
+                ),
+            )
+            parser.add_argument(
                 "--migration-policy",
                 type=str,
                 choices=["none", "long-tail"],
