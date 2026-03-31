@@ -13,6 +13,7 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.perfetto_tracer import get_tracer, init_tracer
 from slime.utils.tracking_utils import init_tracking
 
 RAY_GET_TIMEOUT = 2400# 10 minute timeout for ray.get() calls
@@ -105,6 +106,9 @@ def train(args):
                 "onload_rollout WEIGHTS",
             )
 
+    # Initialize Perfetto tracer
+    init_tracer(getattr(args, "perfetto_trace_path", None))
+
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     total_train_start_time = time.time()
@@ -118,33 +122,36 @@ def train(args):
             )
 
         rollout_start_time = time.time()
-        rollout_data_ref = ray_get_with_timeout(
-            rollout_manager.generate.remote(rollout_id),
-            f"generate rollout {rollout_id}",
-        )
+        with get_tracer().event("inference", device="all", rollout_id=rollout_id):
+            rollout_data_ref = ray_get_with_timeout(
+                rollout_manager.generate.remote(rollout_id),
+                f"generate rollout {rollout_id}",
+            )
         rollout_elapsed = time.time() - rollout_start_time
         print(f"Rollout {rollout_id} took {rollout_elapsed:.2f}s")
 
         if args.offload_rollout:
-            ray_get_with_timeout(
-                rollout_manager.offload.remote(),
-                f"offload rollout {rollout_id}",
-            )
+            with get_tracer().event("offload_rollout", device="all", rollout_id=rollout_id):
+                ray_get_with_timeout(
+                    rollout_manager.offload.remote(),
+                    f"offload rollout {rollout_id}",
+                )
 
         train_start_time = time.time()
-        if args.use_critic:
-            critic_train_handle = critic_model.async_train(rollout_id, rollout_data_ref)
-            if rollout_id >= args.num_critic_only_steps:
+        with get_tracer().event("training", device="all", rollout_id=rollout_id):
+            if args.use_critic:
+                critic_train_handle = critic_model.async_train(rollout_id, rollout_data_ref)
+                if rollout_id >= args.num_critic_only_steps:
+                    ray_get_with_timeout(
+                        actor_model.async_train(rollout_id, rollout_data_ref),
+                        f"actor train rollout {rollout_id}",
+                    )
+                ray_get_with_timeout(critic_train_handle, f"critic train rollout {rollout_id}")
+            else:
                 ray_get_with_timeout(
                     actor_model.async_train(rollout_id, rollout_data_ref),
                     f"actor train rollout {rollout_id}",
                 )
-            ray_get_with_timeout(critic_train_handle, f"critic train rollout {rollout_id}")
-        else:
-            ray_get_with_timeout(
-                actor_model.async_train(rollout_id, rollout_data_ref),
-                f"actor train rollout {rollout_id}",
-            )
         train_elapsed = time.time() - train_start_time
         print(f"Training on rollout {rollout_id} took {train_elapsed:.2f}s")
 
@@ -166,26 +173,31 @@ def train(args):
                 )
 
         print(f"[DEBUG] offload_train + onload_rollout for rollout {rollout_id}")
-        offload_train()
-        onload_rollout()
+        with get_tracer().event("offload_train", device="all", rollout_id=rollout_id):
+            offload_train()
+        with get_tracer().event("onload_rollout", device="all", rollout_id=rollout_id):
+            onload_rollout()
         weight_update_start_time = time.time()
         print(f"[DEBUG] Starting weight update after rollout {rollout_id}")
-        actor_model.update_weights()
+        with get_tracer().event("weight_update", device="all", rollout_id=rollout_id):
+            actor_model.update_weights()
         weight_update_elapsed = time.time() - weight_update_start_time
         print(f"Weight update {rollout_id} took {weight_update_elapsed:.2f}s")
 
         if args.offload_rollout:
             if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
                 print(f"[DEBUG] Loop: onload CUDA_GRAPH after rollout {rollout_id}")
-                ray_get_with_timeout(
-                    rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH]),
-                    f"loop onload CUDA_GRAPH after rollout {rollout_id}",
-                )
+                with get_tracer().event("onload_cuda_graphs", device="all", rollout_id=rollout_id):
+                    ray_get_with_timeout(
+                        rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH]),
+                        f"loop onload CUDA_GRAPH after rollout {rollout_id}",
+                    )
             print(f"[DEBUG] Loop: onload KV_CACHE after rollout {rollout_id}")
-            ray_get_with_timeout(
-                rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE]),
-                f"loop onload KV_CACHE after rollout {rollout_id}",
-            )
+            with get_tracer().event("onload_kv_cache", device="all", rollout_id=rollout_id):
+                ray_get_with_timeout(
+                    rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE]),
+                    f"loop onload KV_CACHE after rollout {rollout_id}",
+                )
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray_get_with_timeout(
@@ -196,6 +208,10 @@ def train(args):
     total_train_end_time = time.time()
     train_time = total_train_end_time - total_train_start_time
     print(f"Total training time: {train_time}")
+
+    # Write Perfetto trace
+    get_tracer().write()
+
     ray_get_with_timeout(rollout_manager.dispose.remote(), "dispose rollout manager")
 
 
