@@ -47,9 +47,6 @@ logger = logging.getLogger(__name__)
 
 def validate_streaming_args(args):
     """Validate that args are compatible with streaming synchronous training."""
-    assert args.tensor_model_parallel_size == 1, (
-        f"Streaming training requires TP=1, got TP={args.tensor_model_parallel_size}"
-    )
     assert args.pipeline_model_parallel_size == 1, (
         f"Streaming training requires PP=1, got PP={args.pipeline_model_parallel_size}"
     )
@@ -93,9 +90,11 @@ def train(args):
         args.start_rollout_id = start_rollout_id
 
     # Store training parallel config
-    world_size = args.num_elastic_nodes * args.num_elastic_gpus_per_node
-    logger.info(f"[DRIVER] Setting train_parallel_config with dp_size={world_size}")
-    elastic_group.set_train_parallel_config({"dp_size": world_size})
+    total_gpus = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+    tp_size = getattr(args, 'tensor_model_parallel_size', 1)
+    num_groups = total_gpus // tp_size
+    logger.info(f"[DRIVER] total_gpus={total_gpus}, tp_size={tp_size}, num_groups={num_groups}")
+    elastic_group.set_train_parallel_config({"dp_size": num_groups})
     logger.info("[DRIVER] train_parallel_config set")
 
     # Switch to inference mode (registers with router)
@@ -105,7 +104,7 @@ def train(args):
 
     logger.info("[DRIVER] Getting engine URLs...")
     engine_urls = elastic_group.get_engine_urls()
-    logger.info(f"[DRIVER] Streaming training initialized with {world_size} GPUs, engine URLs: {engine_urls}")
+    logger.info(f"[DRIVER] Streaming training initialized with {total_gpus} GPUs, {num_groups} groups, engine URLs: {engine_urls}")
 
     # Initialize router with engine URLs (once, before training loop)
     logger.info("[DRIVER] Setting engine URLs on StreamingRolloutManager...")
@@ -117,13 +116,13 @@ def train(args):
 
     # Training loop
     total_train_start = time.time()
-    n_groups = args.rollout_batch_size // args.n_samples_per_prompt
-    max_items_per_grab = max(1, n_groups // (world_size * 2))
+    n_prompt_groups = args.rollout_batch_size // args.n_samples_per_prompt
+    max_items_per_grab = max(1, n_prompt_groups // (num_groups * 2))
     logger.info(
-        f"[DRIVER] Creating StreamingWorkQueue for rollouts"# {rollout_id} "
+        f"[DRIVER] Creating StreamingWorkQueue for rollouts "
         f"(max_items_per_grab={max_items_per_grab})"
     )
-    work_queue = StreamingWorkQueue.remote(world_size, max_items_per_grab=max_items_per_grab)
+    work_queue = StreamingWorkQueue.remote(num_groups, max_items_per_grab=max_items_per_grab)
     all_rollout_metrics = []
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         logger.info(f"[DRIVER] === Streaming rollout {rollout_id} (V1 work-stealing) ===")
@@ -155,22 +154,22 @@ def train(args):
         gen_ref = streaming_rollout_mgr.generate.remote(rollout_id, work_queue)
         logger.info(f"[DRIVER] generate.remote() submitted, entering poll loop")
 
-        # Track inference start time per-engine for Perfetto tracing
+        # Track inference start time per-group for Perfetto tracing
         inference_start_time = time.perf_counter()
-        engine_inference_start = {rank: inference_start_time for rank in range(world_size)}
+        engine_inference_start = {rank: inference_start_time for rank in range(num_groups)}
 
-        # Poll loop: as each engine finishes, switch it to training with work-stealing
+        # Poll loop: as each engine group finishes, switch it to training with work-stealing
         completed = set()
         work_stealing_futures = {}
         poll_count = 0
         first_engine_switch_time = None
         last_engine_done_time = None
 
-        while len(completed) < world_size:
+        while len(completed) < num_groups:
             time.sleep(0.1)  # poll interval
             poll_count += 1
             if poll_count % 50 == 0:
-                logger.info(f"[DRIVER] Poll #{poll_count}, {len(completed)}/{world_size} completed, elapsed={time.time() - rollout_start:.1f}s")
+                logger.info(f"[DRIVER] Poll #{poll_count}, {len(completed)}/{num_groups} completed, elapsed={time.time() - rollout_start:.1f}s")
 
             # Check if gen task crashed (non-blocking)
             ready, _ = ray.wait([gen_ref], timeout=0)
@@ -183,39 +182,37 @@ def train(args):
 
             newly_done = ray.get(work_queue.get_newly_completed_engines.remote())
 
-            for engine_rank in newly_done:
-                # Record per-engine inference duration
+            for group_rank in newly_done:
+                # Record per-group inference duration
                 engine_inference_end = time.perf_counter()
-                get_tracer().emit("inference", device=engine_rank,
-                            start=engine_inference_start[engine_rank],
+                get_tracer().emit("inference", device=group_rank,
+                            start=engine_inference_start[group_rank],
                             end=engine_inference_end, rollout_id=rollout_id)
 
                 switch_start = time.time()
                 if first_engine_switch_time is None:
                     first_engine_switch_time = switch_start
-                logger.info(f"[DRIVER] Engine {engine_rank} completed generation, switching to training...")
-                # NOTE: the below is commented out for ablations, restore this after
-                # Switch this engine to training (non-collective, per-engine)
-                elastic_group.switch_engine_to_training(engine_rank)
+                logger.info(f"[DRIVER] Group {group_rank} completed generation, switching to training...")
+                # Switch this group to training (non-collective, per-group)
+                elastic_group.switch_engine_to_training(group_rank)
 
-                # Start work-stealing training loop (non-blocking Ray future)
-                logger.info(f"[DRIVER] Starting work-stealing train for engine {engine_rank}...")
-                #NOTE: below is commented out for blations, restore this
+                # Start work-stealing training loop on all actors in group (non-blocking)
+                logger.info(f"[DRIVER] Starting work-stealing train for group {group_rank}...")
                 engine_training_start = time.perf_counter()
-                work_stealing_futures[engine_rank] = (
-                    elastic_group.start_work_stealing_train(engine_rank, rollout_id, work_queue),
+                work_stealing_futures[group_rank] = (
+                    elastic_group.start_work_stealing_train(group_rank, rollout_id, work_queue),
                     engine_training_start,
                 )
-                completed.add(engine_rank)
+                completed.add(group_rank)
                 last_engine_done_time = time.time()
                 logger.info(
-                    f"[DRIVER] Engine {engine_rank} switched to training "
+                    f"[DRIVER] Group {group_rank} switched to training "
                     f"({time.time() - switch_start:.2f}s), "
-                    f"{len(completed)}/{world_size} engines in training"
+                    f"{len(completed)}/{num_groups} groups in training"
                 )
-                print(f"[PRINT_INFO][DRIVER] Engine {engine_rank} switched to training "
+                print(f"[PRINT_INFO][DRIVER] Group {group_rank} switched to training "
                     f"({time.time() - switch_start:.2f}s), "
-                    f"{len(completed)}/{world_size} engines in training")
+                    f"{len(completed)}/{num_groups} groups in training")
 
         # Inference time: from rollout_start to last engine completing generation
         inference_elapsed = last_engine_done_time - rollout_start
@@ -227,32 +224,35 @@ def train(args):
         logger.info("[DRIVER] generate finished")
 
         # Wait for all work-stealing training loops to finish
+        # start_work_stealing_train returns a list of futures (one per actor in TP group).
+        # Collect all futures and wait; use TP rank 0's result for metrics.
         logger.info("[DRIVER] Waiting for all work-stealing training futures...")
         print("[DRIVER] Waiting for all work-stealing training futures...")
-        # NOTE: the below is commented out for ablations, restore this code later
-        refs = {rank: ref for rank, (ref, _) in work_stealing_futures.items()}
-        results = ray.get(list(refs.values()))
+        all_refs = []
+        for group_rank, (ref_list, _) in work_stealing_futures.items():
+            all_refs.extend(ref_list)
+        ray.get(all_refs)
         training_done_time = time.perf_counter()
-        for engine_rank, result in zip(refs.keys(), results):
-            # Emit per-engine training event
-            _, train_start = work_stealing_futures[engine_rank]
-            get_tracer().emit("training", device=engine_rank,
+        for group_rank, (ref_list, train_start) in work_stealing_futures.items():
+            # Use TP rank 0's result (first in list) for metrics
+            result = ray.get(ref_list[0])
+            get_tracer().emit("training", device=group_rank,
                         start=train_start, end=training_done_time,
                         rollout_id=rollout_id,
                         samples=result['total_samples_processed'],
                         chunks=result['num_chunks_processed'])
             logger.info(
-                f"[DRIVER] Engine {engine_rank} work-stealing done: "
+                f"[DRIVER] Group {group_rank} work-stealing done: "
                 f"samples={result['total_samples_processed']}, "
                 f"chunks={result['num_chunks_processed']}"
             )
             print(
-                f"[DRIVER] Engine {engine_rank} work-stealing done: "
+                f"[DRIVER] Group {group_rank} work-stealing done: "
                 f"samples={result['total_samples_processed']}, "
                 f"chunks={result['num_chunks_processed']}"
             )
-        logger.info(f"[DRIVER] All {world_size} engines completed work-stealing training")
-        print(f"[DRIVER] All {world_size} engines completed work-stealing training")
+        logger.info(f"[DRIVER] All {num_groups} groups completed work-stealing training")
+        print(f"[DRIVER] All {num_groups} groups completed work-stealing training")
 
         # Training time: from first engine switch to end of work-stealing
         training_elapsed = time.time() - first_engine_switch_time
@@ -316,7 +316,9 @@ def train(args):
     report = {
         "total_training_time_s": total_time,
         "num_rollouts": args.num_rollout,
-        "world_size": world_size,
+        "total_gpus": total_gpus,
+        "tp_size": tp_size,
+        "num_groups": num_groups,
         "rollouts": all_rollout_metrics,
     }
     report_path = "/tmp/slime_streaming_report.json"

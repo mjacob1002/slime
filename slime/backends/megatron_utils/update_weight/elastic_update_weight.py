@@ -64,15 +64,23 @@ class ElasticUpdateWeight:
             args=args, model=model, model_name=model_name, quantization_config=quantization_config
         )
 
-        # In elastic mode, each actor has rollout_num_gpus_per_engine = 1
-        # So we create a Gloo group of size 1 (just this rank)
         self._ipc_engine = None
         self._engine_lock = None
 
-        # For elastic mode with TP > 1 engines, we'd need proper gather groups
-        # For now, assume 1 GPU per engine (common case)
+        # Create Gloo gather groups for TP weight gathering.
+        # With TP=1 (rollout_num_gpus_per_engine=1), each group has size 1 (no-op gather).
+        # With TP>1, ranks in the same TP group gather their shards before sending.
+        # Pattern from UpdateWeightFromTensor.__init__() lines 54-61.
+        gpus_per_engine = getattr(self.args, 'rollout_num_gpus_per_engine', 1)
         self._ipc_gather_group = None
         self._ipc_gather_src = dist.get_rank()
+        for start_rank in range(0, dist.get_world_size(), gpus_per_engine):
+            end_rank = start_rank + gpus_per_engine
+            group_ranks = list(range(start_rank, end_rank))
+            new_group = dist.new_group(ranks=group_ranks, backend="gloo")
+            if dist.get_rank() in group_ranks:
+                self._ipc_gather_group = new_group
+                self._ipc_gather_src = start_rank
 
     def connect_rollout_engine(
         self,
@@ -120,10 +128,12 @@ class ElasticUpdateWeight:
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list, Any]:
         """
-        Serialize and send HF params to the paired engine.
+        Serialize HF params, gather across TP ranks, and send to engine.
 
-        For elastic mode with 1 GPU per engine, we don't need gather_object -
-        just serialize locally and send directly.
+        With TP=1, gather is a no-op (group size 1).
+        With TP>1, all TP ranks serialize their shards, TP rank 0 gathers
+        them via Gloo and sends the collected shards to the engine.
+        Pattern from _send_to_colocated_engine() in update_weight_from_tensor.py.
         """
         long_live_tensors = []
 
@@ -152,15 +162,29 @@ class ElasticUpdateWeight:
                 MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
             )
 
-        # For elastic mode with 1 GPU per engine, send directly without gather
-        # Each rank sends to its own paired engine
+        # Gather TP shards: all ranks in the gather group participate,
+        # but only the gather source (TP rank 0) collects the results.
+        serialized_named_tensors = (
+            [None] * dist.get_world_size(self._ipc_gather_group)
+            if self._ipc_gather_src == dist.get_rank() else None
+        )
+        dist.gather_object(
+            serialized_tensors,
+            object_gather_list=serialized_named_tensors,
+            dst=self._ipc_gather_src,
+            group=self._ipc_gather_group,
+        )
+
+        # Only TP rank 0 (gather source) sends to the engine
         refs = []
-        for serialized_tensor in serialized_tensors:
-            kwargs = {
-                "serialized_named_tensors": [serialized_tensor],
-                "load_format": "flattened_bucket",
-                "weight_version": str(self.weight_version),
-            }
-            refs.append(self._ipc_engine.update_weights_from_tensor.remote(**kwargs))
+        if dist.get_rank() == self._ipc_gather_src:
+            num_dtypes = len(serialized_named_tensors[0])
+            for i in range(num_dtypes):
+                kwargs = {
+                    "serialized_named_tensors": [tensors[i] for tensors in serialized_named_tensors],
+                    "load_format": "flattened_bucket",
+                    "weight_version": str(self.weight_version),
+                }
+                refs.append(self._ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
         return refs, long_live_tensors

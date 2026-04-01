@@ -64,17 +64,30 @@ class RayElasticGroup:
         world_size = args.num_elastic_nodes * args.num_elastic_gpus_per_node
         self._world_size = world_size
 
-        # Create training actors
+        # TP group abstraction: group GPUs into TP groups
+        self._tp_size = getattr(args, 'tensor_model_parallel_size', 1)
+        self._num_groups = world_size // self._tp_size
+
+        # Create training actors (one per GPU, as before)
         self._training_actors = self._create_training_actors(
             args, placement_group, reordered_bundle_indices, reordered_gpu_ids, world_size
         )
 
-        # Create inference engines
+        # Build actor groups: _actor_groups[g] = [actors in TP group g]
+        self._actor_groups = [
+            self._training_actors[g * self._tp_size : (g + 1) * self._tp_size]
+            for g in range(self._num_groups)
+        ]
+
+        # Create inference engines (one per TP group)
         self._inference_engines = self._create_inference_engines(
-            args, placement_group, reordered_bundle_indices, reordered_gpu_ids, world_size
+            args, placement_group, reordered_bundle_indices, reordered_gpu_ids
         )
 
-        logger.info(f"Created RayElasticGroup with {world_size} training actors and {world_size} inference engines")
+        logger.info(
+            f"Created RayElasticGroup with {world_size} training actors and "
+            f"{self._num_groups} inference engines ({self._tp_size}-way TP)"
+        )
 
     def _create_training_actors(
         self, args, pg, bundle_indices, gpu_ids, world_size
@@ -139,13 +152,18 @@ class RayElasticGroup:
         return actors
 
     def _create_inference_engines(
-        self, args, pg, bundle_indices, gpu_ids, world_size
+        self, args, pg, bundle_indices, gpu_ids
     ) -> list:
-        """Create inference engines using rollout.py pattern."""
-        # Elastic engines need memory saver enabled to offload weights during training
+        """Create inference engines — one per TP group.
+
+        With TP=1, this creates one engine per GPU (same as before).
+        With TP>1, this creates num_groups engines, each spanning tp_size GPUs.
+        """
         import copy
         elastic_args = copy.copy(args)
         elastic_args.offload_rollout = True
+        # Ensure SGLang uses --tp tp_size
+        elastic_args.rollout_num_gpus_per_engine = self._tp_size
 
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
             "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
@@ -161,9 +179,11 @@ class RayElasticGroup:
         RolloutRayActor = ray.remote(SGLangEngine)
 
         engines = []
-        for rank in range(world_size):
-            bundle_index = bundle_indices[rank]
-            base_gpu_id = int(gpu_ids[rank])
+        for group_rank in range(self._num_groups):
+            # Place engine on the first GPU in this TP group
+            first_gpu_in_group = group_rank * self._tp_size
+            bundle_index = bundle_indices[first_gpu_in_group]
+            base_gpu_id = int(gpu_ids[first_gpu_in_group])
 
             engine = RolloutRayActor.options(
                 num_cpus=0.2,
@@ -174,7 +194,7 @@ class RayElasticGroup:
                     placement_group_bundle_index=bundle_index,
                 ),
                 runtime_env={"env_vars": env_vars},
-            ).remote(elastic_args, rank=rank, worker_type="regular", base_gpu_id=base_gpu_id)
+            ).remote(elastic_args, rank=group_rank, worker_type="regular", base_gpu_id=base_gpu_id)
 
             engines.append(engine)
 
@@ -194,6 +214,11 @@ class RayElasticGroup:
             actor.init.remote(self.args, role="actor", with_ref=self.args.kl_coef != 0 or self.args.use_kl_loss)
             for actor in self._training_actors
         ])
+        # Create TP Gloo groups while all actors are awake (collective operation).
+        # Must happen before sleep, since dist.new_group requires all ranks.
+        if self._streaming and self._tp_size > 1:
+            ray.get([actor.init_tp_gloo_group.remote() for actor in self._training_actors])
+            logger.info(f"[ELASTIC] TP Gloo groups initialized for {self._world_size} actors")
         # for the sake of initializing the engine
         if self._streaming:
             self.sleep_training_actors_lightweight()
@@ -399,13 +424,15 @@ class RayElasticGroup:
         # Create lock actor for coordinating weight updates
         self._engine_lock = Lock.options(num_cpus=0, num_gpus=0).remote()
 
-        # Each training actor connects to its paired inference engine
-        # Use elastic_connect_rollout_engine which bypasses rank-based selection
-        for actor, engine in zip(self._training_actors, self._inference_engines):
-            ray.get(actor.elastic_connect_rollout_engine.remote(engine, self._engine_lock))
+        # Each training actor connects to its TP group's inference engine.
+        # With TP>1, multiple actors share one engine.
+        for group_rank in range(self._num_groups):
+            engine = self._inference_engines[group_rank]
+            for actor in self._actor_groups[group_rank]:
+                ray.get(actor.elastic_connect_rollout_engine.remote(engine, self._engine_lock))
 
         self._weight_updaters_connected = True
-        logger.info("Connected weight updaters for elastic actors")
+        logger.info(f"Connected weight updaters: {self._num_groups} groups, {len(self._training_actors)} actors")
 
     def update_weights(self):
         """
@@ -700,70 +727,68 @@ class RayElasticGroup:
         infos = ray.get([engine.get_server_info.remote() for engine in self._inference_engines])
         return [f"http://{host}:{port}" for host, port in infos]
 
-    def switch_engine_to_training(self, engine_rank: int):
-        """Switch a single engine from inference to training mode.
+    def switch_engine_to_training(self, group_rank: int):
+        """Switch a TP group from inference to training mode.
 
-        Per-engine, non-collective:
+        Per-group, non-collective:
         1. Deregister engine from router
         2. Release engine GPU memory
-        3. Wake up the paired training actor (lightweight)
+        3. Wake up ALL training actors in the group (lightweight)
 
         Args:
-            engine_rank: Index of the engine to switch.
+            group_rank: Index of the engine/group to switch.
         """
-        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): starting")
-        engine = self._inference_engines[engine_rank]
-        actor = self._training_actors[engine_rank]
+        logger.info(f"[ELASTIC] switch_engine_to_training(group={group_rank}): starting")
+        engine = self._inference_engines[group_rank]
+        actors = self._actor_groups[group_rank]
 
         # 1. Deregister from router so it doesn't receive new requests
-        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): deregistering from router...")
         ray.get(engine.deregister_from_router.remote())
 
         # 2. Release inference GPU memory
-        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): releasing memory...")
         ray.get(engine.release_memory_occupation.remote())
 
-        # 3. Wake up training actor (non-collective, NCCL already alive)
-        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): waking up training actor...")
-        ray.get(actor.wake_up_lightweight.remote())
+        # 3. Wake up ALL training actors in this TP group
+        ray.get([actor.wake_up_lightweight.remote() for actor in actors])
 
-        logger.info(f"[ELASTIC] switch_engine_to_training({engine_rank}): DONE")
+        logger.info(f"[ELASTIC] switch_engine_to_training(group={group_rank}): DONE ({len(actors)} actors woken)")
 
-    def start_local_train(self, engine_rank: int, rollout_id: int, data_ref) -> "ray.ObjectRef":
-        """Start local forward+backward on a single training actor.
+    def start_local_train(self, group_rank: int, rollout_id: int, data_ref) -> list["ray.ObjectRef"]:
+        """Start local forward+backward on all training actors in a group.
 
-        Non-blocking: returns a Ray ObjectRef (future).
+        Non-blocking: returns Ray ObjectRefs (futures).
 
         Args:
-            engine_rank: Index of the training actor.
+            group_rank: Index of the TP group.
             rollout_id: Current rollout ID.
             data_ref: Box containing the training data reference.
 
         Returns:
-            Ray ObjectRef for the training future.
+            List of Ray ObjectRefs for the training futures.
         """
-        logger.info(f"[ELASTIC] start_local_train(engine_rank={engine_rank}, rollout_id={rollout_id})")
-        actor = self._training_actors[engine_rank]
-        return actor.train_forward_backward_local.remote(rollout_id, data_ref)
+        logger.info(f"[ELASTIC] start_local_train(group={group_rank}, rollout_id={rollout_id})")
+        actors = self._actor_groups[group_rank]
+        return [actor.train_forward_backward_local.remote(rollout_id, data_ref) for actor in actors]
 
-    def start_work_stealing_train(self, engine_rank: int, rollout_id: int, work_queue) -> "ray.ObjectRef":
-        """Start work-stealing training loop on a single training actor.
+    def start_work_stealing_train(self, group_rank: int, rollout_id: int, work_queue) -> list["ray.ObjectRef"]:
+        """Start work-stealing training loop on all actors in a TP group.
 
-        Non-blocking: returns a Ray ObjectRef (future). The actor will
-        grab data from the shared work queue, train, and repeat until done.
+        Non-blocking: returns Ray ObjectRefs (futures). All actors in the
+        group grab the same data (TP rank 0 grabs, broadcasts to others)
+        and run forward+backward in lockstep via TP NCCL collectives.
 
         Args:
-            engine_rank: Index of the training actor.
+            group_rank: Index of the TP group.
             rollout_id: Current rollout ID.
             work_queue: StreamingWorkQueue actor handle.
 
         Returns:
-            Ray ObjectRef for the training future.
+            List of Ray ObjectRefs for the training futures.
         """
-        logger.info(f"[ELASTIC] start_work_stealing_train(engine_rank={engine_rank}, rollout_id={rollout_id})")
-        actor = self._training_actors[engine_rank]
-        dp_size = self._world_size
-        return actor.train_work_stealing.remote(work_queue, dp_size)
+        logger.info(f"[ELASTIC] start_work_stealing_train(group={group_rank}, rollout_id={rollout_id})")
+        actors = self._actor_groups[group_rank]
+        dp_size = self._num_groups
+        return [actor.train_work_stealing.remote(work_queue, dp_size) for actor in actors]
 
     def sync_all_and_step(self, rollout_id: int):
         """Collective gradient sync + optimizer step on ALL training actors.
