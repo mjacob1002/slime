@@ -125,6 +125,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--max-items-per-grab",
+                type=int,
+                default=None,
+                help=(
+                    "Override max items per grab in the streaming work queue. "
+                    "If not set, defaults to n_prompt_groups // (num_groups * 2). "
+                    "Larger values reduce training overhead but may starve other groups."
+                ),
+            )
+            parser.add_argument(
                 "--perfetto-trace-path",
                 type=str,
                 default=None,

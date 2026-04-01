@@ -117,7 +117,10 @@ def train(args):
     # Training loop
     total_train_start = time.time()
     n_prompt_groups = args.rollout_batch_size // args.n_samples_per_prompt
-    max_items_per_grab = max(1, n_prompt_groups // (num_groups * 2))
+    if getattr(args, 'max_items_per_grab', None) is not None:
+        max_items_per_grab = args.max_items_per_grab
+    else:
+        max_items_per_grab = max(1, n_prompt_groups // (num_groups * 2))
     logger.info(
         f"[DRIVER] Creating StreamingWorkQueue for rollouts "
         f"(max_items_per_grab={max_items_per_grab})"
