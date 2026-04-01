@@ -1704,10 +1704,22 @@ def slime_validate_args(args):
         # Note: Elastic actors handle their own offloading internally via switch_to_training()/switch_to_inference()
         # Do NOT set offload_train/offload_rollout here - those flags control DEDICATED actors/rollout
         args.elastic_mode = True
+        # In elastic mode, each inference engine needs tp_size GPUs.
+        # Propagate tensor_model_parallel_size to rollout_num_gpus_per_engine
+        # so SGLang gets --tp and ElasticUpdateWeight creates correct gather groups.
+        tp_size = getattr(args, 'tensor_model_parallel_size', 1)
+        if tp_size > 1:
+            args.rollout_num_gpus_per_engine = tp_size
+            total_elastic_gpus = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+            assert total_elastic_gpus % tp_size == 0, (
+                f"Total elastic GPUs ({total_elastic_gpus}) must be divisible by "
+                f"tensor_model_parallel_size ({tp_size})"
+            )
         logger.info(
             f"Elastic group enabled with {args.num_elastic_nodes} nodes x "
             f"{args.num_elastic_gpus_per_node} GPUs/node = "
-            f"{args.num_elastic_nodes * args.num_elastic_gpus_per_node} total elastic actors"
+            f"{args.num_elastic_nodes * args.num_elastic_gpus_per_node} total elastic GPUs"
+            f" (tp_size={tp_size}, num_groups={args.num_elastic_nodes * args.num_elastic_gpus_per_node // tp_size})"
         )
     else:
         args.elastic_mode = False

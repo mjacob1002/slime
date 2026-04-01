@@ -369,8 +369,36 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         # Use dp_size=1 for V0 path (no dynamic scaling)
         return self._process_chunk(rollout_data, dp_size=1)
 
+    def init_tp_gloo_group(self):
+        """Create per-TP-group Gloo groups for data broadcast.
+
+        MUST be called collectively by ALL ranks before any work-stealing
+        begins, because dist.new_group is a collective operation.
+        Call this during init, when all actors are alive.
+        """
+        import torch.distributed as dist
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        if tp_size <= 1:
+            self._tp_gloo_group = None
+            return
+        global_rank = dist.get_rank()
+        self._tp_gloo_group = None
+        for start_rank in range(0, dist.get_world_size(), tp_size):
+            group_ranks = list(range(start_rank, start_rank + tp_size))
+            new_group = dist.new_group(ranks=group_ranks, backend="gloo")
+            if global_rank in group_ranks:
+                self._tp_gloo_group = new_group
+        logger.info(
+            f"[STREAMING] Created TP Gloo group: "
+            f"tp_rank={mpu.get_tensor_model_parallel_rank()}, "
+            f"global_rank={global_rank}"
+        )
+
     def train_work_stealing(self, work_queue_handle, dp_size: int) -> dict:
         """Buffered work-stealing loop: grab data from shared queue, train, repeat.
+
+        With TP>1, only TP rank 0 grabs from the queue and broadcasts data
+        to other TP ranks via Gloo, so all ranks process the same data.
 
         Args:
             work_queue_handle: Ray actor handle for StreamingWorkQueue.
@@ -380,12 +408,21 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             dict with 'total_samples_processed' and 'num_chunks_processed'
         """
         import ray
+        import torch.distributed as dist
+
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        tp_gloo_group = getattr(self, '_tp_gloo_group', None)
+        is_tp_src = (tp_rank == 0)
+        # Global rank of TP rank 0 in this group (for broadcast src)
+        global_rank = dist.get_rank()
+        tp_src_global_rank = (global_rank // tp_size) * tp_size
 
         total_samples = 0
         num_chunks = 0
         buffer = []
 
-        logger.info("[WORK_STEAL] Starting work-stealing loop")
+        logger.info(f"[WORK_STEAL] Starting work-stealing loop (tp_rank={tp_rank}, tp_size={tp_size})")
         self._log_memory("work_steal:loop_start")
 
         # Opt-in memory profiling (set SLIME_MEMORY_SNAPSHOT_DIR to enable)
@@ -403,17 +440,29 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             torch._C._cuda_attach_out_of_memory_observer(_oom_observer)
 
         while True:
-            # Grab available data from the shared queue
-            new_items = ray.get(work_queue_handle.grab_available.remote())
-            if new_items:
-                # Resolve ray refs to actual data
+            # TP rank 0 grabs from queue; other TP ranks wait for broadcast
+            if is_tp_src:
+                new_items = ray.get(work_queue_handle.grab_available.remote())
+                resolved = []
                 for item in new_items:
                     if isinstance(item, Box):
                         data = ray.get(item.inner)
                     else:
                         data = item
-                    buffer.append(data)
-                logger.info(f"[WORK_STEAL] Grabbed {len(new_items)} items, buffer={len(buffer)}")
+                    resolved.append(data)
+            else:
+                resolved = []
+
+            # Broadcast resolved data from TP rank 0 to all TP ranks
+            if tp_size > 1:
+                broadcast_payload = [resolved]
+                dist.broadcast_object_list(broadcast_payload, src=tp_src_global_rank, group=tp_gloo_group)
+                resolved = broadcast_payload[0]
+
+            if resolved:
+                buffer.extend(resolved)
+                if is_tp_src:
+                    logger.info(f"[WORK_STEAL] Grabbed {len(resolved)} items, buffer={len(buffer)}")
 
             # Process buffer if we have data
             if buffer:
@@ -426,19 +475,29 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                 total_samples += result["num_local_samples"]
                 num_chunks += 1
                 self._log_memory(f"work_steal:after_chunk_{num_chunks}")
-                logger.info(
-                    f"[WORK_STEAL] Processed chunk {num_chunks}: "
-                    f"{result['num_local_samples']} samples, "
-                    f"total={total_samples}"
-                )
+                if is_tp_src:
+                    logger.info(
+                        f"[WORK_STEAL] Processed chunk {num_chunks}: "
+                        f"{result['num_local_samples']} samples, "
+                        f"total={total_samples}"
+                    )
 
-            # Check if all generation is done and queue is drained
-            done = ray.get(work_queue_handle.is_done.remote())
+            # TP rank 0 checks completion; broadcast to other TP ranks
+            if is_tp_src:
+                done = ray.get(work_queue_handle.is_done.remote())
+            else:
+                done = False
+
+            if tp_size > 1:
+                done_payload = [done]
+                dist.broadcast_object_list(done_payload, src=tp_src_global_rank, group=tp_gloo_group)
+                done = done_payload[0]
+
             if done and not buffer:
                 break
 
             # Brief sleep to avoid busy-waiting when queue is empty
-            if not new_items and not buffer:
+            if not resolved and not buffer:
                 time.sleep(0.05)
 
         if snapshot_dir:
