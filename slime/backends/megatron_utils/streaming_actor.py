@@ -217,6 +217,8 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             ]
 
     def _process_chunk(self, rollout_data: dict, dp_size: int) -> dict:
+        # NOTE: unsure about the dynamic_global_batch_size thing - funky thing is happening there
+        
         """Process a chunk of rollout data: forward+backward with no collective sync.
 
         Sets dynamic_global_batch_size = num_samples * dp_size to ensure
@@ -230,6 +232,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             dict with 'num_local_samples' and 'num_microbatches'
         """
         args = get_args()
+        chunk_start_time = time.perf_counter()
 
         torch.cuda.reset_peak_memory_stats()
         self._log_memory("_process_chunk:start")
@@ -249,28 +252,36 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             return {"num_local_samples": 0, "num_microbatches": [0]}
 
         # Compute log probs and advantages
+        ref_logprob_time = 0.0
+        actor_logprob_time = 0.0
+        advantages_time = 0.0
         if args.compute_advantages_and_returns:
             if "ref" in self.weights_backuper.backup_tags:
                 self._log_memory("_process_chunk:before_ref_logprob")
                 self._switch_model("ref")
+                t0 = time.perf_counter()
                 rollout_data.update(
                     self.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")
                 )
+                ref_logprob_time = time.perf_counter() - t0
                 self._log_memory("_process_chunk:after_ref_logprob")
-                # clear_memory()  # TODO: reclaim between phases
 
             self._switch_model("actor")
             if not args.use_rollout_logprobs:
                 self._log_memory("_process_chunk:before_actor_logprob")
+                t0 = time.perf_counter()
                 rollout_data.update(
                     self.compute_log_prob(data_iterator, num_microbatches, store_prefix="")
                 )
+                actor_logprob_time = time.perf_counter() - t0
                 self._log_memory("_process_chunk:after_actor_logprob")
-                clear_memory()  # reclaim between phases to avoid fragmentation
+                clear_memory()
 
+            t0 = time.perf_counter()
             compute_advantages_and_returns(args, rollout_data)
+            advantages_time = time.perf_counter() - t0
             self._log_memory("_process_chunk:after_advantages")
-            clear_memory()  # reclaim between phases to avoid fragmentation
+            clear_memory()
 
         # Reset data iterator after log prob forward passes consumed it
         for iterator in data_iterator:
@@ -281,6 +292,8 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
         # Zero grads and run forward+backward
         self._zero_grads()
+
+        microbatch_stats = []
 
         def forward_step(data_iterator, model, return_schedule_plan=False):
             assert not return_schedule_plan
@@ -305,6 +318,10 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                 args.qkv_format,
             )
 
+            mb_samples = len(batch["total_lengths"]) if batch.get("total_lengths") else 0
+            mb_tokens = sum(batch["total_lengths"]) if batch.get("total_lengths") else 0
+            mb_max_len = max(batch["total_lengths"]) if batch.get("total_lengths") else 0
+
             forward_kwargs = {
                 "input_ids": batch["tokens"],
                 "position_ids": None,
@@ -317,11 +334,22 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             if batch["multimodal_train_inputs"] is not None:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
 
+            t0 = time.perf_counter()
             output_tensor = model(**forward_kwargs)
+            fwd_time = time.perf_counter() - t0
+
+            microbatch_stats.append({
+                "samples": mb_samples,
+                "tokens": mb_tokens,
+                "max_len": mb_max_len,
+                "fwd_time_s": round(fwd_time, 4),
+            })
+
             return output_tensor, partial(loss_function, args, batch, num_microbatches[0])
 
         self._log_memory("_process_chunk:before_fwd_bwd")
 
+        fwd_bwd_start = time.perf_counter()
         forward_backward_func = get_forward_backward_func()
         forward_backward_func(
             forward_step_func=forward_step,
@@ -333,25 +361,45 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
         )
+        fwd_bwd_time = time.perf_counter() - fwd_bwd_start
 
         self._log_memory("_process_chunk:after_fwd_bwd")
 
         # Restore original finalize_model_grads_func
         self._restore_training_config(config, original_finalize_func)
 
+        # Aggregate microbatch stats
+        total_mb_tokens = sum(s["tokens"] for s in microbatch_stats)
+        total_fwd_time = sum(s["fwd_time_s"] for s in microbatch_stats)
+        throughput = total_mb_tokens / fwd_bwd_time if fwd_bwd_time > 0 else 0
+
+        chunk_total_time = ref_logprob_time + actor_logprob_time + advantages_time + fwd_bwd_time
+
         logger.info(
             f"Completed _process_chunk: "
-            f"num_local_samples={num_local_samples}, "
-            f"num_microbatches={num_microbatches}, "
-            f"dynamic_global_batch_size={rollout_data['dynamic_global_batch_size']}"
+            f"samples={num_local_samples}, mbs={num_microbatches}, "
+            f"tokens={total_mb_tokens}, "
+            f"ref_logprob={ref_logprob_time:.2f}s, actor_logprob={actor_logprob_time:.2f}s, "
+            f"advantages={advantages_time:.2f}s, fwd_bwd={fwd_bwd_time:.2f}s, "
+            f"chunk_total={chunk_total_time:.2f}s, throughput={throughput:.0f} tok/s"
         )
 
-        # clear_memory()  # TODO: reclaim at end of chunk
         self._log_memory("_process_chunk:end")
+        chunk_end_time = time.perf_counter()
 
         return {
             "num_local_samples": num_local_samples,
             "num_microbatches": num_microbatches,
+            "microbatch_stats": microbatch_stats,
+            "ref_logprob_time_s": round(ref_logprob_time, 3),
+            "actor_logprob_time_s": round(actor_logprob_time, 3),
+            "advantages_time_s": round(advantages_time, 3),
+            "fwd_bwd_time_s": round(fwd_bwd_time, 3),
+            "chunk_total_time_s": round(chunk_total_time, 3),
+            "total_tokens": total_mb_tokens,
+            "throughput_tok_s": round(throughput, 0),
+            "chunk_start_perf": chunk_start_time,
+            "chunk_end_perf": chunk_end_time,
         }
 
     def train_forward_backward_local(self, rollout_id: int, rollout_data_ref: Box) -> dict:
@@ -419,8 +467,10 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         tp_src_global_rank = (global_rank // tp_size) * tp_size
 
         total_samples = 0
+        total_tokens_processed = 0
         num_chunks = 0
         buffer = []
+        all_chunk_stats = []
 
         logger.info(f"[WORK_STEAL] Starting work-stealing loop (tp_rank={tp_rank}, tp_size={tp_size})")
         self._log_memory("work_steal:loop_start")
@@ -462,6 +512,17 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             if resolved:
                 buffer.extend(resolved)
                 if is_tp_src:
+                    # Log token-level stats for each grabbed item
+                    for item in resolved:
+                        lengths = item.get("total_lengths", [])
+                        n_samp = len(lengths)
+                        total_tokens = sum(lengths) if lengths else 0
+                        avg_len = total_tokens / n_samp if n_samp else 0
+                        max_len = max(lengths) if lengths else 0
+                        logger.info(
+                            f"[WORK_STEAL] Grabbed group: {n_samp} samples, "
+                            f"total_tokens={total_tokens}, avg_len={avg_len:.0f}, max_len={max_len}"
+                        )
                     logger.info(f"[WORK_STEAL] Grabbed {len(resolved)} items, buffer={len(buffer)}")
 
             # Process buffer if we have data
@@ -469,11 +530,42 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                 merged = self._merge_rollout_data(buffer)
                 buffer = []
 
+                # Log chunk-level token stats before processing
+                if is_tp_src:
+                    chunk_lengths = merged.get("total_lengths", [])
+                    chunk_total_tokens = sum(chunk_lengths) if chunk_lengths else 0
+                    chunk_avg = chunk_total_tokens / len(chunk_lengths) if chunk_lengths else 0
+                    chunk_max = max(chunk_lengths) if chunk_lengths else 0
+                    logger.info(
+                        f"[WORK_STEAL] Processing chunk: {len(chunk_lengths)} samples, "
+                        f"total_tokens={chunk_total_tokens}, avg_len={chunk_avg:.0f}, max_len={chunk_max}"
+                    )
+
                 result = self._process_chunk(merged, dp_size=dp_size)
                 del merged
                 clear_memory()  # reclaim reserved memory between chunks to avoid fragmentation
                 total_samples += result["num_local_samples"]
+                total_tokens_processed += chunk_total_tokens if is_tp_src else 0
                 num_chunks += 1
+
+                # Collect chunk stats for Perfetto trace
+                if is_tp_src:
+                    all_chunk_stats.append({
+                        "chunk_id": num_chunks,
+                        "samples": result["num_local_samples"],
+                        "num_microbatches": result["num_microbatches"][0],
+                        "total_tokens": result.get("total_tokens", 0),
+                        "ref_logprob_s": result.get("ref_logprob_time_s", 0),
+                        "actor_logprob_s": result.get("actor_logprob_time_s", 0),
+                        "advantages_s": result.get("advantages_time_s", 0),
+                        "fwd_bwd_s": result.get("fwd_bwd_time_s", 0),
+                        "chunk_total_s": result.get("chunk_total_time_s", 0),
+                        "throughput_tok_s": result.get("throughput_tok_s", 0),
+                        "chunk_start_perf": result.get("chunk_start_perf", 0),
+                        "chunk_end_perf": result.get("chunk_end_perf", 0),
+                        "microbatch_stats": result.get("microbatch_stats", []),
+                    })
+
                 self._log_memory(f"work_steal:after_chunk_{num_chunks}")
                 if is_tp_src:
                     logger.info(
@@ -508,12 +600,15 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         self._log_memory("work_steal:loop_end")
         logger.info(
             f"[WORK_STEAL] Loop finished: "
-            f"total_samples={total_samples}, num_chunks={num_chunks}"
+            f"total_samples={total_samples}, total_tokens={total_tokens_processed}, "
+            f"num_chunks={num_chunks}"
         )
 
         return {
             "total_samples_processed": total_samples,
+            "total_tokens_processed": total_tokens_processed,
             "num_chunks_processed": num_chunks,
+            "chunk_stats": all_chunk_stats,
         }
 
     def sync_gradients_and_step(self, rollout_id: int) -> None:

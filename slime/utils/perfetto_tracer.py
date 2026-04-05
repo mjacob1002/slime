@@ -99,7 +99,7 @@ class PerfettoTracer:
             self._events.append(ev)
             self._devices_seen.add(device)
 
-    def emit(self, name: str, device: str | int, start: float, end: float, **kwargs):
+    def emit(self, name: str, device: str | int, start: float, end: float, tid: int = 0, **kwargs):
         """Record a complete event with explicit start/end perf_counter times.
 
         Use this for async operations where the start/end are recorded
@@ -111,6 +111,7 @@ class PerfettoTracer:
             device: Device identifier.
             start: time.perf_counter() value at start.
             end: time.perf_counter() value at end.
+            tid: Thread ID for sub-row placement in Perfetto (default 0).
         """
         if not self.enabled:
             return
@@ -122,7 +123,7 @@ class PerfettoTracer:
             "ts": ts,
             "dur": dur,
             "pid": self._device_pid(device),
-            "tid": 0,
+            "tid": tid,
         }
         if kwargs:
             ev["args"] = kwargs

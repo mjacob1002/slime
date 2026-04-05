@@ -94,7 +94,7 @@ def execute():
         "--ci-test "
         "--ci-disable-kl-checker "
         "--perfetto-trace-path /tmp/streaming_4gpu_tp2_deepseek8b_trace.json "
-        "--profiling-record-lengths-path /tmp/streaming_4gpu_tp2_deepseek8b_lengths.json "
+        "--profiling-replay-lengths-path /tmp/streaming_4gpu_tp2_deepseek8b_lengths.json "
     )
 
     train_args = (

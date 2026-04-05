@@ -337,21 +337,14 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
+    train_mb_stats = []
+
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]],
     ]:
-        """Forward step used by Megatron's pipeline engine during training.
-
-        Args:
-            data_iterator (DataIterator): Input data iterator.
-            model (GPTModel): The GPT model chunk to execute.
-
-        Returns:
-            tuple[torch.Tensor, Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]]]:
-            Output tensor(s) and the loss function, which returns
-            (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
-        """
+        """Forward step used by Megatron's pipeline engine during training."""
+        import time as _time
 
         # Get the batch.
         batch = get_batch(
@@ -374,6 +367,10 @@ def train_one_step(
             args.data_pad_size_multiplier,
             args.qkv_format,
         )
+
+        mb_samples = len(batch["total_lengths"]) if batch.get("total_lengths") else 0
+        mb_tokens = sum(batch["total_lengths"]) if batch.get("total_lengths") else 0
+        mb_max_len = max(batch["total_lengths"]) if batch.get("total_lengths") else 0
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
@@ -405,7 +402,16 @@ def train_one_step(
             if batch["multimodal_train_inputs"] is not None:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
 
+            _t0 = _time.perf_counter()
             output_tensor = model(**forward_kwargs)
+            _fwd_time = _time.perf_counter() - _t0
+
+            train_mb_stats.append({
+                "samples": mb_samples,
+                "tokens": mb_tokens,
+                "max_len": mb_max_len,
+                "fwd_time_s": round(_fwd_time, 4),
+            })
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -424,6 +430,18 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+
+    # Log microbatch stats
+    if train_mb_stats:
+        total_mb_tokens = sum(s["tokens"] for s in train_mb_stats)
+        total_fwd_time = sum(s["fwd_time_s"] for s in train_mb_stats)
+        throughput = total_mb_tokens / total_fwd_time if total_fwd_time > 0 else 0
+        logger.info(
+            f"[TRAIN_ONE_STEP] rollout={rollout_id} step={step_id}: "
+            f"{len(train_mb_stats)} microbatches, {total_mb_tokens} tokens, "
+            f"total_fwd_time={total_fwd_time:.2f}s, throughput={throughput:.0f} tok/s"
+        )
+        train_mb_stats.clear()
 
     valid_step = True
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
