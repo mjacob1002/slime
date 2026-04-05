@@ -239,19 +239,59 @@ def train(args):
         for group_rank, (ref_list, train_start) in work_stealing_futures.items():
             # Use TP rank 0's result (first in list) for metrics
             result = ray.get(ref_list[0])
+            # Summarize chunk stats for Perfetto args
+            chunk_stats = result.get('chunk_stats', [])
+            chunk_summary = [
+                {
+                    "id": c["chunk_id"],
+                    "samples": c["samples"],
+                    "tokens": c["total_tokens"],
+                    "microbatches": c["num_microbatches"],
+                    "ref_logprob_s": c.get("ref_logprob_s", 0),
+                    "actor_logprob_s": c.get("actor_logprob_s", 0),
+                    "advantages_s": c.get("advantages_s", 0),
+                    "fwd_bwd_s": c.get("fwd_bwd_s", 0),
+                    "chunk_total_s": c.get("chunk_total_s", 0),
+                    "tok_per_s": c.get("throughput_tok_s", 0),
+                }
+                for c in chunk_stats
+            ]
             get_tracer().emit("training", device=group_rank,
                         start=train_start, end=training_done_time,
                         rollout_id=rollout_id,
                         samples=result['total_samples_processed'],
-                        chunks=result['num_chunks_processed'])
+                        tokens=result.get('total_tokens_processed', 0),
+                        chunks=result['num_chunks_processed'],
+                        chunk_details=chunk_summary)
+            # Emit per-chunk events on the timeline using actor perf_counter times
+            for c in chunk_stats:
+                chunk_start = c.get("chunk_start_perf", 0)
+                chunk_end = c.get("chunk_end_perf", 0)
+                if chunk_start and chunk_end:
+                    get_tracer().emit(
+                        f"chunk_{c['chunk_id']}", device=group_rank,
+                        start=chunk_start, end=chunk_end,
+                        tid=1,  # sub-row for chunks
+                        rollout_id=rollout_id,
+                        samples=c["samples"],
+                        tokens=c["total_tokens"],
+                        microbatches=c["num_microbatches"],
+                        actor_logprob_s=c.get("actor_logprob_s", 0),
+                        fwd_bwd_s=c.get("fwd_bwd_s", 0),
+                        chunk_total_s=c.get("chunk_total_s", 0),
+                        tok_per_s=c.get("throughput_tok_s", 0),
+                    )
+            total_tokens = result.get('total_tokens_processed', 0)
             logger.info(
                 f"[DRIVER] Group {group_rank} work-stealing done: "
                 f"samples={result['total_samples_processed']}, "
+                f"tokens={total_tokens}, "
                 f"chunks={result['num_chunks_processed']}"
             )
             print(
                 f"[DRIVER] Group {group_rank} work-stealing done: "
                 f"samples={result['total_samples_processed']}, "
+                f"tokens={total_tokens}, "
                 f"chunks={result['num_chunks_processed']}"
             )
         logger.info(f"[DRIVER] All {num_groups} groups completed work-stealing training")

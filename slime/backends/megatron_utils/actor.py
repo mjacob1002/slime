@@ -419,18 +419,33 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        import time as _time
+
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+
+        num_local_samples = len(rollout_data["total_lengths"])
+        total_tokens = sum(rollout_data["total_lengths"])
+        logger.info(
+            f"[TRAIN_ACTOR] rollout={rollout_id}: {num_local_samples} samples, "
+            f"{total_tokens} tokens, num_microbatches={num_microbatches}"
+        )
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
+            ref_logprob_time = 0.0
+            actor_logprob_time = 0.0
+            advantages_time = 0.0
+            train_fwd_bwd_time = 0.0
+
             if self.args.compute_advantages_and_returns:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("ref")
+                    _t0 = _time.perf_counter()
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -438,6 +453,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="ref_",
                         )
                     )
+                    ref_logprob_time = _time.perf_counter() - _t0
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
@@ -445,6 +461,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                    _t0 = _time.perf_counter()
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -452,6 +469,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="",
                         )
                     )
+                    actor_logprob_time = _time.perf_counter() - _t0
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
 
@@ -464,9 +482,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self._active_model_tag != "actor":
                     self._switch_model("actor")
 
-                # Calculate adv and returns. Need to performed before training (instead of on the fly),
-                # because we may need normalize the whole rollout.
+                _t0 = _time.perf_counter()
                 compute_advantages_and_returns(self.args, rollout_data)
+                advantages_time = _time.perf_counter() - _t0
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
@@ -476,6 +494,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            _t0 = _time.perf_counter()
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -485,6 +504,16 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_iterator,
                     num_microbatches,
                 )
+            train_fwd_bwd_time = _time.perf_counter() - _t0
+
+            total_train_time = ref_logprob_time + actor_logprob_time + advantages_time + train_fwd_bwd_time
+            logger.info(
+                f"[TRAIN_ACTOR] rollout={rollout_id} phase breakdown: "
+                f"ref_logprob={ref_logprob_time:.2f}s, actor_logprob={actor_logprob_time:.2f}s, "
+                f"advantages={advantages_time:.2f}s, train_fwd_bwd={train_fwd_bwd_time:.2f}s, "
+                f"total={total_train_time:.2f}s, samples={num_local_samples}, tokens={total_tokens}, "
+                f"microbatches={num_microbatches}"
+            )
 
             self.prof.step(rollout_id=rollout_id)
 
