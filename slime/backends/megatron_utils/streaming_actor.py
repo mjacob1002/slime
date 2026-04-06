@@ -489,17 +489,17 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
             torch._C._cuda_attach_out_of_memory_observer(_oom_observer)
 
+        # Prefetcher for overlapping queue grabs with GPU compute
+        from slime.ray.chunk_prefetcher import ChunkPrefetcher
+        prefetcher = ChunkPrefetcher(work_queue_handle) if is_tp_src else None
+
         while True:
-            # TP rank 0 grabs from queue; other TP ranks wait for broadcast
+            # TP rank 0: collect prefetched data or do synchronous grab (first iteration)
             if is_tp_src:
-                new_items = ray.get(work_queue_handle.grab_available.remote())
-                resolved = []
-                for item in new_items:
-                    if isinstance(item, Box):
-                        data = ray.get(item.inner)
-                    else:
-                        data = item
-                    resolved.append(data)
+                if prefetcher.has_pending():
+                    resolved = prefetcher.collect_prefetch()
+                else:
+                    resolved = prefetcher.grab_sync()
             else:
                 resolved = []
 
@@ -512,7 +512,6 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             if resolved:
                 buffer.extend(resolved)
                 if is_tp_src:
-                    # Log token-level stats for each grabbed item
                     for item in resolved:
                         lengths = item.get("total_lengths", [])
                         n_samp = len(lengths)
@@ -540,6 +539,10 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                         f"[WORK_STEAL] Processing chunk: {len(chunk_lengths)} samples, "
                         f"total_tokens={chunk_total_tokens}, avg_len={chunk_avg:.0f}, max_len={chunk_max}"
                     )
+
+                # Start prefetch BEFORE GPU compute — overlaps queue grab with forward+backward
+                if is_tp_src:
+                    prefetcher.start_prefetch()
 
                 result = self._process_chunk(merged, dp_size=dp_size)
                 del merged
