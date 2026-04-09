@@ -69,7 +69,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         self._log_memory("sleep_lightweight:after_clear")
         print_memory("before lightweight offload")
         torch_memory_saver.pause()
-        # clear_memory()  # TODO: Release blocks freed by pause() so SGLang can reclaim them
+        clear_memory()  # Release blocks freed by pause() so SGLang can reclaim them
         self._log_memory("sleep_lightweight:after_pause")
         print_memory("after lightweight offload")
 
@@ -240,9 +240,12 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         # Ensure data is on GPU (work-stealing path may have raw lists)
         self._ensure_tensors_on_device(rollout_data)
 
-        # Set dynamic_global_batch_size for correct gradient scaling
+        # Set dynamic_global_batch_size for correct gradient scaling.
+        # Use args.global_batch_size (not per-chunk size) so that gradients
+        # accumulated across chunks have the correct magnitude — matching
+        # the colocated path where all samples are processed in one shot.
         num_local_samples = len(rollout_data["total_lengths"])
-        rollout_data["dynamic_global_batch_size"] = num_local_samples * dp_size
+        rollout_data["dynamic_global_batch_size"] = args.global_batch_size
 
         # Create local data iterator (NO collective all_reduce)
         data_iterator, num_microbatches = get_data_iterator_local(args, self.model, rollout_data)
@@ -290,8 +293,8 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         # Setup training config with suppressed collective sync
         config, original_finalize_func = self._setup_training_config()
 
-        # Zero grads and run forward+backward
-        self._zero_grads()
+        # NOTE: Do NOT zero grads here — gradients accumulate across chunks.
+        # _zero_grads() is called once in train_work_stealing before the loop.
 
         microbatch_stats = []
 
@@ -489,6 +492,10 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
             torch._C._cuda_attach_out_of_memory_observer(_oom_observer)
 
+        # Zero gradients ONCE before the work-stealing loop.
+        # Gradients accumulate across chunks; _process_chunk does NOT zero.
+        self._zero_grads()
+
         # Prefetcher for overlapping queue grabs with GPU compute
         from slime.ray.chunk_prefetcher import ChunkPrefetcher
         prefetcher = ChunkPrefetcher(work_queue_handle) if is_tp_src else None
@@ -651,6 +658,11 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
             self._log_memory("sync_grads:after_optimizer_step")
             assert update_successful
+
+            logger.info(
+                f"[SYNC_STEP] rollout={rollout_id}: grad_norm={grad_norm}, "
+                f"num_zeros_in_grad={num_zeros_in_grad}, valid_step={valid_step}"
+            )
 
             # 3. Step the learning rate scheduler
             self.opt_param_scheduler.step(increment=args.global_batch_size)
