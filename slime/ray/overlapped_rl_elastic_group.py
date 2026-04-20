@@ -1,107 +1,283 @@
 """OverlappedRLElasticGroup — supplementary inference on idle training GPUs.
 
-Subclass of RayElasticGroup purpose-built for the train_async_overlapped.py
-flow. The dedicated inference pool (managed by the main RolloutManager) keeps
-running at all times; this group adds a set of SGLang engines colocated with
-the training actors so the training GPUs can join the router's worker pool
-when they're not busy training.
+A composition-based group (NOT a subclass of RayElasticGroup) that launches
+SGLang inference engines on the same placement-group bundles as an existing
+RayTrainGroup's training actors, then toggles their router membership and
+KV-cache / CUDA-graph memory occupancy to "borrow" the training GPUs for
+inference during idle windows.
 
-See MATHEW_IMPLEMENTATION_MD_PLANS/ASYNC_RL_STREAMING_INFRA.md for the full
-design spec. Implementation notes:
-- Engines are persistent (never torn down per switch) — Section A, E.
-- Colocated on the same placement-group bundle as the training actor using
-  fractional num_gpus (0.2 for the engine, 0.4 for the actor). Section A2.
-- WEIGHTS memory stays resident on GPU for the full run; only KV_CACHE and
-  CUDA_GRAPH toggle across switches. Sections D, E2.
-- Overlap engines receive weight pushes through the standard
-  actor_model.update_weights() path, same as dedicated engines. Section D.
+Design rationale — why not inherit from RayElasticGroup:
+
+    RayElasticGroup.init() sets args.elastic_mode = True before the training
+    actors' init() runs. That forces each actor's weight_updater to be
+    ElasticUpdateWeight, which has a single-engine API (connect_rollout_engine,
+    not connect_rollout_engines). ElasticUpdateWeight cannot push to both the
+    main rollout_manager's dedicated engines AND the overlap engines, which is
+    the whole point of this class. See section E2 / D of the design doc for
+    the full argument.
+
+    Composition avoids that by keeping the training actors under a normal
+    RayTrainGroup (elastic_mode=False, picks UpdateWeightFromDistributed, which
+    handles N engines natively). The overlap engines then register themselves
+    into rollout_manager via register_overlap_engines(), making them visible to
+    the existing actor.update_weights() → rollout_manager.get_rollout_engines
+    → weight_updater.connect_rollout_engines(engines_list) path. Weight pushes
+    reach both sets naturally with no new push code.
+
+Router membership (i.e. whether an overlap engine receives generation requests)
+is managed independently via register_with_router / deregister_from_router
+calls in switch_to_inference / switch_to_training. Those are orthogonal to the
+weight-update path — an overlap engine can be in rollout_manager's engine list
+(so it gets weight pushes) while being out of the router (so it doesn't get
+generation requests during training windows).
 """
 import logging
+import os
 
 import ray
+from ray.util.placement_group import PlacementGroup
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from slime.ray.elastic_actor import RayElasticGroup
+from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 
 logger = logging.getLogger(__name__)
 
 
-class OverlappedRLElasticGroup(RayElasticGroup):
-    """Elastic group that shares training GPUs with supplementary inference.
+class OverlappedRLElasticGroup:
+    """Owns the overlap SGLang engines that sit on the training GPUs.
 
-    Unlike the parent RayElasticGroup (built for train_elastic.py where
-    training and inference fully alternate on the same GPUs), this group is
-    a *supplement* to an already-running dedicated inference pool. The
-    overlap engines join/leave the router around the training window:
+    Lifecycle:
+        1. __init__ launches the engines on the training placement-group bundles.
+        2. init() allocates ports, runs SGLang engine.init(), then deactivates
+           the engines (release KV cache + CUDA graphs, deregister from router)
+           so training has the GPUs.
+        3. connect_weight_path(rollout_manager) wires the overlap engines into
+           the rollout_manager's engine list so the standard
+           actor_model.update_weights() naturally pushes weights to them.
+        4. Driver calls switch_to_inference()/switch_to_training() around each
+           training phase.
+        5. Driver calls update_weights(...) if it wants an overlap-only push
+           (rare — normally actor_model.update_weights() covers everything).
 
-        training done  →  switch_to_inference()  (overlap engines join router)
-        ...driver continues...
-        update barrier →  switch_to_training()   (overlap engines leave router)
-                       →  actor_model.update_weights() pushes to everyone
-                       →  switch_to_inference() again for next rollout
+    Not a drop-in replacement for RayTrainGroup — the driver keeps its
+    actor_model and uses this class as a supplement.
 
-    The dedicated engines (owned by the main RolloutManager) never stop
-    serving — they keep routing during all phases.
+    Fields:
+        _overlap_engines: list of SGLangEngine actor handles, one per TP group
+            on the training side. len == num_training_groups.
+        _mode: "training" (deactivated) or "inference" (activated).
     """
 
     def __init__(
         self,
         args,
-        pg,
-        rollout_manager=None,
-        streaming: bool = False,
+        training_pg: tuple[PlacementGroup, list[int], list[int]],
+        training_actors: list = None,
     ) -> None:
-        """Construct the overlap group on the training placement group.
+        """Launch overlap engines on the training placement group bundles.
 
         Args:
-            args: Arguments namespace. Uses actor_num_nodes * actor_num_gpus_per_node
-                for world_size (not the num_elastic_* fields).
-            pg: Tuple of (placement_group, bundle_indices, gpu_ids) for the
-                training GPUs. Same shape as RayElasticGroup expects.
-            rollout_manager: The main RolloutManager (owns the dedicated
-                inference engines). Used for coordinating the router view.
-            streaming: If True, use StreamingMegatronTrainRayActor so
-                sleep_lightweight / wake_up_lightweight are available.
+            args: Argument namespace. Reads actor_num_nodes,
+                actor_num_gpus_per_node, overlap_inference_tp (or
+                tensor_model_parallel_size as fallback).
+            training_pg: (placement_group, reordered_bundle_indices,
+                reordered_gpu_ids) tuple for the training actors — same shape
+                that RayTrainGroup receives. The overlap engines will be
+                placed on the SAME bundles as the training actors (see
+                section A2 of the plan).
+            training_actors: list of training actor handles. Stored for
+                reference only; this class does not own their lifecycle. Used
+                by switch_to_inference / switch_to_training to call
+                sleep_lightweight / wake_up_lightweight on them.
         """
-        # Synthesize elastic-shape args so the parent __init__ works.
-        # train_async.py uses actor_num_nodes / actor_num_gpus_per_node rather
-        # than num_elastic_nodes / num_elastic_gpus_per_node.
-        if not hasattr(args, "num_elastic_nodes") or args.num_elastic_nodes == 0:
-            args.num_elastic_nodes = args.actor_num_nodes
-            args.num_elastic_gpus_per_node = args.actor_num_gpus_per_node
+        self.args = args
+        self._training_pg_info = training_pg
+        self._training_actors = training_actors or []
+        self._mode = "training"  # engines start deactivated after init()
+        self._rollout_manager = None  # set via connect_weight_path()
 
-        # overlap_inference_tp defaults to actor TP if unset (see plan C).
-        if not hasattr(args, "overlap_inference_tp") or args.overlap_inference_tp is None:
-            args.overlap_inference_tp = getattr(args, "tensor_model_parallel_size", 1)
+        # Parallelism computation (one overlap engine per training TP group).
+        self._training_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        self._tp_size = (
+            getattr(args, "overlap_inference_tp", None)
+            or getattr(args, "tensor_model_parallel_size", 1)
+        )
+        assert self._training_world_size % self._tp_size == 0, (
+            f"overlap_inference_tp ({self._tp_size}) must divide training world size "
+            f"({self._training_world_size})"
+        )
+        self._num_groups = self._training_world_size // self._tp_size
 
-        super().__init__(args=args, pg=pg, rollout_manager=rollout_manager, streaming=streaming)
+        # Launch the SGLang actor handles. They are NOT yet initialized —
+        # that happens in init() once ports are allocated.
+        self._overlap_engines = self._launch_engines()
 
         logger.info(
-            f"[OVERLAP] Constructed group: world_size={self._world_size}, "
+            f"[OVERLAP] __init__: training_world_size={self._training_world_size}, "
             f"tp_size={self._tp_size}, num_groups={self._num_groups}, "
-            f"overlap_inference_tp={args.overlap_inference_tp}"
+            f"num_engines={len(self._overlap_engines)}"
         )
 
-    def init(self) -> int:
-        """Initialize like parent, then flip to training-mode at the end.
+    # ── Construction ──────────────────────────────────────────────────────
 
-        Parent's init() ends with inference-active, training-sleeping. For the
-        overlap use case we want the opposite at startup: training-active,
-        overlap-engines-deactivated. This lets the driver's initial
-        actor_model.update_weights() push fresh weights to the overlap engines
-        (which stay resident per E2), then proceed to the training loop.
+    def _launch_engines(self) -> list:
+        """Create the SGLangEngine actor handles on the training PG bundles.
+
+        Mirrors RayElasticGroup._create_inference_engines (elastic_actor.py:154)
+        but standalone: we do not own training actors, so we skip that half.
+        Places each engine at num_gpus=0.2 on the same bundle_index as its
+        paired training actor (for the first TP rank in the group).
         """
-        start_rollout_id = super().init()
-        # Parent leaves us in self._mode == "inference" with training asleep.
-        # Flip to training mode so the first rollout's training can run.
-        logger.info("[OVERLAP] Flipping init state from inference-active → training-active")
-        self.switch_to_training()
-        return start_rollout_id
+        pg, bundle_indices, gpu_ids = self._training_pg_info
 
-    def switch_to_inference(self):
-        """Activate overlap engines so they join the router pool.
+        import copy
+        engine_args = copy.copy(self.args)
+        # The overlap engines are secondary — don't forcibly offload their
+        # memory through the top-level rollout args, the switch logic handles
+        # it explicitly.
+        engine_args.offload_rollout = True
+        engine_args.rollout_num_gpus_per_engine = self._tp_size
 
-        Overrides parent to use the "never release WEIGHTS" policy (E2):
-        only KV_CACHE and CUDA_GRAPH are resumed; weights are already resident.
+        env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
+            "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
+            "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+            "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+            "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+            "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+            "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+        }
+
+        RolloutRayActor = ray.remote(SGLangEngine)
+
+        engines = []
+        for group_rank in range(self._num_groups):
+            first_gpu_in_group = group_rank * self._tp_size
+            bundle_index = bundle_indices[first_gpu_in_group]
+            base_gpu_id = int(gpu_ids[first_gpu_in_group])
+
+            engine = RolloutRayActor.options(
+                num_cpus=0.2,
+                num_gpus=0.2,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=bundle_index,
+                ),
+                runtime_env={"env_vars": env_vars},
+            ).remote(
+                engine_args,
+                rank=group_rank,
+                worker_type="regular",
+                base_gpu_id=base_gpu_id,
+            )
+            engines.append(engine)
+            logger.info(
+                f"[OVERLAP] Launched engine group_rank={group_rank} on bundle_index={bundle_index}, "
+                f"base_gpu_id={base_gpu_id}"
+            )
+
+        return engines
+
+    # ── Init ──────────────────────────────────────────────────────────────
+
+    def init(self) -> None:
+        """Allocate ports, call engine.init(), then deactivate for training.
+
+        Must be called before any switch_to_*/update_weights call. Does NOT
+        touch training actors — they are assumed to be initialized via the
+        existing actor_model path.
+
+        Mirrors RayElasticGroup._init_inference_engines +
+        _allocate_engine_ports (elastic_actor.py:240-288).
+        """
+        logger.info("[OVERLAP] init: allocating engine ports")
+        addr_and_ports = self._allocate_engine_ports()
+
+        logger.info("[OVERLAP] init: calling engine.init() on each overlap engine")
+        init_handles = [
+            engine.init.remote(**addr_and_ports[rank])
+            for rank, engine in enumerate(self._overlap_engines)
+        ]
+        ray.get(init_handles)
+        logger.info(f"[OVERLAP] init: {len(self._overlap_engines)} engines initialized")
+
+        # Deactivate immediately so the training actors own the GPU.
+        # Engines start with KV cache + CUDA graphs allocated and registered
+        # with the router from SGLang's init path; we release both here.
+        logger.info("[OVERLAP] init: deactivating engines (release KV+CUDA graph, deregister)")
+        self._deactivate()
+        logger.info("[OVERLAP] init: ready, mode=training")
+
+    def _allocate_engine_ports(self) -> dict:
+        """Pick ports for each overlap engine.
+
+        Uses start_port=17000 to avoid collision with the dedicated engines
+        (15000) and any elastic-streaming engines (16000).
+        """
+        addr_and_ports = {}
+        start_port = 17000
+
+        for rank, engine in enumerate(self._overlap_engines):
+            host, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
+
+            def get_port(consecutive=1):
+                nonlocal start_port
+                _, port = ray.get(
+                    engine._get_current_node_ip_and_free_port.remote(
+                        start_port=start_port,
+                        consecutive=consecutive,
+                    )
+                )
+                start_port = port + consecutive
+                return port
+
+            server_port = get_port()
+            nccl_port = get_port()
+            dist_init_port = get_port(30 + self.args.sglang_dp_size)
+
+            addr_and_ports[rank] = {
+                "host": host,
+                "port": server_port,
+                "nccl_port": nccl_port,
+                "dist_init_addr": f"{host}:{dist_init_port}",
+            }
+            logger.info(f"[OVERLAP] engine {rank}: {addr_and_ports[rank]}")
+
+        return addr_and_ports
+
+    # ── Wire into the weight-update path ──────────────────────────────────
+
+    def connect_weight_path(self, rollout_manager) -> None:
+        """Register the overlap engines into rollout_manager's engine list.
+
+        After this call, rollout_manager.get_rollout_engines_and_lock() returns
+        dedicated + overlap engines. The existing actor_model.update_weights()
+        → actor.update_weights() (actor.py:569) path then reconnects the
+        weight updater to the combined list and pushes weights to all.
+
+        No weight updater subclassing needed; no NCCL group renaming needed.
+        """
+        assert self._rollout_manager is None, "connect_weight_path called twice"
+        self._rollout_manager = rollout_manager
+        ray.get(
+            rollout_manager.register_overlap_engines.remote(self._overlap_engines)
+        )
+        logger.info(
+            f"[OVERLAP] connect_weight_path: registered {len(self._overlap_engines)} "
+            f"overlap engines into rollout_manager"
+        )
+
+    # ── State transitions ─────────────────────────────────────────────────
+
+    def switch_to_inference(self) -> None:
+        """Activate overlap engines (resume KV+CUDA graphs, register to router).
+
+        Sleeps the training actors first (via sleep_lightweight, preserving NCCL
+        groups). WEIGHTS tag is already resident per section E2 of the plan —
+        only KV_CACHE + CUDA_GRAPH toggle.
         """
         if self._mode == "inference":
             return
@@ -117,30 +293,36 @@ class OverlappedRLElasticGroup(RayElasticGroup):
 
         logger.info("[OVERLAP] switch_to_inference: start")
         with tracer.event("overlap_switch_to_inference", device="training"):
-            # 1. Sleep training actors (lightweight if streaming, full sleep otherwise).
-            if self._streaming:
-                self.sleep_training_actors_lightweight()
-            else:
-                self.sleep_training_actors()
+            # 1. Sleep training actors — torch_memory_saver.pause() only,
+            #    NCCL process groups stay alive.
+            if self._training_actors:
+                ray.get([
+                    actor.sleep_lightweight.remote() for actor in self._training_actors
+                ])
 
-            # 2. Resume KV cache + CUDA graphs on the overlap engines. WEIGHTS already
-            #    resident from the most recent update_weights push.
+            # 2. Resume KV cache + CUDA graphs on the overlap engines.
             tags = [GPU_MEMORY_TYPE_KV_CACHE]
             if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
                 tags.append(GPU_MEMORY_TYPE_CUDA_GRAPH)
-            self._resume_memory_occupation(tags=tags)
+            ray.get([
+                engine.resume_memory_occupation.remote(tags=tags)
+                for engine in self._overlap_engines
+            ])
 
-            # 3. Register with router so dispatched requests flow in.
-            ray.get([engine.register_with_router.remote() for engine in self._inference_engines])
+            # 3. Register with router so generation requests dispatch here.
+            ray.get([
+                engine.register_with_router.remote()
+                for engine in self._overlap_engines
+            ])
 
         self._mode = "inference"
         logger.info("[OVERLAP] switch_to_inference: done")
 
-    def switch_to_training(self):
-        """Deactivate overlap engines so training can own the GPU again.
+    def switch_to_training(self) -> None:
+        """Deactivate overlap engines (drain, deregister, release KV+CUDA).
 
-        Overrides parent to use the "never release WEIGHTS" policy (E2):
-        only KV_CACHE and CUDA_GRAPH are released.
+        Wakes the training actors last. WEIGHTS tag stays resident so weight
+        pushes can still write into it while training runs (section E2).
         """
         if self._mode == "training":
             return
@@ -156,73 +338,89 @@ class OverlappedRLElasticGroup(RayElasticGroup):
 
         logger.info("[OVERLAP] switch_to_training: start")
         with tracer.event("overlap_switch_to_training", device="training"):
-            # 1. Flush in-flight requests on overlap engines (drain; see Section G).
-            ray.get([engine.flush_cache.remote() for engine in self._inference_engines])
+            # 1. Flush in-flight requests on overlap engines (plan section G).
+            ray.get([
+                engine.flush_cache.remote() for engine in self._overlap_engines
+            ])
 
-            # 2. Deregister from router so no new requests dispatch here.
-            ray.get([engine.deregister_from_router.remote() for engine in self._inference_engines])
+            # 2. Deregister from router so no new requests arrive.
+            ray.get([
+                engine.deregister_from_router.remote()
+                for engine in self._overlap_engines
+            ])
 
-            # 3. Release KV cache + CUDA graphs; never WEIGHTS.
+            # 3. Release KV cache + CUDA graphs. Never WEIGHTS (see E2).
             tags = [GPU_MEMORY_TYPE_KV_CACHE]
             if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
                 tags.append(GPU_MEMORY_TYPE_CUDA_GRAPH)
-            self._release_memory_occupation(tags=tags)
+            ray.get([
+                engine.release_memory_occupation.remote(tags=tags)
+                for engine in self._overlap_engines
+            ])
 
             # 4. Wake training actors.
-            if self._streaming:
-                ray.get([actor.wake_up_lightweight.remote() for actor in self._training_actors])
-            else:
-                ray.get([actor.wake_up.remote(is_elastic=True) for actor in self._training_actors])
+            if self._training_actors:
+                ray.get([
+                    actor.wake_up_lightweight.remote()
+                    for actor in self._training_actors
+                ])
 
         self._mode = "training"
         logger.info("[OVERLAP] switch_to_training: done")
 
-    def update_weights(self):
-        """Push fresh weights from training actors to overlap engines.
+    def _deactivate(self) -> None:
+        """Initial-state deactivation — called once from init().
 
-        Simpler than parent's update_weights() — per E2, WEIGHTS are always
-        resident on the overlap engines, so we never need to release/resume
-        the WEIGHTS tag. We just:
-          1. Connect weight updaters (once).
-          2. Wake training actors if they happen to be sleeping (rare; this
-             should normally be called from training mode).
-          3. Call actor.update_weights() which writes fresh weights into the
-             overlap engines' resident WEIGHTS memory.
+        Like switch_to_training but skips wake_up (training actors were never
+        slept) and skips flush_cache (engine is fresh, no in-flight requests).
         """
-        from slime.utils.perfetto_tracer import get_tracer
-        tracer = get_tracer()
+        from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+        try:
+            from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+        except ImportError:
+            GPU_MEMORY_TYPE_CUDA_GRAPH = None
 
-        logger.info(f"[OVERLAP] update_weights: start (mode={self._mode})")
-        with tracer.event("overlap_update_weights", device="training"):
-            # 1. Connect weight updaters (no-op if already connected).
-            self._connect_weight_updaters()
+        # SGLang engine.init() auto-registers with the router; undo that.
+        ray.get([
+            engine.deregister_from_router.remote()
+            for engine in self._overlap_engines
+        ])
 
-            # 2. Wake training actors if in inference mode. Normally not needed
-            #    because the driver calls switch_to_training() before update_weights.
-            if self._mode == "inference":
-                if self._streaming:
-                    ray.get([actor.wake_up_lightweight.remote() for actor in self._training_actors])
-                else:
-                    ray.get([actor.wake_up.remote(is_elastic=True) for actor in self._training_actors])
+        tags = [GPU_MEMORY_TYPE_KV_CACHE]
+        if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
+            tags.append(GPU_MEMORY_TYPE_CUDA_GRAPH)
+        ray.get([
+            engine.release_memory_occupation.remote(tags=tags)
+            for engine in self._overlap_engines
+        ])
+        self._mode = "training"
 
-            # 3. Push weights. Overlap engines' WEIGHTS memory is already resident
-            #    — this writes in place.
-            ray.get([actor.update_weights.remote() for actor in self._training_actors])
+    # ── Optional: overlap-only weight push ────────────────────────────────
 
-        logger.info("[OVERLAP] update_weights: done")
+    def update_weights_only_owned(self) -> None:
+        """Push weights to ONLY the overlap engines, not the dedicated ones.
+
+        In normal operation the driver should call actor_model.update_weights()
+        which, because of connect_weight_path(), naturally pushes to dedicated
+        AND overlap engines via the rollout_manager engine list. This method
+        exists as an escape hatch for edge cases where the caller wants a
+        targeted overlap-only push (e.g. testing).
+
+        Not implemented for V1 — the standard path covers the primary use case.
+        """
+        raise NotImplementedError(
+            "V1: use actor_model.update_weights() instead — it pushes to all "
+            "engines (dedicated + overlap) via rollout_manager. This method "
+            "is reserved for future overlap-only use cases."
+        )
+
+    # ── Accessors ─────────────────────────────────────────────────────────
 
     def mode(self) -> str:
         """Current mode — 'training' or 'inference'."""
         return self._mode
 
-    def train(self, rollout_id: int, rollout_data_refs):
-        """Thin wrapper: delegates to the underlying training actors.
-
-        The overlap group does NOT perform switch logic inside here — that's
-        the driver's responsibility (see Section J of the plan). We only
-        assert the mode is correct and forward to async_train.
-        """
-        assert self._mode == "training", (
-            f"train() called while in {self._mode} mode; call switch_to_training() first"
-        )
-        return self.async_train(rollout_id, rollout_data_refs)
+    @property
+    def overlap_engines(self):
+        """List of SGLangEngine actor handles owned by this group."""
+        return self._overlap_engines

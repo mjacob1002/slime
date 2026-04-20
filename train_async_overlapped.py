@@ -1,26 +1,27 @@
 """train_async_overlapped.py — async RL training with training-GPU inference overlap.
 
-Same as train_async.py, except the training GPUs host supplementary SGLang
-engines (via OverlappedRLElasticGroup) that join the router pool during the
-idle window between `ray.get(actor_model.async_train(...))` and the next
-`actor_model.update_weights()`.
+Same structure as train_async.py, with an `OverlappedRLElasticGroup` bolted on
+that hosts supplementary SGLang engines on the training GPUs. The overlap
+engines join the router pool during the window between `async_train()`
+finishing and the next `actor_model.update_weights()` barrier, then leave
+before the weight push runs.
 
-See MATHEW_IMPLEMENTATION_MD_PLANS/ASYNC_RL_STREAMING_INFRA.md for the full
-spec. Design notes:
-- Dedicated inference pool (managed by `rollout_manager`) keeps running
-  throughout — the overlap engines are a supplement, not a replacement.
-- `OverlappedRLElasticGroup` replaces `actor_model`: it owns both the
-  training actors AND the overlap SGLang engines on the training GPUs.
-- Switching is the driver's responsibility (see Section B of the plan):
-  call `switch_to_inference()` after training completes, `switch_to_training()`
-  before the next `update_weights()`.
+The training actors (`actor_model`) are created by `create_training_models`
+exactly as in train_async.py — they use the non-elastic
+`UpdateWeightFromDistributed` path, which natively handles pushing weights to
+N engines in one NCCL broadcast. The overlap engines register themselves into
+`rollout_manager` at init time (via `register_overlap_engines`), so the
+existing `actor_model.update_weights()` call pushes to both dedicated and
+overlap engines without any changes to the weight-update code.
+
+See MATHEW_IMPLEMENTATION_MD_PLANS/ASYNC_RL_STREAMING_INFRA.md for the design.
 """
 import time
 
 import ray
 
 from slime.ray.overlapped_rl_elastic_group import OverlappedRLElasticGroup
-from slime.ray.placement_group import create_placement_groups, create_rollout_manager
+from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
 from slime.utils.misc import should_run_periodic_action
@@ -33,6 +34,7 @@ def train(args):
     configure_logger()
     init_tracer(getattr(args, "perfetto_trace_path", None))
     tracer = get_tracer()
+    # Convert engine wall-clock (time.time) to driver perf_counter epoch the tracer uses.
     walltime_to_perf_offset = time.perf_counter() - time.time()
 
     def emit_engine_spans(spans, rollout_id, drained=False):
@@ -52,35 +54,37 @@ def train(args):
     pgs = create_placement_groups(args)
     init_tracking(args)
 
-    # create the rollout manager (dedicated inference engines)
+    # create the rollout manager (dedicated inference pool — unchanged from train_async.py).
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
-    # create the OverlappedRLElasticGroup — owns the training actors AND the
-    # overlap SGLang engines on the training placement group.
-    #
-    # Uses streaming=False; we don't need the work-stealing loop, just
-    # sleep_lightweight / wake_up_lightweight for fast switching (which are
-    # available on StreamingMegatronTrainRayActor). We pass streaming=True so
-    # the parent class creates StreamingMegatronTrainRayActor instances.
-    overlapped_group = OverlappedRLElasticGroup(
-        args=args,
-        pg=pgs["actor"],
-        rollout_manager=rollout_manager,
-        streaming=True,
-    )
-    start_rollout_id = overlapped_group.init()
-    if args.start_rollout_id is None:
-        args.start_rollout_id = start_rollout_id
+    # create the actor + critic models on pgs["actor"] (unchanged from train_async.py).
+    # actor_model is a RayTrainGroup; its actors use UpdateWeightFromDistributed (non-elastic).
+    actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
-    # Initial weight push: with WEIGHTS resident on the overlap engines,
-    # this bootstraps them with actual values so the first switch_to_inference
-    # has something to serve.
-    overlapped_group.update_weights()
+    # Launch the overlap group on the SAME placement-group bundles as the training actors.
+    # num_gpus=0.2 per engine, on top of the training actor's num_gpus=0.4 — 0.6 < 1.0 so
+    # Ray schedules both on the same bundle. Requires that the training placement group
+    # exists and is used by actor_model; we're just co-hosting SGLang engines on it.
+    overlap_group = OverlappedRLElasticGroup(
+        args=args,
+        training_pg=pgs["actor"],
+        training_actors=actor_model._actor_handlers,
+    )
+    overlap_group.init()  # allocate ports, run engine.init(), deactivate
+
+    # Wire overlap engines into rollout_manager's engine list. After this call,
+    # actor_model.update_weights() will push weights to both dedicated + overlap
+    # engines via one NCCL broadcast group.
+    overlap_group.connect_weight_path(rollout_manager)
+
+    # Initial weight update (this bootstraps BOTH dedicated and overlap engines
+    # with the training weights, via the combined engine list we just wired up).
+    actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
-    # async train loop with overlap switching
+    # ─── async train loop with overlap switching ───────────────────────────
     rollout_start_time = time.time()
     total_train_start_time = time.time()
     pending_rollout_submit_ts = time.perf_counter()
@@ -88,7 +92,8 @@ def train(args):
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
 
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        print(f"Inside rollout {rollout_id} (overlap mode)")
+        print(f"[OVERLAPPED] Inside rollout {rollout_id}")
+
         # Sync the last generation
         engine_spans_future = None
         if rollout_data_next_future is not None:
@@ -118,44 +123,46 @@ def train(args):
             emit_engine_spans(ray.get(engine_spans_future), rollout_id=rollout_id)
 
         # ─── TRAINING PHASE ────────────────────────────────────────────────
-        # Overlap group must be in training mode for this to work.
-        assert overlapped_group.mode() == "training", (
-            f"Overlap group in {overlapped_group.mode()} mode, expected training"
+        # Training actors are awake, overlap engines deactivated.
+        assert overlap_group.mode() == "training", (
+            f"overlap_group in {overlap_group.mode()} mode at start of training; "
+            "driver should always end an iteration in training mode"
         )
         train_start_time = time.time()
         print(f"Training on data from rollout {rollout_id}")
         with tracer.event("training", device="training", rollout_id=rollout_id):
-            ray.get(overlapped_group.train(rollout_id, rollout_data_curr_ref))
-        print(f"Finished training on data from rollout {rollout_id}")
+            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
         train_elapsed = time.time() - train_start_time
         print(f"Training on rollout {rollout_id} took {train_elapsed:.2f}s")
 
-        # ─── OVERLAP PHASE: borrow training GPUs for inference ─────────────
-        # Training is done; switch the training GPUs to inference mode so they
-        # join the router pool and help drain the next rollout's requests.
-        #
-        # If the next iteration hits an update_weights barrier, we'll switch
-        # back just-in-time (below). Otherwise the overlap runs until end of
-        # this iteration's inference_wait at the top of the loop.
-        with tracer.event("overlap_inference", device="training", rollout_id=rollout_id):
-            overlapped_group.switch_to_inference()
+        # ─── OVERLAP PHASE: borrow the training GPUs for inference ─────────
+        with tracer.event("overlap_inference_switch_in", device="training", rollout_id=rollout_id):
+            overlap_group.switch_to_inference()
+        # Training GPUs are now serving the router. Requests for the next
+        # rollout route to dedicated + overlap engines.
 
-        # ─── Save / eval hooks (unchanged from train_async.py) ─────────────
+        # Periodic save (unchanged from train_async.py shape).
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+            # save_model pokes the training actors; switch back briefly.
+            overlap_group.switch_to_training()
             with tracer.event("save", device="driver", rollout_id=rollout_id):
-                # save_model is on the training actors; they're sleeping now,
-                # but save_model typically reads the latest state via weight
-                # tensors which should be accessible. If this fails, switch
-                # back first.
-                overlapped_group.switch_to_training()
-                # (train_async.py calls actor_model.save_model; overlap_group
-                # doesn't expose save_model yet. If needed, add a passthrough
-                # later. V1 skips saves.)
-                # overlapped_group.save_model(rollout_id, force_sync=rollout_id == args.num_rollout - 1)
+                actor_model.save_model(
+                    rollout_id,
+                    force_sync=rollout_id == args.num_rollout - 1,
+                )
+                if args.use_critic:
+                    critic_model.save_model(
+                        rollout_id,
+                        force_sync=rollout_id == args.num_rollout - 1,
+                    )
+                if args.rollout_global_dataset:
+                    ray.get(rollout_manager.save.remote(rollout_id))
+            # Stay in training mode; weight update follows immediately if
+            # the interval fires, otherwise we re-enter inference below.
 
         # ─── WEIGHT-UPDATE BARRIER ─────────────────────────────────────────
         if (rollout_id + 1) % args.update_weights_interval == 0:
-            # sync pending generate before update weights
+            # Drain the pending rollout we launched above.
             if rollout_data_next_future is not None:
                 with tracer.event("drain_next_rollout", device="driver", rollout_id=rollout_id + 1):
                     rollout_data_curr_ref = ray.get(rollout_data_next_future)
@@ -174,38 +181,29 @@ def train(args):
                 rollout_data_curr_ref = None
             rollout_data_next_future = None
 
-            # Switch back to training mode (deactivate overlap engines).
-            # Then push fresh weights to overlap engines AND dedicated engines.
+            # Deactivate overlap engines and do the weight push. The push
+            # reaches BOTH dedicated and overlap engines because overlap
+            # engines were registered into rollout_manager's engine list at init.
             with tracer.event("weight_update_barrier", device="all", rollout_id=rollout_id):
-                overlapped_group.switch_to_training()
-                # Push to dedicated rollout_manager engines (existing path).
-                # overlap_group.update_weights() pushes to its overlap engines.
-                overlapped_group.update_weights()
-                # Also update the dedicated engines. In train_async.py this is
-                # actor_model.update_weights(); OverlappedRLElasticGroup doesn't
-                # push to dedicated engines directly. We need to call
-                # rollout_manager.update_weights() or keep actor_model for that.
-                #
-                # V1 gap: see Section D of the plan. Currently the overlap group's
-                # update_weights only pushes to overlap engines. The dedicated
-                # engines need their own push via rollout_manager or via a
-                # separate RayTrainGroup connected to them.
-                # For V1 2-GPU test this is the primary risk — flagged.
+                overlap_group.switch_to_training()
+                print(f"Updating weights after rollout {rollout_id}")
+                actor_model.update_weights()
+            # Overlap group is in training mode; re-activate below.
 
+        # Periodic eval — requires overlap engines OFF the router so eval
+        # traffic only hits dedicated engines (for deterministic eval topology).
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            # eval uses rollout_manager (dedicated engines); we must be in
-            # training mode so overlap engines are NOT in the router pool.
-            if overlapped_group.mode() == "inference":
-                overlapped_group.switch_to_training()
+            if overlap_group.mode() == "inference":
+                overlap_group.switch_to_training()
             with tracer.event("eval", device="inference", rollout_id=rollout_id):
                 ray.get(rollout_manager.eval.remote(rollout_id))
 
-        # Ensure we end the iteration in TRAINING mode for the next train()
-        # call. If no weight-update barrier fired, we're still in inference
-        # mode from earlier; flip back.
-        if overlapped_group.mode() == "inference":
-            with tracer.event("end_of_iter_switch_to_training", device="training", rollout_id=rollout_id):
-                overlapped_group.switch_to_training()
+        # Ensure we end the iteration in TRAINING mode for next iter's train().
+        # If neither weight update nor eval ran above, we're still in inference
+        # mode from the overlap-in switch — flip back.
+        if overlap_group.mode() == "inference":
+            with tracer.event("overlap_inference_switch_out", device="training", rollout_id=rollout_id):
+                overlap_group.switch_to_training()
 
     total_train_end_time = time.time()
     train_time = total_train_end_time - total_train_start_time
