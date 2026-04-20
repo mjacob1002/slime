@@ -86,6 +86,9 @@ class RolloutManager:
         print(f"Initializing the rollout engine lock...")
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self._metric_checker = MetricChecker.maybe_create(args)
+        # SLIME_TIMELINE: per-rollout, per-engine spans for driver-side Perfetto emission.
+        # Populated in generate() from raw Sample wall-clock timestamps; drained by pop_engine_spans().
+        self._engine_spans_by_rollout: dict[int, list[dict]] = {}
         if self.args.use_fault_tolerance:
             self._health_monitor = RolloutHealthMonitor(self, args)
 
@@ -102,6 +105,38 @@ class RolloutManager:
     def get_rollout_engines_and_lock(self):
         return self.rollout_engines, self.rollout_engine_lock, self.num_new_engines
 
+    def register_overlap_engines(self, overlap_engines):
+        """Append overlap-group SGLang engines to this manager's engine list.
+
+        Used by OverlappedRLElasticGroup to make its co-located training-GPU
+        engines visible to the weight-update path. After this call,
+        actor.update_weights() (actor.py:569) sees the combined list via
+        get_rollout_engines_and_lock() and pushes weights to all of them
+        via one UpdateWeightFromDistributed NCCL group.
+
+        Router membership (which engines receive generation requests) is
+        managed separately via register_with_router/deregister_from_router
+        on the engine actors themselves; this method only touches the
+        weight-update engine list.
+
+        Idempotent-ish: bumps num_new_engines by the number of engines added
+        so the next actor.update_weights() triggers a reconnect. Re-calling
+        this method with the same engines will double-register — don't do
+        that; call it exactly once per overlap group at driver startup.
+        """
+        if not overlap_engines:
+            return
+        self.all_rollout_engines = list(self.all_rollout_engines) + list(overlap_engines)
+        self.num_new_engines = (self.num_new_engines or 0) + len(overlap_engines)
+
+    def pop_engine_spans(self, rollout_id):  # SLIME_TIMELINE
+        """Return per-engine wall-clock spans for the given rollout and clear from memory.
+
+        Used by the driver (train_async.py) to emit one Perfetto bar per engine per rollout.
+        Returns [] if generate() was never called for this rollout_id (e.g., debug runs).
+        """
+        return self._engine_spans_by_rollout.pop(rollout_id, [])
+
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
         return len(self.data_source.dataset) // self.args.rollout_batch_size
@@ -112,6 +147,7 @@ class RolloutManager:
         try:
             data, metrics = self._get_rollout_data(rollout_id=rollout_id)
             _write_timeline(rollout_id, data)  # SLIME_TIMELINE
+            self._engine_spans_by_rollout[rollout_id] = _compute_engine_spans(data)  # SLIME_TIMELINE
             self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
             _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
             data = self._convert_samples_to_train_data(data)
@@ -417,6 +453,28 @@ class RolloutManager:
                 rollout_data["dynamic_global_batch_size"] = self._dynamic_global_batch_size
             rollout_data_refs.append(Box(ray.put(rollout_data)))
         return rollout_data_refs
+
+
+def _compute_engine_spans(samples):  # SLIME_TIMELINE
+    """Group samples by engine_rank; return one (rank, min_start, max_end, n_samples) span per engine.
+
+    Times are wall-clock time.time() values from the engines. The driver converts them to
+    its own perf_counter epoch before calling tracer.emit().
+    """
+    by_rank: dict[int, list] = {}
+    for s in samples:
+        if s.engine_rank < 0 or s.generation_start_time <= 0 or s.generation_end_time <= 0:
+            continue
+        by_rank.setdefault(s.engine_rank, []).append(s)
+    spans = []
+    for rank, group in by_rank.items():
+        spans.append({
+            "rank": rank,
+            "start_walltime": min(s.generation_start_time for s in group),
+            "end_walltime": max(s.generation_end_time for s in group),
+            "n_samples": len(group),
+        })
+    return spans
 
 
 def _write_timeline(rollout_id, samples):  # SLIME_TIMELINE
