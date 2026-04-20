@@ -125,6 +125,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--overlap-inference-tp",
+                type=int,
+                default=None,
+                help=(
+                    "TP size of the SGLang engines colocated with training GPUs in "
+                    "OverlappedRLElasticGroup (used by train_async_overlapped.py). "
+                    "If None, defaults to tensor-model-parallel-size."
+                ),
+            )
+            parser.add_argument(
                 "--max-items-per-grab",
                 type=int,
                 default=None,
