@@ -57,6 +57,17 @@ def train(args):
     # create the rollout manager (dedicated inference pool — unchanged from train_async.py).
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
+    # _start_router runs inside the RolloutManager Ray actor (rollout.py:52) and
+    # mutates its actor-local args copy. The driver's args are pickled on .remote
+    # call and never updated back, so args.sglang_router_ip/port stay None here.
+    # Without this readback, OverlappedRLElasticGroup forwards None-router args to
+    # each overlap engine, and their register_with_router calls fall through the
+    # `not self.router_ip` guard silently — the router never learns about them
+    # and 100% of /generate traffic pins to the dedicated engine.
+    pg_info = ray.get(rollout_manager.get_placement_group_info.remote())
+    args.sglang_router_ip = pg_info["args"].sglang_router_ip
+    args.sglang_router_port = pg_info["args"].sglang_router_port
+
     # create the actor + critic models on pgs["actor"] (unchanged from train_async.py).
     # actor_model is a RayTrainGroup; its actors use UpdateWeightFromDistributed (non-elastic).
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
@@ -72,14 +83,18 @@ def train(args):
     )
     overlap_group.init()  # allocate ports, run engine.init(), deactivate
 
-    # Wire overlap engines into rollout_manager's engine list. After this call,
-    # actor_model.update_weights() will push weights to both dedicated + overlap
-    # engines via one NCCL broadcast group.
+    # Wire each training actor to its paired overlap engine for IPC-based
+    # weight pushes. Dedicated engines continue to use the primary NCCL path
+    # (actor_model.update_weights()) — overlap engines use the separate IPC
+    # path (overlap_group.update_weights()). Two paths because NCCL cannot
+    # span two ranks on one GPU.
     overlap_group.connect_weight_path(rollout_manager)
 
-    # Initial weight update (this bootstraps BOTH dedicated and overlap engines
-    # with the training weights, via the combined engine list we just wired up).
+    # Initial weight update: push to BOTH sets of engines.
+    # actor_model.update_weights() → NCCL broadcast to dedicated engines.
+    # overlap_group.update_weights() → Ray IPC to overlap engines.
     actor_model.update_weights()
+    overlap_group.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -181,13 +196,18 @@ def train(args):
                 rollout_data_curr_ref = None
             rollout_data_next_future = None
 
-            # Deactivate overlap engines and do the weight push. The push
-            # reaches BOTH dedicated and overlap engines because overlap
-            # engines were registered into rollout_manager's engine list at init.
+            # Deactivate overlap engines, then push fresh weights to both sets
+            # of engines:
+            #   - dedicated engines: NCCL via actor_model.update_weights()
+            #   - overlap engines:   IPC via overlap_group.update_weights(),
+            #     but WEIGHTS tag was released in switch_to_training for
+            #     memory reasons — resume it first so the push has a target.
             with tracer.event("weight_update_barrier", device="all", rollout_id=rollout_id):
                 overlap_group.switch_to_training()
                 print(f"Updating weights after rollout {rollout_id}")
                 actor_model.update_weights()
+                overlap_group.resume_weights_for_push()
+                overlap_group.update_weights()
             # Overlap group is in training mode; re-activate below.
 
         # Periodic eval — requires overlap engines OFF the router so eval
