@@ -59,7 +59,13 @@ class RayTrainGroup:
             **self.args.train_env_vars,
         }
 
-        if self.args.offload_train and self.args.train_backend == "megatron":
+        # Also set LD_PRELOAD for overlap case: OverlappedRLElasticGroup calls
+        # actor.sleep(is_elastic=True) which hits torch_memory_saver.pause().
+        needs_memory_saver = (
+            self.args.offload_train
+            or getattr(self.args, "overlap_inference_tp", None) is not None
+        )
+        if needs_memory_saver and self.args.train_backend == "megatron":
             import torch_memory_saver
 
             dynlib_path = os.path.join(

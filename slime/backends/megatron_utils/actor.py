@@ -587,7 +587,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # Use torch_memory_saver.disable() for both offload_train and elastic_mode
         # to ensure weight update allocations stay on GPU
-        use_memory_saver = self.args.offload_train or getattr(self.args, 'elastic_mode', False)
+        use_memory_saver = (
+            self.args.offload_train
+            or getattr(self.args, 'elastic_mode', False)
+            or getattr(self.args, 'overlap_inference_tp', None) is not None
+        )
         with torch_memory_saver.disable() if use_memory_saver else nullcontext():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
@@ -756,3 +760,75 @@ class MegatronTrainRayActor(TrainRayActor):
             raise RuntimeError("elastic_connect_rollout_engine should only be called in elastic mode")
 
         self.weight_updater.connect_rollout_engine(engine, engine_lock)
+
+    def connect_overlap_engine(
+        self,
+        engine: ActorHandle,
+        engine_lock: ActorHandle,
+    ) -> None:
+        """
+        Connect this training actor to its paired OVERLAP engine.
+
+        Used by OverlappedRLElasticGroup (non-elastic mode). The overlap engine
+        sits on the same physical GPU as this training actor, so NCCL cannot
+        include it in the primary weight-update group (which is used for the
+        dedicated, off-GPU engines). A separate IPC-based weight-update path
+        is created here via OverlapUpdateWeight.
+
+        Coexists with the primary self.weight_updater (UpdateWeightFromDistributed
+        or similar) — the primary handles dedicated engines via NCCL, this
+        handles the single colocated overlap engine via Ray IPC.
+
+        Collective: must be called on all training actors simultaneously
+        because OverlapUpdateWeight.__init__ creates Gloo groups (collective).
+
+        Args:
+            engine: The overlap SGLang engine Ray actor paired with this actor.
+            engine_lock: Lock actor for serializing pushes.
+        """
+        if getattr(self.args, 'elastic_mode', False):
+            raise RuntimeError(
+                "connect_overlap_engine is for non-elastic mode (train_async_overlapped); "
+                "use elastic_connect_rollout_engine for elastic mode."
+            )
+        from slime.backends.megatron_utils.update_weight.overlap_update_weight import OverlapUpdateWeight
+
+        model_name = (
+            type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name
+        )
+        quantization_config = getattr(self.hf_config, "quantization_config", None)
+
+        self.overlap_weight_updater = OverlapUpdateWeight(
+            self.args,
+            self.model,
+            weights_getter=lambda: self.weights_backuper.get("actor"),
+            model_name=model_name,
+            quantization_config=quantization_config,
+        )
+        self.overlap_weight_updater.connect_engine(engine, engine_lock)
+
+    def update_weights_to_overlap_engine(self) -> None:
+        """Push current weights to the paired overlap engine via IPC.
+
+        Wraps OverlapUpdateWeight.update_weights() with the same memory-saver
+        context the primary update_weights() uses, so the push allocations
+        stay on GPU while torch_memory_saver is otherwise paused.
+
+        Collective: must be called on all training actors simultaneously.
+        """
+        if not hasattr(self, "overlap_weight_updater"):
+            raise RuntimeError(
+                "update_weights_to_overlap_engine called before connect_overlap_engine; "
+                "no overlap weight updater present."
+            )
+
+        from torch_memory_saver import torch_memory_saver
+        from contextlib import nullcontext
+
+        use_memory_saver = (
+            self.args.offload_train
+            or getattr(self.args, "elastic_mode", False)
+            or getattr(self.args, "overlap_inference_tp", None) is not None
+        )
+        with torch_memory_saver.disable() if use_memory_saver else nullcontext():
+            self.overlap_weight_updater.update_weights()
