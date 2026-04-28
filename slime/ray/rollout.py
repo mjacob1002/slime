@@ -105,30 +105,6 @@ class RolloutManager:
     def get_rollout_engines_and_lock(self):
         return self.rollout_engines, self.rollout_engine_lock, self.num_new_engines
 
-    def register_overlap_engines(self, overlap_engines):
-        """Append overlap-group SGLang engines to this manager's engine list.
-
-        Used by OverlappedRLElasticGroup to make its co-located training-GPU
-        engines visible to the weight-update path. After this call,
-        actor.update_weights() (actor.py:569) sees the combined list via
-        get_rollout_engines_and_lock() and pushes weights to all of them
-        via one UpdateWeightFromDistributed NCCL group.
-
-        Router membership (which engines receive generation requests) is
-        managed separately via register_with_router/deregister_from_router
-        on the engine actors themselves; this method only touches the
-        weight-update engine list.
-
-        Idempotent-ish: bumps num_new_engines by the number of engines added
-        so the next actor.update_weights() triggers a reconnect. Re-calling
-        this method with the same engines will double-register — don't do
-        that; call it exactly once per overlap group at driver startup.
-        """
-        if not overlap_engines:
-            return
-        self.all_rollout_engines = list(self.all_rollout_engines) + list(overlap_engines)
-        self.num_new_engines = (self.num_new_engines or 0) + len(overlap_engines)
-
     def pop_engine_spans(self, rollout_id):  # SLIME_TIMELINE
         """Return per-engine wall-clock spans for the given rollout and clear from memory.
 
@@ -686,9 +662,20 @@ def _start_router(args):
     if args.sglang_router_port is None:
         args.sglang_router_port = find_available_port(random.randint(3000, 4000))
 
+    # --use-queued-slime-router implies --use-slime-router.
+    if getattr(args, "use_queued_slime_router", False) and not args.use_slime_router:
+        args.use_slime_router = True
+
     if args.use_slime_router:
         assert args.prefill_num_servers is None, "slime router does not support prefill_num_servers."
-        from slime.router.router import run_router
+        if getattr(args, "use_queued_slime_router", False):
+            from slime.router.queued_router import run_queued_router as run_router
+            logger.info(
+                f"Using QueuedSlimeRouter with max_per_worker="
+                f"{getattr(args, 'slime_router_max_per_worker', 16)}"
+            )
+        else:
+            from slime.router.router import run_router
 
         router_args = args
 
