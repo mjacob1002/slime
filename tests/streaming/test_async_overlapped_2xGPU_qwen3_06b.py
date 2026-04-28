@@ -34,9 +34,8 @@ def execute():
         f"--ref-load /root/{MODEL_NAME}_torch_dist "
     )
 
-    # Fast-iteration smoke config: small batch + short responses so first
-    # rollout finishes in ~1 min instead of ~12, surfacing bugs in the
-    # switch/weight-update path without waiting on long generations.
+    # Realistic workload: global_batch_size=256 (64 prompts x 4 samples),
+    # max response 32k to exercise long-generation overlap windows.
     rollout_args = (
         "--prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl "
         "--input-key prompt "
@@ -45,11 +44,11 @@ def execute():
         "--rollout-shuffle "
         "--rm-type math "
         "--num-rollout 3 "
-        "--rollout-batch-size 8 "
+        "--rollout-batch-size 64 "
         "--n-samples-per-prompt 4 "
-        "--rollout-max-response-len 2048 "
+        "--rollout-max-response-len 32768 "
         "--rollout-temperature 1 "
-        "--global-batch-size 32 "
+        "--global-batch-size 256 "
     )
 
     grpo_args = (
@@ -94,26 +93,19 @@ def execute():
         "--sglang-mem-fraction-static 0.85 "
     )
 
-    # ⚠️ DIAGNOSTIC — not production defaults. These knobs are here to make
-    # overlap-engine traffic observable in the smoke test:
-    #
-    # --use-slime-router: Rust sglang_router's POST /workers is async via an
-    #   internal job queue (server.rs:438-486 returns 202 "queued for
-    #   background processing"). Register returns before the worker is
-    #   actually in the pool, and our immediate deregister hits a race where
-    #   GET /workers doesn't yet include the URL — so deregister silently
-    #   exits without removing it, and traffic later routes to a deactivated
-    #   engine → hang. The slime-router (slime/router/router.py) is fully
-    #   synchronous: add_worker / remove_worker mutate the dict and return.
-    #
-    # --sglang-server-concurrency 4: tightens the client-side asyncio
-    #   semaphore (sglang_rollout.py:45) from the default 512 down to 4 so
-    #   dispatch spans the whole rollout window. Without this, all POSTs
-    #   fire at t≈0 and there are none left to route to overlap after
-    #   switch_to_inference.
+    # --use-slime-router is load-bearing, NOT diagnostic: it sidesteps a
+    # race in the Rust sglang_router where POST /workers is async via an
+    # internal job queue (sgl-router/src/server.rs:438-486 returns 202
+    # "queued for background processing"). Register returns before the
+    # worker is in the pool, then our immediate deregister at _deactivate
+    # hits a race where GET /workers doesn't yet include the URL — so
+    # deregister silently exits without removing it, and traffic later
+    # routes to a deactivated engine, hanging the rollout. slime-router
+    # (slime/router/router.py) is fully synchronous: add_worker /
+    # remove_worker mutate a dict and return, no race. Required until the
+    # Rust-router race is fixed via handshake polling in sglang_engine.py.
     concurrency_args = (
         "--use-slime-router "
-        "--sglang-server-concurrency 4 "
     )
 
     profiling_args = (
