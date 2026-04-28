@@ -1004,6 +1004,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=3,
                 help="Number of consecutive failures before marking a worker as unhealthy.",
             )
+            parser.add_argument(
+                "--use-queued-slime-router",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use QueuedSlimeRouter: per-worker in-flight cap + shared "
+                    "request queue. Implies --use-slime-router. Lets "
+                    "late-joining workers (e.g. overlap engines) pick up "
+                    "traffic instead of having all requests already committed "
+                    "to the earlier-registered pool."
+                ),
+            )
+            parser.add_argument(
+                "--slime-router-max-per-worker",
+                type=int,
+                default=16,
+                help=(
+                    "QueuedSlimeRouter: per-worker in-flight cap. Requests "
+                    "over this threshold wait in the router queue until a "
+                    "worker frees up or a new worker registers."
+                ),
+            )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
@@ -1532,6 +1554,12 @@ def parse_args(add_custom_arguments=None):
             args.moe_token_dispatcher_type = "alltoall"
 
     sglang_validate_args(args)
+
+    # --use-queued-slime-router implies --use-slime-router. Resolve here so
+    # downstream components (engines deciding /add_worker vs /workers) see
+    # the correct flag, not only the driver-side router-launch logic.
+    if getattr(args, "use_queued_slime_router", False) and not getattr(args, "use_slime_router", False):
+        args.use_slime_router = True
 
     return args
 
