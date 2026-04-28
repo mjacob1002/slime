@@ -106,6 +106,9 @@ def execute_train(
         config = ExecuteTrainConfig()
     external_ray = get_bool_env_var("SLIME_SCRIPT_EXTERNAL_RAY")
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    ray_gcs_port = os.environ.get("SLIME_RAY_GCS_PORT", "6399")
+    ray_dashboard_port = os.environ.get("SLIME_RAY_DASHBOARD_PORT", "8275")
+    ray_dashboard_agent_port = os.environ.get("SLIME_RAY_DASHBOARD_AGENT_PORT", "52400")
 
     train_backend_fsdp = "--train-backend fsdp" in train_args
     assert train_backend_fsdp == (megatron_model_type is None)
@@ -131,7 +134,7 @@ def execute_train(
         exec_command(
             # will prevent ray from buffering stdout/stderr
             f"export PYTHONBUFFERED=16 && "
-            f"ray start --head --node-ip-address {master_addr} --num-gpus {num_gpus_per_node} --port 6399 --dashboard-port 8275 --dashboard-agent-listen-port 52400 --disable-usage-stats"
+            f"ray start --head --node-ip-address {master_addr} --num-gpus {num_gpus_per_node} --port {ray_gcs_port} --dashboard-port {ray_dashboard_port} --dashboard-agent-listen-port {ray_dashboard_agent_port} --disable-usage-stats"
         )
 
     # Wait for Ray dashboard agent to be ready for job submission
@@ -140,7 +143,7 @@ def execute_train(
     import json as _json
     for _attempt in range(90):
         try:
-            resp = urllib.request.urlopen("http://127.0.0.1:8275/api/jobs/", timeout=2)
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{ray_dashboard_port}/api/jobs/", timeout=2)
             if resp.status == 200:
                 break
         except Exception:
@@ -193,7 +196,7 @@ def execute_train(
         output = exec_command(
             f"export no_proxy=127.0.0.1 && export PYTHONBUFFERED=16 && "
             f"{cmd_megatron_model_source}"
-            f'ray job submit --address="http://127.0.0.1:8275" '
+            f'ray job submit --address="http://127.0.0.1:{ray_dashboard_port}" '
             f"--runtime-env-json='{runtime_env_json}' "
             f"-- python3 {train_script} "
             f"{'${MODEL_ARGS[@]}' if megatron_model_type is not None else ''} "
