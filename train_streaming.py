@@ -89,12 +89,21 @@ def train(args):
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_id
 
-    # Store training parallel config
+    # Store training parallel config. Training and inference TP are decoupled:
+    # train groups drive DP for training; inference engines may be more numerous
+    # when --rollout-num-gpus-per-engine < --tensor-model-parallel-size.
     total_gpus = args.num_elastic_nodes * args.num_elastic_gpus_per_node
-    tp_size = getattr(args, 'tensor_model_parallel_size', 1)
-    num_groups = total_gpus // tp_size
-    logger.info(f"[DRIVER] total_gpus={total_gpus}, tp_size={tp_size}, num_groups={num_groups}")
-    elastic_group.set_train_parallel_config({"dp_size": num_groups})
+    train_tp = getattr(args, 'tensor_model_parallel_size', 1)
+    infer_tp = getattr(args, 'rollout_num_gpus_per_engine', 1) or 1
+    num_train_groups = total_gpus // train_tp
+    num_infer_engines = total_gpus // infer_tp
+    engines_per_train_group = train_tp // infer_tp
+    logger.info(
+        f"[DRIVER] total_gpus={total_gpus}, train_tp={train_tp}, infer_tp={infer_tp}, "
+        f"num_train_groups={num_train_groups}, num_infer_engines={num_infer_engines}, "
+        f"engines_per_train_group={engines_per_train_group}"
+    )
+    elastic_group.set_train_parallel_config({"dp_size": num_train_groups})
     logger.info("[DRIVER] train_parallel_config set")
 
     # Switch to inference mode (registers with router)
@@ -104,7 +113,11 @@ def train(args):
 
     logger.info("[DRIVER] Getting engine URLs...")
     engine_urls = elastic_group.get_engine_urls()
-    logger.info(f"[DRIVER] Streaming training initialized with {total_gpus} GPUs, {num_groups} groups, engine URLs: {engine_urls}")
+    logger.info(
+        f"[DRIVER] Streaming training initialized with {total_gpus} GPUs, "
+        f"{num_train_groups} train groups, {num_infer_engines} infer engines, "
+        f"engine URLs: {engine_urls}"
+    )
 
     # Initialize router with engine URLs (once, before training loop)
     logger.info("[DRIVER] Setting engine URLs on StreamingRolloutManager...")
@@ -120,12 +133,20 @@ def train(args):
     if getattr(args, 'max_items_per_grab', None) is not None:
         max_items_per_grab = args.max_items_per_grab
     else:
-        max_items_per_grab = max(1, n_prompt_groups // (num_groups * 2))
+        # Use train-group count for grab sizing — that's the consumer side.
+        max_items_per_grab = max(1, n_prompt_groups // (num_train_groups * 2))
     logger.info(
         f"[DRIVER] Creating StreamingWorkQueue for rollouts "
         f"(max_items_per_grab={max_items_per_grab})"
     )
-    work_queue = StreamingWorkQueue.remote(num_groups, max_items_per_grab=max_items_per_grab)
+    # num_engines == producers (one per inference engine); train-group bookkeeping
+    # lets the work queue tell the driver when all engines for a train group are done.
+    work_queue = StreamingWorkQueue.remote(
+        num_infer_engines,
+        max_items_per_grab=max_items_per_grab,
+        num_train_groups=num_train_groups,
+        engines_per_train_group=engines_per_train_group,
+    )
     all_rollout_metrics = []
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         logger.info(f"[DRIVER] === Streaming rollout {rollout_id} (V1 work-stealing) ===")
@@ -157,22 +178,30 @@ def train(args):
         gen_ref = streaming_rollout_mgr.generate.remote(rollout_id, work_queue)
         logger.info(f"[DRIVER] generate.remote() submitted, entering poll loop")
 
-        # Track inference start time per-group for Perfetto tracing
+        # Track inference start time per-engine (engines are the producer side).
         inference_start_time = time.perf_counter()
-        engine_inference_start = {rank: inference_start_time for rank in range(num_groups)}
+        engine_inference_start = {e: inference_start_time for e in range(num_infer_engines)}
 
-        # Poll loop: as each engine group finishes, switch it to training with work-stealing
+        # Poll loop. Two signals from work_queue:
+        #   - get_newly_completed_engines(): per-engine completion → emit inference
+        #     trace event and eagerly free that engine's GPU memory.
+        #   - get_newly_completed_train_groups(): all engines for a train group
+        #     done → flip those GPUs to training and start work-stealing.
         completed = set()
+        sleeped_engines = set()
         work_stealing_futures = {}
         poll_count = 0
         first_engine_switch_time = None
         last_engine_done_time = None
 
-        while len(completed) < num_groups:
+        while len(completed) < num_train_groups:
             time.sleep(0.1)  # poll interval
             poll_count += 1
             if poll_count % 50 == 0:
-                logger.info(f"[DRIVER] Poll #{poll_count}, {len(completed)}/{num_groups} completed, elapsed={time.time() - rollout_start:.1f}s")
+                logger.info(
+                    f"[DRIVER] Poll #{poll_count}, {len(completed)}/{num_train_groups} train groups "
+                    f"completed, elapsed={time.time() - rollout_start:.1f}s"
+                )
 
             # Check if gen task crashed (non-blocking)
             ready, _ = ray.wait([gen_ref], timeout=0)
@@ -183,20 +212,32 @@ def train(args):
                     logger.error(f"[DRIVER] generate FAILED: {e}")
                     raise
 
-            newly_done = ray.get(work_queue.get_newly_completed_engines.remote())
-
-            for group_rank in newly_done:
-                # Record per-group inference duration
+            # Per-engine: emit trace + eager sleep. Safe to deregister/release
+            # because the engine has no more in-flight work for this rollout.
+            newly_done_engines = ray.get(work_queue.get_newly_completed_engines.remote())
+            for engine_idx in newly_done_engines:
+                if engine_idx in sleeped_engines:
+                    continue
                 engine_inference_end = time.perf_counter()
-                get_tracer().emit("inference", device=group_rank,
-                            start=engine_inference_start[group_rank],
+                get_tracer().emit("inference", device=engine_idx,
+                            start=engine_inference_start[engine_idx],
                             end=engine_inference_end, rollout_id=rollout_id)
+                if engines_per_train_group > 1:
+                    # Only useful when sibling engines might still be busy on the
+                    # same GPUs; with 1:1 mapping, switch_engine_to_training does
+                    # the same work below.
+                    elastic_group.sleep_engine(engine_idx)
+                    sleeped_engines.add(engine_idx)
 
+            # Per-train-group: flip to training when all engines for the group are done.
+            newly_done_groups = ray.get(work_queue.get_newly_completed_train_groups.remote())
+            for group_rank in newly_done_groups:
                 switch_start = time.time()
                 if first_engine_switch_time is None:
                     first_engine_switch_time = switch_start
-                logger.info(f"[DRIVER] Group {group_rank} completed generation, switching to training...")
-                # Switch this group to training (non-collective, per-group)
+                logger.info(f"[DRIVER] Train group {group_rank} fully done, switching to training...")
+                # Switch this train group to training (non-collective, per-group).
+                # Idempotent w.r.t. already-sleeped engines.
                 elastic_group.switch_engine_to_training(group_rank)
 
                 # Start work-stealing training loop on all actors in group (non-blocking)
@@ -209,13 +250,13 @@ def train(args):
                 completed.add(group_rank)
                 last_engine_done_time = time.time()
                 logger.info(
-                    f"[DRIVER] Group {group_rank} switched to training "
+                    f"[DRIVER] Train group {group_rank} switched to training "
                     f"({time.time() - switch_start:.2f}s), "
-                    f"{len(completed)}/{num_groups} groups in training"
+                    f"{len(completed)}/{num_train_groups} groups in training"
                 )
-                print(f"[PRINT_INFO][DRIVER] Group {group_rank} switched to training "
+                print(f"[PRINT_INFO][DRIVER] Train group {group_rank} switched to training "
                     f"({time.time() - switch_start:.2f}s), "
-                    f"{len(completed)}/{num_groups} groups in training")
+                    f"{len(completed)}/{num_train_groups} groups in training")
 
         # Inference time: from rollout_start to last engine completing generation
         inference_elapsed = last_engine_done_time - rollout_start
@@ -294,8 +335,8 @@ def train(args):
                 f"tokens={total_tokens}, "
                 f"chunks={result['num_chunks_processed']}"
             )
-        logger.info(f"[DRIVER] All {num_groups} groups completed work-stealing training")
-        print(f"[DRIVER] All {num_groups} groups completed work-stealing training")
+        logger.info(f"[DRIVER] All {num_train_groups} train groups completed work-stealing training")
+        print(f"[DRIVER] All {num_train_groups} train groups completed work-stealing training")
 
         # Training time: from first engine switch to end of work-stealing
         training_elapsed = time.time() - first_engine_switch_time
@@ -360,8 +401,10 @@ def train(args):
         "total_training_time_s": total_time,
         "num_rollouts": args.num_rollout,
         "total_gpus": total_gpus,
-        "tp_size": tp_size,
-        "num_groups": num_groups,
+        "train_tp": train_tp,
+        "infer_tp": infer_tp,
+        "num_train_groups": num_train_groups,
+        "num_infer_engines": num_infer_engines,
         "rollouts": all_rollout_metrics,
     }
     report_path = "/tmp/slime_streaming_report.json"
