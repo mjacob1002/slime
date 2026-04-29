@@ -1,0 +1,9 @@
+{
+  "train_mode": "streaming",
+  "model_name": "Qwen3-0.6B",
+  "megatron_model_type": "qwen3-0.6B",
+  "num_gpus_per_node": 4,
+  "elastic_gpus": 3,
+  "num_rollout": 50,
+  "enable_eval": true
+}
