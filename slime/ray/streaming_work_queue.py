@@ -25,11 +25,33 @@ class StreamingWorkQueue:
       all their prompt groups, so the driver can switch them to training.
     """
 
-    def __init__(self, num_engines: int, max_items_per_grab: int | None = None):
+    def __init__(
+        self,
+        num_engines: int,
+        max_items_per_grab: int | None = None,
+        *,
+        num_train_groups: int | None = None,
+        engines_per_train_group: int | None = None,
+    ):
         from slime.utils.logging_utils import configure_logger
         configure_logger()
         self._num_engines = num_engines
         self._max_items_per_grab = max_items_per_grab
+
+        # Train-group bookkeeping. When inference TP < training TP, multiple
+        # engines share the GPUs of one training TP group; the driver can only
+        # flip a train group to training when ALL its engines have finished.
+        # Defaults preserve 1:1 behavior (one engine per train group).
+        if num_train_groups is None:
+            num_train_groups = num_engines
+        if engines_per_train_group is None:
+            engines_per_train_group = num_engines // num_train_groups
+        assert num_train_groups * engines_per_train_group == num_engines, (
+            f"num_train_groups ({num_train_groups}) * engines_per_train_group "
+            f"({engines_per_train_group}) != num_engines ({num_engines})"
+        )
+        self._num_train_groups = num_train_groups
+        self._engines_per_train_group = engines_per_train_group
 
         # Data queue
         self._pending: list = []        # items not yet grabbed
@@ -39,8 +61,16 @@ class StreamingWorkQueue:
         self._completed_engines: set[int] = set()
         self._consumed_engines: set[int] = set()  # already returned by get_newly_completed
 
+        # Train-group completion tracking — derived from engine completions.
+        # A train group is "ready to flip" only when all its engines are done.
+        self._engines_done_by_group: dict[int, set[int]] = {}
+        self._completed_train_groups: set[int] = set()
+        self._consumed_train_groups: set[int] = set()
+
         logger.info(
             f"[WORK_QUEUE] Initialized with num_engines={num_engines}, "
+            f"num_train_groups={num_train_groups}, "
+            f"engines_per_train_group={engines_per_train_group}, "
             f"max_items_per_grab={max_items_per_grab}"
         )
 
@@ -56,11 +86,22 @@ class StreamingWorkQueue:
         """Mark an engine as having completed ALL its prompt groups.
 
         Called by the rollout manager when all groups for an engine are done.
+        Also updates train-group readiness: the engine's train group is marked
+        complete once every engine sharing those GPUs has finished. Future
+        request-migration policies can subscribe to this method to redirect or
+        drain in-flight work without involving the driver.
         """
         self._completed_engines.add(engine_rank)
+        train_group = engine_rank // self._engines_per_train_group
+        bucket = self._engines_done_by_group.setdefault(train_group, set())
+        bucket.add(engine_rank)
+        if len(bucket) == self._engines_per_train_group:
+            self._completed_train_groups.add(train_group)
         logger.info(
-            f"[WORK_QUEUE] engine_completed({engine_rank}), "
-            f"total={len(self._completed_engines)}/{self._num_engines}"
+            f"[WORK_QUEUE] engine_completed({engine_rank}) → train_group={train_group} "
+            f"({len(bucket)}/{self._engines_per_train_group}), "
+            f"engines_total={len(self._completed_engines)}/{self._num_engines}, "
+            f"train_groups_total={len(self._completed_train_groups)}/{self._num_train_groups}"
         )
 
     def mark_generation_complete(self):
@@ -71,12 +112,28 @@ class StreamingWorkQueue:
     def get_newly_completed_engines(self) -> set[int]:
         """Return engine ranks that completed since the last call.
 
-        Used by the driver to switch newly-finished engines to training.
+        Useful for per-engine early sleep / tracing. The driver should NOT
+        use this to decide when to flip a train group to training when
+        engines_per_train_group > 1 — use get_newly_completed_train_groups()
+        instead.
         """
         new = self._completed_engines - self._consumed_engines
         self._consumed_engines.update(new)
         if new:
             logger.info(f"[WORK_QUEUE] get_newly_completed_engines: returning {new}")
+        return new
+
+    def get_newly_completed_train_groups(self) -> set[int]:
+        """Return train groups whose engines have ALL finished since the last call.
+
+        This is the signal the driver uses to flip a train group's GPUs from
+        inference to training. With engines_per_train_group == 1 this matches
+        get_newly_completed_engines(); with > 1 it aggregates.
+        """
+        new = self._completed_train_groups - self._consumed_train_groups
+        self._consumed_train_groups.update(new)
+        if new:
+            logger.info(f"[WORK_QUEUE] get_newly_completed_train_groups: returning {new}")
         return new
 
     def grab_available(self) -> list:
@@ -112,4 +169,7 @@ class StreamingWorkQueue:
         self._generation_complete = False
         self._completed_engines.clear()
         self._consumed_engines.clear()
+        self._engines_done_by_group.clear()
+        self._completed_train_groups.clear()
+        self._consumed_train_groups.clear()
         logger.info("[WORK_QUEUE] Reset")

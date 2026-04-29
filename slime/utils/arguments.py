@@ -1752,22 +1752,39 @@ def slime_validate_args(args):
         # Note: Elastic actors handle their own offloading internally via switch_to_training()/switch_to_inference()
         # Do NOT set offload_train/offload_rollout here - those flags control DEDICATED actors/rollout
         args.elastic_mode = True
-        # In elastic mode, each inference engine needs tp_size GPUs.
-        # Propagate tensor_model_parallel_size to rollout_num_gpus_per_engine
-        # so SGLang gets --tp and ElasticUpdateWeight creates correct gather groups.
-        tp_size = getattr(args, 'tensor_model_parallel_size', 1)
-        if tp_size > 1:
-            args.rollout_num_gpus_per_engine = tp_size
-            total_elastic_gpus = args.num_elastic_nodes * args.num_elastic_gpus_per_node
-            assert total_elastic_gpus % tp_size == 0, (
-                f"Total elastic GPUs ({total_elastic_gpus}) must be divisible by "
-                f"tensor_model_parallel_size ({tp_size})"
-            )
+        # Training and inference TP are independent. Inference TP comes from
+        # --rollout-num-gpus-per-engine; training TP comes from --tensor-model-parallel-size.
+        # Both must divide the elastic world size, and tp_train must be a multiple of
+        # tp_infer so each training TP group contains an integer number of inference engines.
+        tp_train = getattr(args, 'tensor_model_parallel_size', 1)
+        tp_infer = getattr(args, 'rollout_num_gpus_per_engine', None) or 1
+        total_elastic_gpus = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+        assert total_elastic_gpus % tp_train == 0, (
+            f"Total elastic GPUs ({total_elastic_gpus}) must be divisible by "
+            f"tensor_model_parallel_size ({tp_train})"
+        )
+        assert total_elastic_gpus % tp_infer == 0, (
+            f"Total elastic GPUs ({total_elastic_gpus}) must be divisible by "
+            f"rollout_num_gpus_per_engine ({tp_infer})"
+        )
+        assert tp_infer <= tp_train, (
+            f"rollout_num_gpus_per_engine ({tp_infer}) must be <= "
+            f"tensor_model_parallel_size ({tp_train}); the tp_infer > tp_train case is not yet supported"
+        )
+        assert tp_train % tp_infer == 0, (
+            f"tensor_model_parallel_size ({tp_train}) must be divisible by "
+            f"rollout_num_gpus_per_engine ({tp_infer}) so each training TP group "
+            f"contains an integer number of inference engines"
+        )
+        # Make tp_infer authoritative for SGLang plumbing; do not override it.
+        args.rollout_num_gpus_per_engine = tp_infer
         logger.info(
             f"Elastic group enabled with {args.num_elastic_nodes} nodes x "
             f"{args.num_elastic_gpus_per_node} GPUs/node = "
-            f"{args.num_elastic_nodes * args.num_elastic_gpus_per_node} total elastic GPUs"
-            f" (tp_size={tp_size}, num_groups={args.num_elastic_nodes * args.num_elastic_gpus_per_node // tp_size})"
+            f"{total_elastic_gpus} total elastic GPUs"
+            f" (tp_train={tp_train}, tp_infer={tp_infer}, "
+            f"num_train_groups={total_elastic_gpus // tp_train}, "
+            f"num_infer_engines={total_elastic_gpus // tp_infer})"
         )
     else:
         args.elastic_mode = False
