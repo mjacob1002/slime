@@ -1,0 +1,13 @@
+{
+  "train_mode": "streaming",
+  "model_name": "Qwen3-0.6B",
+  "megatron_model_type": "qwen3-0.6B",
+  "hf_checkpoint": "/root/models/Qwen3-0.6B",
+  "ref_load": "/root/Qwen3-0.6B_torch_dist",
+  "save_path": "/root/models/Qwen3-0.6B_slime/",
+  "num_gpus_per_node": 2,
+  "elastic_gpus": 2,
+  "num_rollout": 3,
+  "max_response_length": 16384,
+  "enable_eval": false
+}
