@@ -46,7 +46,7 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        "--num-rollout 3 "
+        "--num-rollout 2 "
         "--rollout-batch-size 64 "
         "--n-samples-per-prompt 4 "
         "--rollout-max-response-len 32768 "
@@ -89,7 +89,7 @@ def execute():
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-decode-log-interval 100 "
-        "--sglang-mem-fraction-static 0.80 "
+        "--sglang-mem-fraction-static 0.70 "
     )
 
     ci_args = (
