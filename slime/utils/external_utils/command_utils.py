@@ -6,14 +6,17 @@ import datetime
 import json
 import os
 import random
+import shlex
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import Literal
 
 from slime.utils.misc import exec_command
-from slime.utils.typer_utils import dataclass_cli
+from slime.utils.typer_utils import dataclass_cli, dataclass_cli_with_json
 
-_ = exec_command, dataclass_cli
+_ = exec_command, dataclass_cli, dataclass_cli_with_json
 
 repo_base_dir = Path(os.path.abspath(__file__)).resolve().parents[3]
 
@@ -82,19 +85,43 @@ def fp8_cast_bf16(path_src, path_dst):
     )
 
 
+TrainMode = Literal["sync", "async", "streaming", "async_overlapped"]
+
+TRAIN_SCRIPT_BY_MODE: dict[str, str] = {
+    "sync": "train.py",
+    "async": "train_async.py",
+    "streaming": "train_streaming.py",
+    "async_overlapped": "train_async_overlapped.py",
+}
+
+
+def _default_run_id() -> str:
+    return create_run_id()
+
+
 # This class can be extended by concrete scripts
 @dataclass
 class ExecuteTrainConfig:
     cuda_core_dump: bool = False
     num_nodes: int = int(os.environ.get("SLURM_JOB_NUM_NODES", "1"))
     extra_env_vars: str = ""
+    # Selects which top-level training entry point to invoke. Used by
+    # execute_train() when the caller does not pass an explicit `train_script`.
+    train_mode: TrainMode = "sync"
+    # Stable identifier for this run. Defaults to a timestamp+random suffix and
+    # is used to derive run_dir if run_dir is not set explicitly.
+    run_id: str = field(default_factory=_default_run_id)
+    # Per-run output directory. All launcher-managed artifacts (run.log,
+    # perfetto.json, config.json) land here. None resolves to
+    # /root/shared_data/{run_id}/ inside execute_train().
+    run_dir: str | None = None
 
 
 def execute_train(
     train_args: str,
     num_gpus_per_node: int,
     megatron_model_type: str | None,
-    train_script: str = "train.py",
+    train_script: str | None = None,
     before_ray_job_submit=None,
     extra_env_vars=None,
     config: ExecuteTrainConfig | None = None,
@@ -104,6 +131,49 @@ def execute_train(
         extra_env_vars = {}
     if config is None:
         config = ExecuteTrainConfig()
+
+    # Resolve train_script: explicit caller value wins; otherwise pick from
+    # config.train_mode. Honoring the caller's explicit choice keeps existing
+    # call sites (e.g. tests that pass `train_script="tests/profile_*.py"`)
+    # working unchanged.
+    if train_script is None:
+        train_script = TRAIN_SCRIPT_BY_MODE[config.train_mode]
+
+    # Resolve run_dir + per-run artifact paths.
+    run_dir = Path(config.run_dir) if config.run_dir else Path(f"/root/shared_data/{config.run_id}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_log_path = run_dir / "run.log"
+    perfetto_path = run_dir / "perfetto.json"
+    config_path = run_dir / "config.json"
+
+    # Snapshot the config so the run is self-describing on disk. The
+    # _source_config_path key is set by dataclass_cli_with_json when the
+    # caller drove the run from a JSON file via --config-path; None otherwise.
+    snapshot_extra = {"_source_config_path": os.environ.get("SLIME_LAUNCHER_CONFIG_PATH")}
+    try:
+        snapshot = {**asdict(config), **snapshot_extra}
+        config_path.write_text(json.dumps(snapshot, indent=2, default=str))
+    except TypeError:
+        # Fallback if a field isn't JSON-serializable: best-effort string dump.
+        config_path.write_text(
+            json.dumps(
+                {**{f.name: str(getattr(config, f.name)) for f in fields(config)}, **snapshot_extra},
+                indent=2,
+            )
+        )
+
+    # Auto-inject perfetto trace path if the caller didn't already pass one.
+    if "--perfetto-trace-path" not in train_args:
+        train_args = f"{train_args} --perfetto-trace-path {perfetto_path} "
+
+    # Banner line lands as the first entry in run.log so `grep -l mode= run.log`
+    # over many run dirs gives a quick index of past runs.
+    banner = (
+        f"[LAUNCHER] train_mode={config.train_mode} run_id={config.run_id} "
+        f"run_dir={run_dir} train_script={train_script}"
+    )
+    exec_command(f"echo {shlex.quote(banner)} | tee -a {shlex.quote(str(run_log_path))}")
+
     external_ray = get_bool_env_var("SLIME_SCRIPT_EXTERNAL_RAY")
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
     ray_gcs_port = os.environ.get("SLIME_RAY_GCS_PORT", "6399")
@@ -193,14 +263,21 @@ def execute_train(
             if megatron_model_type is not None
             else ""
         )
+        # Tee stdout+stderr into run_dir/run.log while also streaming to the
+        # console / capture_output pipe. set -o pipefail so a failure inside
+        # `ray job submit` propagates through the pipe instead of getting
+        # masked by tee's exit status.
+        run_log_quoted = shlex.quote(str(run_log_path))
         output = exec_command(
-            f"export no_proxy=127.0.0.1 && export PYTHONBUFFERED=16 && "
+            f"set -o pipefail; export no_proxy=127.0.0.1 && export PYTHONBUFFERED=16 && "
             f"{cmd_megatron_model_source}"
+            f"{{ "
             f'ray job submit --address="http://127.0.0.1:{ray_dashboard_port}" '
             f"--runtime-env-json='{runtime_env_json}' "
             f"-- python3 {train_script} "
             f"{'${MODEL_ARGS[@]}' if megatron_model_type is not None else ''} "
-            f"{train_args}",
+            f"{train_args}"
+            f" ; }} 2>&1 | tee -a {run_log_quoted}",
             capture_output=capture_output,
         )
         return output
