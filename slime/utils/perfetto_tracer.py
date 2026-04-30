@@ -8,8 +8,13 @@ Usage:
 
     init_tracer("/tmp/trace.json")           # enable at startup
 
-    with tracer.event("inference", device=0): # record a phase
+    with tracer.event("inference", device=0): # record a phase on one row
         do_inference()
+
+    # An event spanning multiple physical GPUs renders as one bar per row;
+    # all bars share an `args.event_id` so post-processing can group them.
+    with tracer.event("training", device=[0, 1]):
+        do_training()
 
     tracer.instant("engine_done", device=1)   # record a point event
 
@@ -21,8 +26,13 @@ import logging
 import threading
 import time
 from contextlib import contextmanager
+from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
+
+
+# Type alias: a single device id or a list/tuple of physical-GPU ids.
+Device = str | int | Sequence[int]
 
 
 class PerfettoTracer:
@@ -36,6 +46,9 @@ class PerfettoTracer:
         self._devices_seen: set[str | int] = set()
         # Reference time for computing timestamps in microseconds
         self._epoch = time.perf_counter()
+        # Monotonic logical-event counter. Each public emit/event/instant call
+        # produces one id, shared across every duplicated span the call yields.
+        self._next_id = 0
 
     def _ts_us(self) -> int:
         """Current timestamp in microseconds relative to tracer epoch."""
@@ -56,9 +69,31 @@ class PerfettoTracer:
             return f"GPU {device}"
         return device.capitalize()
 
+    @staticmethod
+    def _as_device_list(device: Device) -> list[str | int]:
+        """Normalize device arg to a list of single-row identifiers.
+
+        - int/str: single-row event → [device]
+        - list/tuple of ints: per-physical-GPU duplication → [g0, g1, ...]
+        """
+        if isinstance(device, (list, tuple)):
+            return list(device)
+        return [device]
+
+    def _allocate_event_id(self) -> int:
+        """Atomically allocate the next logical-event id."""
+        with self._lock:
+            n = self._next_id
+            self._next_id += 1
+            return n
+
     @contextmanager
-    def event(self, name: str, device: str | int, **kwargs):
-        """Context manager that records a complete event (ph="X")."""
+    def event(self, name: str, device: Device, **kwargs):
+        """Context manager that records a complete event (ph="X").
+
+        If `device` is a list/tuple of physical-GPU ids, the same span is
+        recorded once per GPU row, with a shared `args.event_id`.
+        """
         if not self.enabled:
             yield
             return
@@ -67,48 +102,57 @@ class PerfettoTracer:
             yield
         finally:
             dur = self._ts_us() - start
-            ev = {
-                "name": name,
-                "ph": "X",
-                "ts": start,
-                "dur": dur,
-                "pid": self._device_pid(device),
-                "tid": 0,
-            }
-            if kwargs:
-                ev["args"] = kwargs
+            event_id = self._allocate_event_id()
+            args = {**kwargs, "event_id": event_id}
+            devices = self._as_device_list(device)
             with self._lock:
-                self._events.append(ev)
-                self._devices_seen.add(device)
+                for d in devices:
+                    self._events.append({
+                        "name": name,
+                        "ph": "X",
+                        "ts": start,
+                        "dur": dur,
+                        "pid": self._device_pid(d),
+                        "tid": 0,
+                        "args": args,
+                    })
+                    self._devices_seen.add(d)
 
-    def instant(self, name: str, device: str | int, **kwargs):
+    def instant(self, name: str, device: Device, **kwargs):
         """Record an instantaneous marker event (ph="i")."""
         if not self.enabled:
             return
-        ev = {
-            "name": name,
-            "ph": "i",
-            "ts": self._ts_us(),
-            "pid": self._device_pid(device),
-            "tid": 0,
-            "s": "g",  # global scope
-        }
-        if kwargs:
-            ev["args"] = kwargs
+        ts = self._ts_us()
+        event_id = self._allocate_event_id()
+        args = {**kwargs, "event_id": event_id}
+        devices = self._as_device_list(device)
         with self._lock:
-            self._events.append(ev)
-            self._devices_seen.add(device)
+            for d in devices:
+                self._events.append({
+                    "name": name,
+                    "ph": "i",
+                    "ts": ts,
+                    "pid": self._device_pid(d),
+                    "tid": 0,
+                    "s": "g",  # global scope
+                    "args": args,
+                })
+                self._devices_seen.add(d)
 
-    def emit(self, name: str, device: str | int, start: float, end: float, tid: int = 0, **kwargs):
+    def emit(self, name: str, device: Device, start: float, end: float, tid: int = 0, **kwargs):
         """Record a complete event with explicit start/end perf_counter times.
 
         Use this for async operations where the start/end are recorded
         separately (e.g., inference that starts and finishes at different
         points in a poll loop).
 
+        If `device` is a list/tuple of physical-GPU ids, the span is recorded
+        once per GPU row with a shared `args.event_id`.
+
         Args:
             name: Label for the event.
-            device: Device identifier.
+            device: Device identifier — int/str (single row) or list/tuple
+                of physical-GPU ids (one row per GPU, same span).
             start: time.perf_counter() value at start.
             end: time.perf_counter() value at end.
             tid: Thread ID for sub-row placement in Perfetto (default 0).
@@ -117,19 +161,21 @@ class PerfettoTracer:
             return
         ts = int((start - self._epoch) * 1_000_000)
         dur = int((end - start) * 1_000_000)
-        ev = {
-            "name": name,
-            "ph": "X",
-            "ts": ts,
-            "dur": dur,
-            "pid": self._device_pid(device),
-            "tid": tid,
-        }
-        if kwargs:
-            ev["args"] = kwargs
+        event_id = self._allocate_event_id()
+        args = {**kwargs, "event_id": event_id}
+        devices = self._as_device_list(device)
         with self._lock:
-            self._events.append(ev)
-            self._devices_seen.add(device)
+            for d in devices:
+                self._events.append({
+                    "name": name,
+                    "ph": "X",
+                    "ts": ts,
+                    "dur": dur,
+                    "pid": self._device_pid(d),
+                    "tid": tid,
+                    "args": args,
+                })
+                self._devices_seen.add(d)
 
     def write(self, path: str | None = None):
         """Write all collected events to Chrome Trace Event JSON."""

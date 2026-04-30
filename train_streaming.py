@@ -127,6 +127,25 @@ def train(args):
     # Initialize Perfetto tracer
     init_tracer(getattr(args, "perfetto_trace_path", None))
 
+    # Cache the per-engine and per-train-group physical-GPU lists for the
+    # tracer. These let emit() label rows with the actual GPU IDs
+    # (cross-referenceable with nvidia-smi) instead of the engine/group index,
+    # so a viewer can see at a glance which GPUs are training vs inferring at
+    # any moment — partition-aware tracing per
+    # feedback_partition_aware_profiling.md.
+    gpus_per_engine_cache = {
+        e: elastic_group.physical_gpus_for_engine(e) for e in range(num_infer_engines)
+    }
+    gpus_per_group_cache = {
+        g: elastic_group.physical_gpus_for_train_group(g) for g in range(num_train_groups)
+    }
+    get_tracer().instant(
+        "partition_map", device="driver",
+        train_groups=gpus_per_group_cache,
+        infer_engines=gpus_per_engine_cache,
+        train_tp=train_tp, infer_tp=infer_tp,
+    )
+
     # Training loop
     total_train_start = time.time()
     n_prompt_groups = args.rollout_batch_size // args.n_samples_per_prompt
@@ -219,9 +238,10 @@ def train(args):
                 if engine_idx in sleeped_engines:
                     continue
                 engine_inference_end = time.perf_counter()
-                get_tracer().emit("inference", device=engine_idx,
+                get_tracer().emit("inference", device=gpus_per_engine_cache[engine_idx],
                             start=engine_inference_start[engine_idx],
-                            end=engine_inference_end, rollout_id=rollout_id)
+                            end=engine_inference_end, rollout_id=rollout_id,
+                            engine_idx=engine_idx)
                 if engines_per_train_group > 1:
                     # Only useful when sibling engines might still be busy on the
                     # same GPUs; with 1:1 mapping, switch_engine_to_training does
@@ -297,9 +317,10 @@ def train(args):
                 }
                 for c in chunk_stats
             ]
-            get_tracer().emit("training", device=group_rank,
+            get_tracer().emit("training", device=gpus_per_group_cache[group_rank],
                         start=train_start, end=training_done_time,
                         rollout_id=rollout_id,
+                        train_group=group_rank,
                         samples=result['total_samples_processed'],
                         tokens=result.get('total_tokens_processed', 0),
                         chunks=result['num_chunks_processed'],
@@ -310,10 +331,11 @@ def train(args):
                 chunk_end = c.get("chunk_end_perf", 0)
                 if chunk_start and chunk_end:
                     get_tracer().emit(
-                        f"chunk_{c['chunk_id']}", device=group_rank,
+                        f"chunk_{c['chunk_id']}", device=gpus_per_group_cache[group_rank],
                         start=chunk_start, end=chunk_end,
                         tid=1,  # sub-row for chunks
                         rollout_id=rollout_id,
+                        train_group=group_rank,
                         samples=c["samples"],
                         tokens=c["total_tokens"],
                         microbatches=c["num_microbatches"],
