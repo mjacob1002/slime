@@ -219,6 +219,28 @@ class RayElasticGroup:
         end = start + self._engines_per_train_group
         return self._inference_engines[start:end]
 
+    def physical_gpus_for_engine(self, engine_idx: int) -> list[int]:
+        """Physical GPU IDs occupied by inference engine `engine_idx`.
+
+        Reads from the placement-group GPU IDs Ray assigned at construction.
+        Length == `_infer_tp_size`. Used by the Perfetto tracer to label
+        per-physical-GPU rows so the timeline reflects actual hardware
+        partitions instead of engine indices.
+        """
+        _, _, reordered_gpu_ids = self._pg_info
+        start = engine_idx * self._infer_tp_size
+        return [int(reordered_gpu_ids[start + i]) for i in range(self._infer_tp_size)]
+
+    def physical_gpus_for_train_group(self, group_rank: int) -> list[int]:
+        """Physical GPU IDs occupied by training TP group `group_rank`.
+
+        Length == `_train_tp_size`. With infer_tp < train_tp, these
+        intentionally span more GPUs than `physical_gpus_for_engine`.
+        """
+        _, _, reordered_gpu_ids = self._pg_info
+        start = group_rank * self._train_tp_size
+        return [int(reordered_gpu_ids[start + i]) for i in range(self._train_tp_size)]
+
     def init(self) -> int:
         """
         Initialize training actors and inference engines.
