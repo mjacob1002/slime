@@ -3,6 +3,7 @@ import copy
 import inspect
 import logging
 import time
+import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -131,8 +132,13 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status = Sample.Status.TRUNCATED
         return sample
 
+    # Allocate a stable request id once so /abort_request can target this call.
+    if sample.rid is None:
+        sample.rid = uuid.uuid4().hex
+
     # Prepare payload for sglang server
     payload = {
+        "rid": sample.rid,
         "sampling_params": sampling_params,
         "return_logprob": True,
     }

@@ -144,6 +144,7 @@ def train(args):
         train_groups=gpus_per_group_cache,
         infer_engines=gpus_per_engine_cache,
         train_tp=train_tp, infer_tp=infer_tp,
+        migration_policy=getattr(args, "migration_policy", "none") or "none",
     )
 
     # Training loop

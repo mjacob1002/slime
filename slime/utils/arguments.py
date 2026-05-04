@@ -156,12 +156,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--migration-policy",
                 type=str,
-                choices=["none", "long-tail"],
+                choices=["none", "train_group_aware"],
                 default="none",
                 help=(
                     "Request migration policy for streaming training. "
                     "'none' keeps all requests on their assigned engine. "
-                    "'long-tail' migrates truncated requests to engine 0."
+                    "'train_group_aware' aborts in-flight requests on a lagging "
+                    "engine when its train group is otherwise drained, and "
+                    "re-dispatches them to a still-inferring train group."
                 ),
             )
 
