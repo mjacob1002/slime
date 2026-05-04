@@ -49,6 +49,11 @@ class Sample:
     generation_end_time: float = 0.0    # SLIME_TIMELINE: wall-clock time.time()
     engine_rank: int = -1               # SLIME_TIMELINE: which engine/GPU processed this
 
+    # Stable handle for SGLang /abort_request — assigned at first /generate call.
+    rid: str | None = None
+    # If migrated, the original engine_rank before re-dispatch (None otherwise).
+    migrated_from: int | None = None
+
     @dataclass
     class SpecInfo:
         spec_accept_token_num: int = 0

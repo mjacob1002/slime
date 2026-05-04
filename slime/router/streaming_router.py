@@ -6,21 +6,30 @@ generate_and_rm_group() to make HTTP calls to engines.
 
 This is NOT an HTTP server (unlike SlimeRouter). It operates at the Python
 level, coordinating which prompt groups go to which engine and pushing
-completed results to the work queue.
+completed results to the work queue incrementally.
+
+Optionally consults a `MigrationPolicy` after each group completion to
+abort + re-dispatch in-flight groups off lagging engines onto still-busy
+ones, mitigating the streaming long-tail tax.
 """
 
 import asyncio
 import copy
 import itertools
-import json
 import logging
-import os
+import time
 from collections.abc import Callable
 from typing import Any
 
 import ray
 
-from slime.router.migration_policy import NoMigrationPolicy, RequestMigrationPolicy
+from slime.backends.sglang_utils.sglang_engine import abort_request_at
+from slime.router.migration_policy import (
+    MigrationContext,
+    MigrationDecision,
+    MigrationPolicy,
+    NoMigration,
+)
 from slime.utils.ray_utils import Box
 from slime.utils.types import Sample
 
@@ -33,32 +42,53 @@ class StreamingRouter:
     Args:
         engine_urls: List of engine URLs (one per engine).
         work_queue: StreamingWorkQueue Ray actor handle.
-        migration_policy: Policy controlling request migration.
+        migration_policy: Policy controlling request migration (or NoMigration).
         args: Training arguments namespace.
         convert_samples_fn: Callable that converts list[Sample] -> train_data dict.
+        engines_per_train_group: How many engines share one training group.
+            Defaults to 1 (each engine is its own train group, the pre-decoupling
+            colocated layout).
     """
 
     def __init__(
         self,
         engine_urls: list[str],
         work_queue,
-        migration_policy: RequestMigrationPolicy,
+        migration_policy: MigrationPolicy,
         args,
         convert_samples_fn: Callable[[list[Sample]], dict],
+        engines_per_train_group: int = 1,
     ):
         self.engine_urls = engine_urls
         self.num_engines = len(engine_urls)
         self.work_queue = work_queue
-        self.migration_policy = migration_policy
+        self.migration_policy = migration_policy or NoMigration()
         self.args = args
         self.convert_samples_fn = convert_samples_fn
+
+        if engines_per_train_group <= 0 or self.num_engines % engines_per_train_group != 0:
+            raise ValueError(
+                f"engines_per_train_group ({engines_per_train_group}) must divide "
+                f"num_engines ({self.num_engines})"
+            )
+        self.engines_per_train_group = engines_per_train_group
+        self.num_train_groups = self.num_engines // engines_per_train_group
 
         # Parse engine URLs into per-engine args (host/port overrides)
         self.engine_local_args = self._parse_engine_urls()
 
+    # ---------- topology helpers (also exposed to MigrationContext) ----------
+
+    def _train_group_for_engine(self, engine: int) -> int:
+        return engine // self.engines_per_train_group
+
+    def _engines_for_train_group(self, group: int) -> list[int]:
+        start = group * self.engines_per_train_group
+        return list(range(start, start + self.engines_per_train_group))
+
     def _parse_engine_urls(self) -> dict[int, Any]:
         """Parse engine URLs into per-engine args with host/port overrides."""
-        engine_local_args = {}
+        engine_local_args: dict[int, Any] = {}
         for engine_rank, url in enumerate(self.engine_urls):
             local_args = copy.copy(self.args)
             url_parts = url.replace("http://", "").replace("https://", "")
@@ -98,10 +128,16 @@ class StreamingRouter:
         data to work_queue per-group, signals engine_completed and
         mark_generation_complete at the appropriate times.
 
+        After each group completes, consults `migration_policy` for any
+        abort + re-dispatch decisions and executes them serially.
+
         Returns:
             List of per-sample info dicts for rollout logging.
         """
         from slime.rollout.sglang_rollout import generate_and_rm_group
+
+        # Reset migration policy state at the start of every rollout.
+        self.migration_policy.reset()
 
         # Split samples across engines
         samples_per_engine = self._split_samples_across_engines(samples)
@@ -116,13 +152,28 @@ class StreamingRouter:
             groups = [engine_samples[i : i + n_spp] for i in range(0, len(engine_samples), n_spp)]
             engine_prompt_groups[engine_rank] = groups
 
-        # Flatten to one asyncio task per prompt group
-        tasks: dict[asyncio.Task, tuple[int, int]] = {}  # task -> (engine_rank, group_idx)
-        groups_per_engine: dict[int, int] = {}
+        # ── Dispatch + bookkeeping state ───────────────────────────────
+        # task -> (engine_rank, group_idx, group_samples). Extending the
+        # original (engine, idx) tuple with the actual samples lets us do
+        # migration without re-inferring which samples belong to which task.
+        tasks: dict[asyncio.Task, tuple[int, int, list[Sample]]] = {}
+        groups_originally_assigned: dict[int, int] = {}
+        groups_currently_assigned: dict[int, int] = {}
         completed_per_engine: dict[int, int] = {}
+        # Per-engine in-flight group list (drained when task completes / migrates).
+        in_flight_groups: dict[int, list[list[Sample]]] = {e: [] for e in range(self.num_engines)}
+        # "inferring" until completed_per_engine == groups_currently_assigned, then "drained".
+        engine_status: dict[int, str] = {e: "inferring" for e in range(self.num_engines)}
+        # Set of train groups whose engines have completely flipped to training.
+        # Router can't observe the flip directly; treat any engine with status
+        # "drained" as no longer absorbing migrations into its train group.
+        flipped_train_groups: set[int] = set()
+        # Migrations executed this rollout, oldest first.
+        recent_migrations: list[MigrationDecision] = []
 
         for engine_rank, groups in engine_prompt_groups.items():
-            groups_per_engine[engine_rank] = len(groups)
+            groups_originally_assigned[engine_rank] = len(groups)
+            groups_currently_assigned[engine_rank] = len(groups)
             completed_per_engine[engine_rank] = 0
             local_args = self.engine_local_args[engine_rank]
 
@@ -134,18 +185,123 @@ class StreamingRouter:
                 task = asyncio.create_task(
                     generate_and_rm_group(local_args, group, sampling_params.copy(), evaluation=False)
                 )
-                tasks[task] = (engine_rank, group_idx)
+                tasks[task] = (engine_rank, group_idx, group)
+                in_flight_groups[engine_rank].append(group)
 
         total_groups = len(tasks)
         logger.info(f"[ROLLOUT] dispatch_and_collect: {total_groups} per-group tasks across {self.num_engines} engines")
 
-        # Wait for groups to complete one at a time (FIRST_COMPLETED)
         all_samples: list[dict] = []
         pending = set(tasks.keys())
+
+        def _build_context() -> MigrationContext:
+            return MigrationContext(
+                num_engines=self.num_engines,
+                num_train_groups=self.num_train_groups,
+                engines_per_train_group=self.engines_per_train_group,
+                train_group_for_engine=self._train_group_for_engine,
+                engines_for_train_group=self._engines_for_train_group,
+                in_flight_groups={e: list(gs) for e, gs in in_flight_groups.items()},
+                in_flight_count={e: len(gs) for e, gs in in_flight_groups.items()},
+                groups_originally_assigned=dict(groups_originally_assigned),
+                groups_currently_assigned=dict(groups_currently_assigned),
+                completed_per_engine=dict(completed_per_engine),
+                engine_status=dict(engine_status),
+                flipped_train_groups=set(flipped_train_groups),
+                recent_migrations=list(recent_migrations),
+            )
+
+        def _find_task_for_group(target_group: list[Sample]) -> asyncio.Task | None:
+            # Identity match — same list object reference, since we stored
+            # the exact list we created the task for.
+            for t, (_, _, g) in tasks.items():
+                if g is target_group:
+                    return t
+            return None
+
+        async def _execute_migration(decision: MigrationDecision) -> None:
+            src_task = _find_task_for_group(decision.group)
+            if src_task is None or src_task.done():
+                logger.info(
+                    f"[MIGRATION] skip — src task for group already gone "
+                    f"(src={decision.src_engine}, dst={decision.dst_engine})"
+                )
+                return
+
+            src_url = self.engine_urls[decision.src_engine]
+            rids = [s.rid for s in decision.group if s.rid]
+            logger.info(
+                f"[MIGRATION] aborting {len(rids)} rid(s) on engine {decision.src_engine} "
+                f"-> dst engine {decision.dst_engine} ({decision.reason})"
+            )
+            for rid in rids:
+                ok = abort_request_at(src_url, rid)
+                logger.info(f"[MIGRATION] abort_request_at({src_url}, {rid}) ok={ok}")
+
+            # Wait for the original task to settle. It may raise on abort or
+            # return abort-flagged samples; either is acceptable — we discard
+            # whatever state was accumulated and re-dispatch from scratch.
+            try:
+                await src_task
+            except Exception as e:
+                logger.info(f"[MIGRATION] src task raised after abort (expected): {e}")
+
+            # Reset each migrated sample so the next /generate call starts fresh.
+            # Per the plan, we accept losing partial decoded tokens.
+            for sample in decision.group:
+                sample.tokens = []
+                sample.response = ""
+                sample.response_length = 0
+                sample.rollout_log_probs = None
+                sample.status = Sample.Status.PENDING
+                sample.migrated_from = decision.src_engine
+                sample.rid = None  # will be re-allocated by generate()
+
+            # Drop the migrated group from src bookkeeping.
+            try:
+                in_flight_groups[decision.src_engine].remove(decision.group)
+            except ValueError:
+                pass
+            tasks.pop(src_task, None)
+            pending.discard(src_task)
+            groups_currently_assigned[decision.src_engine] -= 1
+            # Engine may now be at parity → fire engine_completed if it's not
+            # already. Mark drained either way.
+            if (
+                completed_per_engine[decision.src_engine]
+                >= groups_currently_assigned[decision.src_engine]
+                and engine_status[decision.src_engine] == "inferring"
+            ):
+                engine_status[decision.src_engine] = "drained"
+                ray.get(self.work_queue.engine_completed.remote(decision.src_engine))
+                logger.info(
+                    f"[MIGRATION] src engine {decision.src_engine} drained after migration "
+                    f"(assigned={groups_currently_assigned[decision.src_engine]}, "
+                    f"completed={completed_per_engine[decision.src_engine]}) → engine_completed"
+                )
+
+            # Re-dispatch on dst.
+            dst_args = self.engine_local_args[decision.dst_engine]
+            new_task = asyncio.create_task(
+                generate_and_rm_group(dst_args, decision.group, sampling_params.copy(), evaluation=False)
+            )
+            tasks[new_task] = (decision.dst_engine, -1, decision.group)
+            in_flight_groups[decision.dst_engine].append(decision.group)
+            pending.add(new_task)
+            groups_currently_assigned[decision.dst_engine] += 1
+            recent_migrations.append(decision)
+            logger.info(
+                f"[MIGRATION] re-dispatched {len(decision.group)} sample(s) on engine {decision.dst_engine} "
+                f"(now assigned={groups_currently_assigned[decision.dst_engine]})"
+            )
+
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                engine_rank, group_idx = tasks[task]
+                if task not in tasks:
+                    # Task was already aborted by a migration earlier in this batch.
+                    continue
+                engine_rank, group_idx, group_samples = tasks[task]
                 try:
                     completed_samples = task.result()
                 except Exception as e:
@@ -184,12 +340,12 @@ class StreamingRouter:
                             "generation_latency": sample.generation_latency,
                             "prompt_preview": prompt_str[:200],
                             "response_preview": sample.response[:500],
+                            "migrated_from": sample.migrated_from,
                         }
                     )
 
                 # Convert and push to work queue
                 train_data = self.convert_samples_fn(flat_samples)
-                # 
                 data_ref = Box(ray.put(train_data))
                 ray.get(self.work_queue.push_data.remote(data_ref))
                 logger.info(
@@ -197,14 +353,31 @@ class StreamingRouter:
                     f"{len(flat_samples)} samples"
                 )
 
-                # Track per-engine completion
+                # Drop from in-flight tracking and update completion counters.
+                try:
+                    in_flight_groups[engine_rank].remove(group_samples)
+                except ValueError:
+                    pass
+                tasks.pop(task, None)
                 completed_per_engine[engine_rank] += 1
-                if completed_per_engine[engine_rank] == groups_per_engine[engine_rank]:
-                    ray.get(self.work_queue.engine_completed.remote(engine_rank))
-                    logger.info(
-                        f"[ROLLOUT] Engine {engine_rank} ALL {groups_per_engine[engine_rank]} "
-                        f"groups done → engine_completed"
+                if completed_per_engine[engine_rank] == groups_currently_assigned[engine_rank]:
+                    if engine_status[engine_rank] != "drained":
+                        engine_status[engine_rank] = "drained"
+                        ray.get(self.work_queue.engine_completed.remote(engine_rank))
+                        logger.info(
+                            f"[ROLLOUT] Engine {engine_rank} ALL "
+                            f"{groups_currently_assigned[engine_rank]} groups done → engine_completed"
+                        )
+
+                # Consult migration policy. Always pass a fresh context so the
+                # policy sees prior decisions in the same `done` batch.
+                if not isinstance(self.migration_policy, NoMigration):
+                    ctx = _build_context()
+                    decisions = self.migration_policy.on_request_completed(
+                        engine_rank, group_samples, ctx
                     )
+                    for d in decisions:
+                        await _execute_migration(d)
 
         # Record response lengths if configured
         if getattr(self.args, "profiling_record_lengths_path", None):
@@ -215,5 +388,11 @@ class StreamingRouter:
         # Signal that all generation is complete
         ray.get(self.work_queue.mark_generation_complete.remote())
         logger.info("[ROLLOUT] All generation complete, mark_generation_complete called")
+
+        if recent_migrations:
+            logger.info(
+                f"[ROLLOUT] Migration summary for rollout {rollout_id}: "
+                f"{len(recent_migrations)} group(s) migrated"
+            )
 
         return all_samples

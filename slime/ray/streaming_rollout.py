@@ -15,7 +15,7 @@ import ray
 import torch
 
 from slime.rollout.base_types import call_rollout_fn
-from slime.router.migration_policy import NoMigrationPolicy
+from slime.router.migration_policy import make_migration_policy
 from slime.router.streaming_router import StreamingRouter
 from slime.utils.async_utils import run
 from slime.utils.http_utils import init_http_client
@@ -91,12 +91,16 @@ class StreamingRolloutManager:
         state = SGGenerateState(init_args)
         logger.info(f"[ROLLOUT] SGGenerateState initialized, semaphore permits={state.semaphore._value}")
 
-        # Build migration policy
-        policy_name = getattr(self.args, "migration_policy", "none")
-        if policy_name == "none":
-            migration_policy = NoMigrationPolicy()
-        else:
-            raise ValueError(f"Unknown migration policy: {policy_name}")
+        # Build migration policy via factory (handles "none" and "train_group_aware").
+        migration_policy = make_migration_policy(self.args)
+        policy_name = getattr(self.args, "migration_policy", "none") or "none"
+
+        # Train-group geometry — derived the same way as in train_streaming.py.
+        # Falls back to 1:1 mapping (engines_per_train_group=1) if the args
+        # required for streaming-colocated layout aren't present.
+        train_tp = getattr(self.args, "tensor_model_parallel_size", 1) or 1
+        infer_tp = getattr(self.args, "rollout_num_gpus_per_engine", 1) or 1
+        engines_per_train_group = max(1, train_tp // infer_tp)
 
         # Create the router (reused across rollouts)
         self.router = StreamingRouter(
@@ -105,8 +109,12 @@ class StreamingRolloutManager:
             migration_policy=migration_policy,
             args=self.args,
             convert_samples_fn=self._convert_samples_to_train_data,
+            engines_per_train_group=engines_per_train_group,
         )
-        logger.info(f"[ROLLOUT] StreamingRouter created with {num_engines} engines, policy={policy_name}")
+        logger.info(
+            f"[ROLLOUT] StreamingRouter created with {num_engines} engines, "
+            f"policy={policy_name}, engines_per_train_group={engines_per_train_group}"
+        )
 
     def generate(self, rollout_id: int, work_queue):
         """Dispatch all requests through the StreamingRouter.

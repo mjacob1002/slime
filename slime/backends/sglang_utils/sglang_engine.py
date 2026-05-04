@@ -50,6 +50,27 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
+def abort_request_at(server_url: str, rid: str, timeout: float = 5.0) -> bool:
+    """POST /abort_request to a specific SGLang server URL.
+
+    Returns True if the abort was acknowledged (HTTP 2xx). Returns False on any
+    failure — including 404 (rid already gone), 5xx, or transport errors. The
+    caller should treat False as "nothing to do" and continue: by the time we
+    decide to abort, the original task may have completed naturally.
+
+    Args:
+        server_url: Full base URL like "http://10.0.0.1:15000".
+        rid: Request id provided in the original /generate payload.
+        timeout: Per-request timeout in seconds.
+    """
+    try:
+        response = requests.post(f"{server_url}/abort_request", json={"rid": rid}, timeout=timeout)
+        return response.ok
+    except requests.RequestException as e:
+        logger.warning(f"abort_request_at({server_url}, rid={rid}) failed: {e}")
+        return False
+
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 
@@ -310,6 +331,12 @@ class SGLangEngine(RayActor):
             "update_weights_from_tensor",
             payload,
         )
+
+    def abort_request(self, rid: str) -> bool:
+        """Abort an in-flight request on this engine by rid. Returns True on success."""
+        if self.node_rank != 0:
+            return False
+        return abort_request_at(f"http://{self.server_host}:{self.server_port}", rid)
 
     def flush_cache(self):
         """Flush the cache of the server."""
