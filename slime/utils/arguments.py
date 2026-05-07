@@ -166,6 +166,49 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "re-dispatches them to a still-inferring train group."
                 ),
             )
+            parser.add_argument(
+                "--migration-preserve-tokens",
+                dest="migration_preserve_tokens",
+                action="store_true",
+                default=None,
+                help=(
+                    "When migration fires, keep the partial decoded tokens that "
+                    "were already returned by SGLang's abort response so the "
+                    "destination engine resumes from the buffered prefix instead "
+                    "of re-decoding from scratch. Default True when --migration-"
+                    "policy != none. Pass --no-migration-preserve-tokens for the "
+                    "v1 wipe-and-redo behaviour (debugging / regression)."
+                ),
+            )
+            parser.add_argument(
+                "--no-migration-preserve-tokens",
+                dest="migration_preserve_tokens",
+                action="store_false",
+                help="Disable partial-token preservation across migrations.",
+            )
+            parser.add_argument(
+                "--migration-dst-usage-cap",
+                type=float,
+                default=0.70,
+                help=(
+                    "Maximum projected KV-cache token_usage fraction on a "
+                    "destination engine for a migration to be allowed. The "
+                    "MigrationFeasibilityChecker probes /get_load on each "
+                    "candidate destination and skips it if "
+                    "(num_tokens + estimated_added) / max_total_num_tokens "
+                    "would exceed this. Set to 1.0 to disable the gate."
+                ),
+            )
+            parser.add_argument(
+                "--migration-min-src-usage",
+                type=float,
+                default=0.05,
+                help=(
+                    "Minimum source-engine token_usage fraction below which "
+                    "migration is skipped entirely for that drain event "
+                    "(abort + re-dispatch overhead would dwarf savings)."
+                ),
+            )
 
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)
@@ -1562,6 +1605,14 @@ def parse_args(add_custom_arguments=None):
     # the correct flag, not only the driver-side router-launch logic.
     if getattr(args, "use_queued_slime_router", False) and not getattr(args, "use_slime_router", False):
         args.use_slime_router = True
+
+    # --migration-preserve-tokens default: True iff a non-trivial migration
+    # policy is selected. Users can force either way with --[no-]migration-
+    # preserve-tokens; argparse stores None when neither flag was passed.
+    if getattr(args, "migration_preserve_tokens", None) is None:
+        args.migration_preserve_tokens = (
+            getattr(args, "migration_policy", "none") not in (None, "none", "")
+        )
 
     return args
 

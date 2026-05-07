@@ -24,6 +24,7 @@ from typing import Any
 import ray
 
 from slime.backends.sglang_utils.sglang_engine import abort_request_at
+from slime.router.migration_feasibility import MigrationFeasibilityChecker
 from slime.router.migration_policy import (
     MigrationContext,
     MigrationDecision,
@@ -76,6 +77,24 @@ class StreamingRouter:
 
         # Parse engine URLs into per-engine args (host/port overrides)
         self.engine_local_args = self._parse_engine_urls()
+
+        # Feasibility checker is attached only when a non-trivial migration
+        # policy is in use — otherwise the policy never consults it.
+        self.feasibility_checker: MigrationFeasibilityChecker | None = None
+        if not isinstance(self.migration_policy, NoMigration):
+            dst_cap = float(getattr(args, "migration_dst_usage_cap",
+                                   MigrationFeasibilityChecker.DEFAULT_DST_USAGE_CAP))
+            min_src = float(getattr(args, "migration_min_src_usage",
+                                   MigrationFeasibilityChecker.DEFAULT_MIN_SRC_USAGE))
+            self.feasibility_checker = MigrationFeasibilityChecker(
+                engine_urls=self.engine_urls,
+                dst_usage_cap=dst_cap,
+                min_src_usage=min_src,
+            )
+            logger.info(
+                f"[ROUTER] MigrationFeasibilityChecker attached: "
+                f"dst_usage_cap={dst_cap}, min_src_usage={min_src}"
+            )
 
     # ---------- topology helpers (also exposed to MigrationContext) ----------
 
@@ -194,6 +213,26 @@ class StreamingRouter:
         all_samples: list[dict] = []
         pending = set(tasks.keys())
 
+        max_new_tokens_per_sample = int(getattr(self.args, "rollout_max_response_len", 0) or 0)
+
+        # If replay-lengths are configured, resolve to the per-sample map for
+        # the current rollout once. The estimator falls back gracefully when
+        # this is None or when a particular sample.index isn't in the map.
+        replay_lengths_per_sample: dict[int, int] | None = None
+        replay_path = getattr(self.args, "profiling_replay_lengths_path", None)
+        if replay_path:
+            try:
+                from slime.utils.profiling_lengths import load_replay_lengths
+                all_replay = load_replay_lengths(replay_path)
+                # Use the current rollout's recorded lengths if present, else
+                # rollout 0 as a fallback (matches `apply_replay_to_sampling_params`).
+                replay_lengths_per_sample = all_replay.get(rollout_id) or all_replay.get(0)
+            except Exception as e:
+                logger.warning(
+                    f"[ROUTER] failed to load replay lengths from {replay_path} "
+                    f"for migration estimator: {e}"
+                )
+
         def _build_context() -> MigrationContext:
             return MigrationContext(
                 num_engines=self.num_engines,
@@ -209,6 +248,9 @@ class StreamingRouter:
                 engine_status=dict(engine_status),
                 flipped_train_groups=set(flipped_train_groups),
                 recent_migrations=list(recent_migrations),
+                feasibility_checker=self.feasibility_checker,
+                max_new_tokens_per_sample=max_new_tokens_per_sample,
+                replay_lengths_per_sample=replay_lengths_per_sample,
             )
 
         def _find_task_for_group(target_group: list[Sample]) -> asyncio.Task | None:
@@ -246,16 +288,40 @@ class StreamingRouter:
             except Exception as e:
                 logger.info(f"[MIGRATION] src task raised after abort (expected): {e}")
 
-            # Reset each migrated sample so the next /generate call starts fresh.
-            # Per the plan, we accept losing partial decoded tokens.
+            # Sample state is already populated with the partial decode by
+            # generate()'s post-processing, even on abort: SGLang's
+            # _handle_abort_req (tokenizer_manager.py:1911) returns the
+            # accumulated `state.output_ids` and logprobs in the /generate
+            # response, and slime's existing extraction at the bottom of
+            # generate() merges those into `sample.tokens` / `.response` /
+            # `.rollout_log_probs`. We just need to NOT wipe them and
+            # normalize status so generate() will resume from the buffer.
+            #
+            # `--migration-preserve-tokens` (default True) gates this; passing
+            # `--no-migration-preserve-tokens` reverts to v1 wipe-and-redo
+            # behaviour for debugging / regression testing.
+            preserve_tokens = bool(getattr(self.args, "migration_preserve_tokens", True))
+            buffered_per_sample: list[int] = []
             for sample in decision.group:
-                sample.tokens = []
-                sample.response = ""
-                sample.response_length = 0
-                sample.rollout_log_probs = None
+                if not preserve_tokens:
+                    sample.tokens = []
+                    sample.response = ""
+                    sample.response_length = 0
+                    sample.rollout_log_probs = None
+                else:
+                    buffered_per_sample.append(sample.response_length)
+                # Always normalize the rest.
                 sample.status = Sample.Status.PENDING
                 sample.migrated_from = decision.src_engine
                 sample.rid = None  # will be re-allocated by generate()
+            if preserve_tokens and buffered_per_sample:
+                mean_buf = sum(buffered_per_sample) / len(buffered_per_sample)
+                logger.info(
+                    f"[MIGRATION] preserved buffered decode: "
+                    f"mean={mean_buf:.0f} tokens, "
+                    f"min={min(buffered_per_sample)}, max={max(buffered_per_sample)} "
+                    f"(across {len(buffered_per_sample)} samples)"
+                )
 
             # Drop the migrated group from src bookkeeping.
             try:
@@ -373,7 +439,7 @@ class StreamingRouter:
                 # policy sees prior decisions in the same `done` batch.
                 if not isinstance(self.migration_policy, NoMigration):
                     ctx = _build_context()
-                    decisions = self.migration_policy.on_request_completed(
+                    decisions = await self.migration_policy.on_request_completed(
                         engine_rank, group_samples, ctx
                     )
                     for d in decisions:

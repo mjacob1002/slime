@@ -171,7 +171,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         else:
             new_response_tokens, new_response_log_probs = [], []
 
-        # Update sample with tokens directly - avoiding re-tokenization
+        # Update sample with tokens directly - avoiding re-tokenization.
+        # On a /abort_request mid-flight, SGLang's _handle_abort_req still
+        # populates output_token_logprobs with the partial decode (see
+        # tokenizer_manager.py:1936 where output_ids = state.output_ids), so
+        # this same code path captures partial state for migration.
         sample.tokens = sample.tokens + new_response_tokens
         sample.response_length += len(new_response_tokens)
         sample.response += output["text"]
