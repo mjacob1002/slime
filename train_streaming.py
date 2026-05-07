@@ -145,6 +145,9 @@ def train(args):
         infer_engines=gpus_per_engine_cache,
         train_tp=train_tp, infer_tp=infer_tp,
         migration_policy=getattr(args, "migration_policy", "none") or "none",
+        migration_preserve_tokens=bool(getattr(args, "migration_preserve_tokens", False)),
+        migration_dst_usage_cap=float(getattr(args, "migration_dst_usage_cap", 0.70)),
+        migration_min_src_usage=float(getattr(args, "migration_min_src_usage", 0.05)),
     )
 
     # Training loop

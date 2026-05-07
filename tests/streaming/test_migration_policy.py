@@ -1,7 +1,8 @@
 """Unit tests for slime.router.migration_policy.
 
 These tests exercise the policy classes against synthetic MigrationContext
-snapshots — no asyncio, no network, no Ray. They're fast and deterministic.
+snapshots — no real asyncio, no network, no Ray. The policy is async, so
+each call goes through `asyncio.run`; that's the only asyncio surface.
 
 Layout assumed by most tests: 4 engines, 2 train groups of 2 engines each.
   train_group 0: engines [0, 1]
@@ -9,16 +10,22 @@ Layout assumed by most tests: 4 engines, 2 train groups of 2 engines each.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
 # Allow `python tests/streaming/test_migration_policy.py` from any cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+
+def _run_policy(policy, src_engine, group, ctx):
+    return asyncio.run(policy.on_request_completed(src_engine, group, ctx))
+
 from slime.router.migration_policy import (
     MigrationContext,
     NoMigration,
     TrainGroupAwareMigration,
+    _estimate_added_tokens_for_group,
     make_migration_policy,
 )
 from slime.utils.types import Sample
@@ -79,7 +86,7 @@ def test_no_migration_always_empty():
     p = NoMigration()
     sample = _make_sample(0)
     ctx = _ctx_4engines_2groups()
-    assert p.on_request_completed(0, [sample], ctx) == []
+    assert _run_policy(p, 0, [sample], ctx) == []
 
 
 def test_factory_routes_correctly():
@@ -112,7 +119,7 @@ def test_train_group_aware_returns_empty_when_engine_not_drained():
         completed_per_engine={0: 1, 1: 0, 2: 0, 3: 0},
         groups_currently_assigned={0: 1, 1: 1, 2: 1, 3: 1},
     )
-    assert p.on_request_completed(0, [_make_sample(0)], ctx) == []
+    assert _run_policy(p, 0, [_make_sample(0)], ctx) == []
 
 
 def test_train_group_aware_returns_empty_when_no_sibling_lagging():
@@ -124,7 +131,7 @@ def test_train_group_aware_returns_empty_when_no_sibling_lagging():
         completed_per_engine={0: 1, 1: 1, 2: 0, 3: 1},
         groups_currently_assigned={0: 1, 1: 1, 2: 1, 3: 1},
     )
-    assert p.on_request_completed(0, [_make_sample(0)], ctx) == []
+    assert _run_policy(p, 0, [_make_sample(0)], ctx) == []
 
 
 def test_train_group_aware_returns_empty_when_no_destination_group_available():
@@ -138,7 +145,7 @@ def test_train_group_aware_returns_empty_when_no_destination_group_available():
         completed_per_engine={0: 1, 1: 0, 2: 1, 3: 1},
         groups_currently_assigned={0: 1, 1: 1, 2: 1, 3: 1},
     )
-    assert p.on_request_completed(0, [_make_sample(0)], ctx) == []
+    assert _run_policy(p, 0, [_make_sample(0)], ctx) == []
 
 
 def test_train_group_aware_picks_least_loaded_destination():
@@ -165,7 +172,7 @@ def test_train_group_aware_picks_least_loaded_destination():
         completed_per_engine={0: 1, 1: 0, 2: 0, 3: 0},
         groups_currently_assigned={0: 1, 1: 2, 2: 1, 3: 3},
     )
-    decisions = p.on_request_completed(0, [_make_sample(0)], ctx)
+    decisions = _run_policy(p, 0, [_make_sample(0)], ctx)
     assert len(decisions) == 2, f"expected 2 migrations, got {len(decisions)}"
     assert all(d.src_engine == 1 for d in decisions)
     # First migration → engine 2 (least loaded, load=1 vs 3).
@@ -186,7 +193,7 @@ def test_train_group_aware_skips_destinations_whose_train_group_has_flipped():
         groups_currently_assigned={0: 1, 1: 1, 2: 1, 3: 1},
         flipped_train_groups={1},
     )
-    assert p.on_request_completed(0, [_make_sample(0)], ctx) == []
+    assert _run_policy(p, 0, [_make_sample(0)], ctx) == []
 
 
 def test_train_group_aware_decision_carries_group_and_reason():
@@ -199,11 +206,63 @@ def test_train_group_aware_decision_carries_group_and_reason():
         completed_per_engine={0: 1, 1: 0, 2: 0, 3: 0},
         groups_currently_assigned={0: 1, 1: 1, 2: 1, 3: 1},
     )
-    [decision] = p.on_request_completed(0, [_make_sample(0)], ctx)
+    [decision] = _run_policy(p, 0, [_make_sample(0)], ctx)
     assert decision.group is sib_group  # identity, not equality
     assert decision.src_engine == 1
     assert decision.dst_engine in (2, 3)
     assert "drained" in decision.reason
+
+
+# ───────────────────────── estimator tests ──────────────────────────
+
+
+def test_estimator_worst_case_without_replay_lengths():
+    # 4 samples, prompt_ids ~3000 each, decoded ~12000, max_new_tokens=32768.
+    # Worst case per sample: 15000 prefill + (32768 - 12000) = 35768.
+    grp = []
+    for i in range(4):
+        s = Sample(index=10 + i, prompt="p")
+        s.tokens = list(range(15000))  # prompt + 12k decoded approx
+        s.response_length = 12000
+        grp.append(s)
+    estimate = _estimate_added_tokens_for_group(grp, max_new_tokens_per_sample=32768)
+    # 4 × (15000 + 32768 - 12000) = 4 × 35768 = 143072
+    assert estimate == 4 * (15000 + 32768 - 12000)
+
+
+def test_estimator_uses_replay_length_when_present():
+    grp = []
+    for i in range(4):
+        s = Sample(index=10 + i, prompt="p")
+        s.tokens = list(range(15000))
+        s.response_length = 12000
+        grp.append(s)
+    # Recorded responses for these indices were 13000 tokens each.
+    replay = {10: 13000, 11: 13000, 12: 13000, 13: 13000}
+    estimate = _estimate_added_tokens_for_group(
+        grp, max_new_tokens_per_sample=32768, replay_lengths_per_sample=replay
+    )
+    # Per sample: 15000 prefill + max(0, min(32768, 13000) - 12000) = 15000 + 1000 = 16000
+    assert estimate == 4 * 16000
+
+
+def test_estimator_falls_back_per_sample_when_missing():
+    grp = []
+    for i in range(4):
+        s = Sample(index=10 + i, prompt="p")
+        s.tokens = list(range(5000))
+        s.response_length = 0
+        grp.append(s)
+    # Only the first 2 samples have replay; others use full max_new_tokens.
+    replay = {10: 8000, 11: 8000}
+    estimate = _estimate_added_tokens_for_group(
+        grp, max_new_tokens_per_sample=32768, replay_lengths_per_sample=replay
+    )
+    expected = (
+        2 * (5000 + 8000)             # samples with replay → capped at recorded length
+        + 2 * (5000 + 32768)          # samples without replay → full budget
+    )
+    assert estimate == expected
 
 
 # ───────────────────────── runner ──────────────────────────
