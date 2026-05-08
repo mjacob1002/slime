@@ -237,21 +237,22 @@ def train(args):
 
             # Per-engine: emit trace + eager sleep. Safe to deregister/release
             # because the engine has no more in-flight work for this rollout.
-            newly_done_engines = ray.get(work_queue.get_newly_completed_engines.remote())
-            for engine_idx in newly_done_engines:
-                if engine_idx in sleeped_engines:
-                    continue
-                engine_inference_end = time.perf_counter()
-                get_tracer().emit("inference", device=gpus_per_engine_cache[engine_idx],
-                            start=engine_inference_start[engine_idx],
-                            end=engine_inference_end, rollout_id=rollout_id,
-                            engine_idx=engine_idx)
-                if engines_per_train_group > 1:
-                    # Only useful when sibling engines might still be busy on the
-                    # same GPUs; with 1:1 mapping, switch_engine_to_training does
-                    # the same work below.
-                    elastic_group.sleep_engine(engine_idx)
-                    sleeped_engines.add(engine_idx)
+            def _drain_completed_engines():
+                for engine_idx in ray.get(work_queue.get_newly_completed_engines.remote()):
+                    if engine_idx in sleeped_engines:
+                        continue
+                    get_tracer().emit("inference", device=gpus_per_engine_cache[engine_idx],
+                                start=engine_inference_start[engine_idx],
+                                end=time.perf_counter(), rollout_id=rollout_id,
+                                engine_idx=engine_idx)
+                    if engines_per_train_group > 1:
+                        # Only useful when sibling engines might still be busy on the
+                        # same GPUs; with 1:1 mapping, switch_engine_to_training does
+                        # the same work below.
+                        elastic_group.sleep_engine(engine_idx)
+                        sleeped_engines.add(engine_idx)
+
+            _drain_completed_engines()
 
             # Per-train-group: flip to training when all engines for the group are done.
             newly_done_groups = ray.get(work_queue.get_newly_completed_train_groups.remote())
@@ -281,6 +282,16 @@ def train(args):
                 print(f"[PRINT_INFO][DRIVER] Train group {group_rank} switched to training "
                     f"({time.time() - switch_start:.2f}s), "
                     f"{len(completed)}/{num_train_groups} groups in training")
+
+            # Final drain: an engine_completed() call can land between the
+            # get_newly_completed_engines() RPC above and the
+            # get_newly_completed_train_groups() RPC, populating both sets at
+            # once. If that engine was the last one in its train group, the
+            # `completed.add()` above can satisfy the while-loop exit condition
+            # before we ever read `_completed_engines` again — losing the
+            # inference trace event for that engine. Drain once more here so
+            # those late-arriving engines get their emit before we exit.
+            _drain_completed_engines()
 
         # Inference time: from rollout_start to last engine completing generation
         inference_elapsed = last_engine_done_time - rollout_start
