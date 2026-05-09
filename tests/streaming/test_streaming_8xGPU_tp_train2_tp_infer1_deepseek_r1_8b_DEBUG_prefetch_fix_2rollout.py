@@ -1,17 +1,11 @@
-"""8 GPU streaming colocated, train_tp=2 / infer_tp=1, DeepSeek-R1-Distill-Llama-8B,
-10 rollouts, with request migration enabled (v4 policy).
+"""DEBUG: 2-rollout streaming run to validate the prefetch-strand fix.
 
-Identical to test_streaming_8xGPU_tp_train2_tp_infer1_deepseek_r1_8b_10rollout.py
-except --migration-policy train_group_aware is set, which enables:
-  - token preservation across abort + re-dispatch (v2)
-  - pre-migration KV-cache feasibility gate (v3)
-  - replay-aware destination cap estimator (v4, via the same
-    --profiling-replay-lengths-path the no-migration run uses)
+Same configs as test_streaming_8xGPU_tp_train2_tp_infer1_deepseek_r1_8b_10rollout.py,
+but --num-rollout 2 and a DEBUG perfetto path so the verification script can
+distinguish it from the production runs.
 
-Layout:
-  - 8 Megatron training actors, train_tp=2 -> 4 train groups of 2 ranks each.
-  - 8 SGLang inference engines, infer_tp=1 -> 1 engine per GPU.
-  - engines_per_train_group = 2.
+Run with the fixed streaming_actor.py drain block. Expected verification result:
+all 2 rollouts × 1024 samples trained on (vs the pre-fix 896/1024 = 87.5%).
 """
 import os
 import slime.utils.external_utils.command_utils as U
@@ -49,7 +43,7 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        "--num-rollout 10 "
+        "--num-rollout 2 "
         "--rollout-batch-size 256 "
         "--n-samples-per-prompt 4 "
         "--rollout-max-response-len 32768 "
@@ -95,14 +89,10 @@ def execute():
         "--sglang-mem-fraction-static 0.70 "
     )
 
-    migration_args = (
-        "--migration-policy train_group_aware "
-    )
-
     ci_args = (
         "--ci-test "
         "--ci-disable-kl-checker "
-        "--perfetto-trace-path /tmp/streaming_8gpu_tp_train2_tp_infer1_deepseek8b_10rollout_migration_FIXED_trace.json "
+        "--perfetto-trace-path /tmp/DEBUG_streaming_8gpu_tp_train2_tp_infer1_deepseek8b_2rollout_prefetch_fix_trace.json "
         "--profiling-replay-lengths-path /workspace/slime/profiling-lengths/colocate_8gpu_tp_train2_tp_infer1_deepseek8b_10rollout_lengths.json "
     )
 
@@ -114,7 +104,6 @@ def execute():
         f"{elastic_args} "
         f"{perf_args} "
         f"{sglang_args} "
-        f"{migration_args} "
         f"{U.get_default_wandb_args(__file__)} "
         f"{ci_args} "
     )
