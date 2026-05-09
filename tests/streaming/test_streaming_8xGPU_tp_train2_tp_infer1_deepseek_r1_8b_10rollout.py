@@ -95,7 +95,7 @@ def execute():
     ci_args = (
         "--ci-test "
         "--ci-disable-kl-checker "
-        "--perfetto-trace-path /tmp/streaming_8gpu_tp_train2_tp_infer1_deepseek8b_10rollout_trace.json "
+        "--perfetto-trace-path /tmp/streaming_8gpu_tp_train2_tp_infer1_deepseek8b_10rollout_FIXED_trace.json "
         "--profiling-replay-lengths-path /workspace/slime/profiling-lengths/colocate_8gpu_tp_train2_tp_infer1_deepseek8b_10rollout_lengths.json "
     )
 

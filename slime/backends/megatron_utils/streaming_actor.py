@@ -602,6 +602,58 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             if not resolved and not buffer:
                 time.sleep(0.05)
 
+        # Drain any in-flight prefetch. start_prefetch() above may have grabbed
+        # items from _pending that the trainer never delivered to a chunk. The
+        # work_queue's grab_available is destructive — once items leave _pending
+        # they're gone — so without this drain those items are stranded in
+        # prefetcher._grab_ref forever (~12.5% sample loss with 4 train groups).
+        if is_tp_src and prefetcher.has_pending():
+            leftover = prefetcher.collect_prefetch()
+        else:
+            leftover = []
+        if tp_size > 1:
+            drain_payload = [leftover]
+            dist.broadcast_object_list(drain_payload, src=tp_src_global_rank, group=tp_gloo_group)
+            leftover = drain_payload[0]
+        if leftover:
+            merged = self._merge_rollout_data(leftover)
+            if is_tp_src:
+                chunk_lengths = merged.get("total_lengths", [])
+                chunk_total_tokens = sum(chunk_lengths) if chunk_lengths else 0
+                chunk_avg = chunk_total_tokens / len(chunk_lengths) if chunk_lengths else 0
+                chunk_max = max(chunk_lengths) if chunk_lengths else 0
+                logger.info(
+                    f"[WORK_STEAL] Drain chunk: {len(chunk_lengths)} samples, "
+                    f"total_tokens={chunk_total_tokens}, avg_len={chunk_avg:.0f}, max_len={chunk_max}"
+                )
+            result = self._process_chunk(merged, dp_size=dp_size)
+            del merged
+            clear_memory()
+            total_samples += result["num_local_samples"]
+            total_tokens_processed += chunk_total_tokens if is_tp_src else 0
+            num_chunks += 1
+            if is_tp_src:
+                all_chunk_stats.append({
+                    "chunk_id": num_chunks,
+                    "samples": result["num_local_samples"],
+                    "num_microbatches": result["num_microbatches"][0],
+                    "total_tokens": result.get("total_tokens", 0),
+                    "ref_logprob_s": result.get("ref_logprob_time_s", 0),
+                    "actor_logprob_s": result.get("actor_logprob_time_s", 0),
+                    "advantages_s": result.get("advantages_time_s", 0),
+                    "fwd_bwd_s": result.get("fwd_bwd_time_s", 0),
+                    "chunk_total_s": result.get("chunk_total_time_s", 0),
+                    "throughput_tok_s": result.get("throughput_tok_s", 0),
+                    "chunk_start_perf": result.get("chunk_start_perf", 0),
+                    "chunk_end_perf": result.get("chunk_end_perf", 0),
+                    "microbatch_stats": result.get("microbatch_stats", []),
+                })
+                logger.info(
+                    f"[WORK_STEAL] Drained chunk {num_chunks}: "
+                    f"{result['num_local_samples']} samples, total={total_samples}"
+                )
+            self._log_memory(f"work_steal:after_drain_chunk_{num_chunks}")
+
         if snapshot_dir:
             logger.info(f"[WORK_STEAL] Dumping memory snapshot to {snapshot_path}")
             torch.cuda.memory._dump_snapshot(snapshot_path)
