@@ -169,6 +169,7 @@ def train(args):
         max_items_per_grab=max_items_per_grab,
         num_train_groups=num_train_groups,
         engines_per_train_group=engines_per_train_group,
+        expected_items_per_rollout=args.rollout_batch_size,
     )
     all_rollout_metrics = []
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
