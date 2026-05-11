@@ -584,7 +584,11 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                 t_process_returned = time.perf_counter()
                 del merged
                 if not use_chunk_pool:
-                    clear_memory()  # reclaim reserved memory between chunks to avoid fragmentation
+                    # gateable=True opts this call into the adaptive
+                    # SLIME_CLEAR_MEM_RESERVED_GB threshold check (default off).
+                    # When unset, behaviour is identical to the prior
+                    # unconditional clear_memory() call.
+                    clear_memory(gateable=True)
                 t_clear_memory_done = time.perf_counter()
                 total_samples += result["num_local_samples"]
                 total_tokens_processed += chunk_total_tokens if is_tp_src else 0
@@ -707,6 +711,12 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             f"total_samples={total_samples}, total_tokens={total_tokens_processed}, "
             f"num_chunks={num_chunks}"
         )
+
+        # End-of-rollout safety: when the adaptive in-loop clear_memory is
+        # gated and may have skipped some calls, fragmented cache must still
+        # be reclaimed before sleep_lightweight hands memory back to SGLang.
+        # Unconditional call; once per rollout this is negligible cost.
+        clear_memory()
 
         return {
             "total_samples_processed": total_samples,
