@@ -145,6 +145,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--grab-policy",
+                type=str,
+                default="tail_split",
+                choices=("bulk", "tail_split", "all_engines_training"),
+                help=(
+                    "Streaming work-queue grab policy. 'bulk' = legacy "
+                    "max_items_per_grab only. 'tail_split' = also cap at 1 "
+                    "item when <=8 items remain to train on (current default, "
+                    "matches committed 71d3e3aa behavior). "
+                    "'all_engines_training' = also cap at 1 once every "
+                    "inference engine has finished (all GPUs in training "
+                    "mode) -- regressed in DAPO smoke (+19s/rollout), kept "
+                    "for future experiments. Default: tail_split."
+                ),
+            )
+            parser.add_argument(
                 "--perfetto-trace-path",
                 type=str,
                 default=None,

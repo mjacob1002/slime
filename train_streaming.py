@@ -170,6 +170,7 @@ def train(args):
         num_train_groups=num_train_groups,
         engines_per_train_group=engines_per_train_group,
         expected_items_per_rollout=args.rollout_batch_size,
+        grab_policy_name=getattr(args, 'grab_policy', None),
     )
     all_rollout_metrics = []
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
@@ -360,6 +361,32 @@ def train(args):
                         chunk_total_s=c.get("chunk_total_s", 0),
                         tok_per_s=c.get("throughput_tok_s", 0),
                     )
+
+                # Inter-chunk profiling events (tid=2 keeps them on a separate
+                # sub-row from the chunk_N events). Each interval is named
+                # after the operation it covers; durations show up directly
+                # in the perfetto UI for diagnosing inter-chunk gaps.
+                profiling_intervals = [
+                    ("ws_collect_prefetch", "t_iter_start_perf", "t_collect_done_perf"),
+                    ("ws_tp_broadcast",     "t_collect_done_perf", "t_broadcast_done_perf"),
+                    ("ws_extend_buffer",    "t_broadcast_done_perf", "t_extend_done_perf"),
+                    ("ws_merge_data",       "t_extend_done_perf", "t_merge_done_perf"),
+                    ("ws_log_and_prefetch", "t_merge_done_perf", "t_prefetch_started_perf"),
+                    ("ws_clear_memory",     "t_process_returned_perf", "t_clear_memory_done_perf"),
+                ]
+                for ev_name, start_key, end_key in profiling_intervals:
+                    s = c.get(start_key, 0)
+                    e = c.get(end_key, 0)
+                    if s and e and e > s:
+                        get_tracer().emit(
+                            ev_name, device=gpus_per_group_cache[group_rank],
+                            start=s, end=e,
+                            tid=2,  # sub-row for profiling overhead
+                            rollout_id=rollout_id,
+                            train_group=group_rank,
+                            chunk_id=c["chunk_id"],
+                            duration_ms=int((e - s) * 1000),
+                        )
             total_tokens = result.get('total_tokens_processed', 0)
             logger.info(
                 f"[DRIVER] Group {group_rank} work-stealing done: "

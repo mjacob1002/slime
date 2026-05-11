@@ -496,11 +496,27 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         # Gradients accumulate across chunks; _process_chunk does NOT zero.
         self._zero_grads()
 
+        # Optional per-rollout MemPool for transient chunk allocations
+        # (activations, log-prob outputs, advantages). When enabled, replaces
+        # the per-chunk clear_memory() with an O(1) pool release at context
+        # exit. Grad buffers/model weights are allocated outside the pool's
+        # scope and persist normally across chunks. Default off — gate is
+        # SLIME_CHUNK_MEMPOOL env var, propagated via Ray runtime_env.
+        use_chunk_pool = os.environ.get("SLIME_CHUNK_MEMPOOL", "0") == "1"
+        chunk_pool = torch.cuda.MemPool() if use_chunk_pool else None
+        if use_chunk_pool:
+            logger.info("[CHUNK_MEMPOOL] enabled — chunk_pool created for this rollout")
+
         # Prefetcher for overlapping queue grabs with GPU compute
         from slime.ray.chunk_prefetcher import ChunkPrefetcher
         prefetcher = ChunkPrefetcher(work_queue_handle) if is_tp_src else None
 
         while True:
+            # ── inter-chunk profiling: capture perf_counter timestamps at each
+            # major step so the driver can emit per-step perfetto events.
+            # These are passed through chunk_stats; no behaviour change.
+            t_iter_start = time.perf_counter()
+
             # TP rank 0: collect prefetched data or do synchronous grab (first iteration)
             if is_tp_src:
                 if prefetcher.has_pending():
@@ -509,12 +525,14 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                     resolved = prefetcher.grab_sync()
             else:
                 resolved = []
+            t_collect_done = time.perf_counter()
 
             # Broadcast resolved data from TP rank 0 to all TP ranks
             if tp_size > 1:
                 broadcast_payload = [resolved]
                 dist.broadcast_object_list(broadcast_payload, src=tp_src_global_rank, group=tp_gloo_group)
                 resolved = broadcast_payload[0]
+            t_broadcast_done = time.perf_counter()
 
             if resolved:
                 buffer.extend(resolved)
@@ -530,11 +548,13 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                             f"total_tokens={total_tokens}, avg_len={avg_len:.0f}, max_len={max_len}"
                         )
                     logger.info(f"[WORK_STEAL] Grabbed {len(resolved)} items, buffer={len(buffer)}")
+            t_extend_done = time.perf_counter()
 
             # Process buffer if we have data
             if buffer:
                 merged = self._merge_rollout_data(buffer)
                 buffer = []
+                t_merge_done = time.perf_counter()
 
                 # Log chunk-level token stats before processing
                 if is_tp_src:
@@ -550,10 +570,22 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                 # Start prefetch BEFORE GPU compute — overlaps queue grab with forward+backward
                 if is_tp_src:
                     prefetcher.start_prefetch()
+                t_prefetch_started = time.perf_counter()
 
-                result = self._process_chunk(merged, dp_size=dp_size)
+                # Wrap _process_chunk in the chunk pool when enabled, so all
+                # transient allocations route through it; pool's memory is
+                # released on context exit (O(1)) instead of via clear_memory
+                # walking the whole allocator.
+                if use_chunk_pool:
+                    with torch.cuda.use_mem_pool(chunk_pool):
+                        result = self._process_chunk(merged, dp_size=dp_size)
+                else:
+                    result = self._process_chunk(merged, dp_size=dp_size)
+                t_process_returned = time.perf_counter()
                 del merged
-                clear_memory()  # reclaim reserved memory between chunks to avoid fragmentation
+                if not use_chunk_pool:
+                    clear_memory()  # reclaim reserved memory between chunks to avoid fragmentation
+                t_clear_memory_done = time.perf_counter()
                 total_samples += result["num_local_samples"]
                 total_tokens_processed += chunk_total_tokens if is_tp_src else 0
                 num_chunks += 1
@@ -574,6 +606,16 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                         "chunk_start_perf": result.get("chunk_start_perf", 0),
                         "chunk_end_perf": result.get("chunk_end_perf", 0),
                         "microbatch_stats": result.get("microbatch_stats", []),
+                        # Inter-chunk profiling timestamps (perf_counter).
+                        # Driver emits one perfetto event per [t_a, t_b] interval.
+                        "t_iter_start_perf": t_iter_start,
+                        "t_collect_done_perf": t_collect_done,
+                        "t_broadcast_done_perf": t_broadcast_done,
+                        "t_extend_done_perf": t_extend_done,
+                        "t_merge_done_perf": t_merge_done,
+                        "t_prefetch_started_perf": t_prefetch_started,
+                        "t_process_returned_perf": t_process_returned,
+                        "t_clear_memory_done_perf": t_clear_memory_done,
                     })
 
                 self._log_memory(f"work_steal:after_chunk_{num_chunks}")
