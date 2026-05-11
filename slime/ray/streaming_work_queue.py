@@ -14,6 +14,13 @@ import ray
 logger = logging.getLogger(__name__)
 
 
+# When the number of items remaining to train on (across the rest of the
+# rollout) drops to this many, cap each grab at 1 item so the residual tail
+# fans out across all train groups in parallel rather than one train group
+# grabbing the whole tail in a single heavy chunk.
+TAIL_SINGLE_ITEM_THRESHOLD = 8
+
+
 @ray.remote
 class StreamingWorkQueue:
     """Shared work queue replacing StreamingEventQueue for V1 streaming.
@@ -32,6 +39,7 @@ class StreamingWorkQueue:
         *,
         num_train_groups: int | None = None,
         engines_per_train_group: int | None = None,
+        expected_items_per_rollout: int = 0,
     ):
         from slime.utils.logging_utils import configure_logger
         configure_logger()
@@ -57,6 +65,14 @@ class StreamingWorkQueue:
         self._pending: list = []        # items not yet grabbed
         self._generation_complete = False  # True once all generation is done
 
+        # Tail heuristic. We know the total items pushed per rollout up front
+        # (= rollout_batch_size). The grab counter lets grab_available switch
+        # to single-item chunks once <= TAIL_SINGLE_ITEM_THRESHOLD items remain
+        # to train on, so the long-tail prompt groups fan out across all train
+        # groups instead of clustering in one heavy chunk. 0 disables.
+        self._expected_items_per_rollout = int(expected_items_per_rollout)
+        self._items_grabbed_so_far = 0
+
         # Engine completion tracking
         self._completed_engines: set[int] = set()
         self._consumed_engines: set[int] = set()  # already returned by get_newly_completed
@@ -71,7 +87,8 @@ class StreamingWorkQueue:
             f"[WORK_QUEUE] Initialized with num_engines={num_engines}, "
             f"num_train_groups={num_train_groups}, "
             f"engines_per_train_group={engines_per_train_group}, "
-            f"max_items_per_grab={max_items_per_grab}"
+            f"max_items_per_grab={max_items_per_grab}, "
+            f"expected_items_per_rollout={expected_items_per_rollout}"
         )
 
     def push_data(self, data_ref):
@@ -143,19 +160,50 @@ class StreamingWorkQueue:
         that many items, leaving the rest in the queue for other consumers.
         Otherwise returns all pending items.
 
+        Tail-mode: when fewer than TAIL_SINGLE_ITEM_THRESHOLD items remain to
+        train on across the rest of the rollout (computed against
+        expected_items_per_rollout), each grab is capped at 1 item so the
+        residual fans out across all train groups in parallel rather than one
+        train group taking the entire heavy tail in a single chunk.
+        Disabled when expected_items_per_rollout is 0 (the default).
+
         Returns:
             List of data items (may be empty if nothing new).
         """
-        if self._max_items_per_grab is not None and len(self._pending) > self._max_items_per_grab:
-            items = self._pending[:self._max_items_per_grab]
-            self._pending = self._pending[self._max_items_per_grab:]
+        pending_count = len(self._pending)
+
+        in_tail = False
+        if self._expected_items_per_rollout > 0:
+            remaining_to_train = (
+                self._expected_items_per_rollout - self._items_grabbed_so_far
+            )
+            in_tail = 0 < remaining_to_train <= TAIL_SINGLE_ITEM_THRESHOLD
+
+        if in_tail:
+            effective_cap = 1
+        elif self._max_items_per_grab is not None:
+            effective_cap = self._max_items_per_grab
+        else:
+            effective_cap = pending_count
+
+        if effective_cap < pending_count:
+            items = self._pending[:effective_cap]
+            self._pending = self._pending[effective_cap:]
         else:
             items = self._pending
             self._pending = []
+
         if items:
+            self._items_grabbed_so_far += len(items)
+            remaining_to_train = (
+                self._expected_items_per_rollout - self._items_grabbed_so_far
+                if self._expected_items_per_rollout > 0 else None
+            )
             logger.info(
                 f"[WORK_QUEUE] grab_available: returning {len(items)} items "
-                f"(remaining={len(self._pending)})"
+                f"(remaining_in_queue={len(self._pending)}, "
+                f"remaining_to_train={remaining_to_train}, "
+                f"mode={'TAIL' if in_tail else 'normal'})"
             )
         return items
 
@@ -166,6 +214,7 @@ class StreamingWorkQueue:
     def reset(self):
         """Reset all state for the next rollout."""
         self._pending = []
+        self._items_grabbed_so_far = 0
         self._generation_complete = False
         self._completed_engines.clear()
         self._consumed_engines.clear()
