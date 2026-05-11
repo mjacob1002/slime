@@ -11,14 +11,14 @@ import logging
 
 import ray
 
+from slime.ray.grab_policy import (
+    GrabPolicy,
+    GrabState,
+    TAIL_SINGLE_ITEM_THRESHOLD,
+    make_grab_policy,
+)
+
 logger = logging.getLogger(__name__)
-
-
-# When the number of items remaining to train on (across the rest of the
-# rollout) drops to this many, cap each grab at 1 item so the residual tail
-# fans out across all train groups in parallel rather than one train group
-# grabbing the whole tail in a single heavy chunk.
-TAIL_SINGLE_ITEM_THRESHOLD = 8
 
 
 @ray.remote
@@ -40,11 +40,18 @@ class StreamingWorkQueue:
         num_train_groups: int | None = None,
         engines_per_train_group: int | None = None,
         expected_items_per_rollout: int = 0,
+        grab_policy_name: str | None = None,
     ):
         from slime.utils.logging_utils import configure_logger
         configure_logger()
         self._num_engines = num_engines
         self._max_items_per_grab = max_items_per_grab
+
+        # Grab policy decides per-grab item count from queue state. String
+        # name keeps Ray serialization simple; the policy object is built
+        # inside this actor and never crosses the Ray boundary.
+        self._grab_policy: GrabPolicy = make_grab_policy(grab_policy_name)
+        self._grab_policy_name = grab_policy_name or "all_engines_training"
 
         # Train-group bookkeeping. When inference TP < training TP, multiple
         # engines share the GPUs of one training TP group; the driver can only
@@ -88,7 +95,8 @@ class StreamingWorkQueue:
             f"num_train_groups={num_train_groups}, "
             f"engines_per_train_group={engines_per_train_group}, "
             f"max_items_per_grab={max_items_per_grab}, "
-            f"expected_items_per_rollout={expected_items_per_rollout}"
+            f"expected_items_per_rollout={expected_items_per_rollout}, "
+            f"grab_policy={self._grab_policy_name}"
         )
 
     def push_data(self, data_ref):
@@ -154,37 +162,34 @@ class StreamingWorkQueue:
         return new
 
     def grab_available(self) -> list:
-        """Grab available data items, up to max_items_per_grab.
+        """Grab available data items, cap decided by the configured GrabPolicy.
 
-        If max_items_per_grab was set in the constructor, returns at most
-        that many items, leaving the rest in the queue for other consumers.
-        Otherwise returns all pending items.
-
-        Tail-mode: when fewer than TAIL_SINGLE_ITEM_THRESHOLD items remain to
-        train on across the rest of the rollout (computed against
-        expected_items_per_rollout), each grab is capped at 1 item so the
-        residual fans out across all train groups in parallel rather than one
-        train group taking the entire heavy tail in a single chunk.
-        Disabled when expected_items_per_rollout is 0 (the default).
+        Default policy (AllEnginesTraining) caps each grab at 1 item once
+        either:
+          - remaining_to_train <= TAIL_SINGLE_ITEM_THRESHOLD, or
+          - every inference engine has called engine_completed().
+        Otherwise the policy falls back to the legacy max_items_per_grab cap.
+        See slime/ray/grab_policy.py for alternatives.
 
         Returns:
             List of data items (may be empty if nothing new).
         """
         pending_count = len(self._pending)
+        state = GrabState(
+            pending_count=pending_count,
+            max_items_per_grab=self._max_items_per_grab,
+            expected_items_per_rollout=self._expected_items_per_rollout,
+            items_grabbed_so_far=self._items_grabbed_so_far,
+            num_engines=self._num_engines,
+            num_completed_engines=len(self._completed_engines),
+        )
 
-        in_tail = False
-        if self._expected_items_per_rollout > 0:
-            remaining_to_train = (
-                self._expected_items_per_rollout - self._items_grabbed_so_far
-            )
-            in_tail = 0 < remaining_to_train <= TAIL_SINGLE_ITEM_THRESHOLD
-
-        if in_tail:
-            effective_cap = 1
-        elif self._max_items_per_grab is not None:
-            effective_cap = self._max_items_per_grab
+        if pending_count == 0:
+            effective_cap = 0
+            mode = self._grab_policy.mode_label(state)
         else:
-            effective_cap = pending_count
+            effective_cap = max(1, self._grab_policy.effective_cap(state))
+            mode = self._grab_policy.mode_label(state)
 
         if effective_cap < pending_count:
             items = self._pending[:effective_cap]
@@ -203,7 +208,8 @@ class StreamingWorkQueue:
                 f"[WORK_QUEUE] grab_available: returning {len(items)} items "
                 f"(remaining_in_queue={len(self._pending)}, "
                 f"remaining_to_train={remaining_to_train}, "
-                f"mode={'TAIL' if in_tail else 'normal'})"
+                f"completed_engines={len(self._completed_engines)}/{self._num_engines}, "
+                f"mode={mode})"
             )
         return items
 
