@@ -148,12 +148,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--grab-policy",
                 type=str,
                 default="tail_split",
-                choices=("bulk", "tail_split", "all_engines_training"),
+                choices=("bulk", "tail_split", "graduated_tail_split",
+                         "all_engines_training"),
                 help=(
                     "Streaming work-queue grab policy. 'bulk' = legacy "
                     "max_items_per_grab only. 'tail_split' = also cap at 1 "
                     "item when <=8 items remain to train on (current default, "
                     "matches committed 71d3e3aa behavior). "
+                    "'graduated_tail_split' = step the cap down 8->4->2->1 "
+                    "as remaining drops through 32->16->8 thresholds. "
                     "'all_engines_training' = also cap at 1 once every "
                     "inference engine has finished (all GPUs in training "
                     "mode) -- regressed in DAPO smoke (+19s/rollout), kept "

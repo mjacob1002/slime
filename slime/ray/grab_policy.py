@@ -96,6 +96,52 @@ class TailSplitPolicy(GrabPolicy):
         return "normal"
 
 
+class GraduatedTailSplitPolicy(GrabPolicy):
+    """Graduated tail-split: per-grab cap decreases as remaining shrinks.
+
+    Long-tail samples cluster near the end of the rollout, so the simple
+    `tail_split` policy's "bulk OR single-item" binary transition is too
+    coarse. This policy steps the per-grab cap down 8 -> 4 -> 2 -> 1 as
+    remaining_to_train falls through 32 -> 16 -> 8 thresholds:
+
+        remaining > 32        -> bulk cap (default 8, 32 samples/chunk)
+        16 < remaining <= 32  -> 4 items/grab (16 samples/chunk)
+        8  < remaining <= 16  -> 2 items/grab (8 samples/chunk)
+        0  < remaining <= 8   -> 1 item/grab  (4 samples/chunk)
+
+    Same end-state as TailSplitPolicy for the last 8 items, but with two
+    intermediate stages where moderately-heavy mid-tail chunks get fanned
+    across 2 or 4 train groups in parallel instead of one train group
+    taking them all in a single bulk chunk.
+    """
+
+    def __init__(self):
+        self._bulk = BulkPolicy()
+
+    def _cap_for_remaining(self, remaining):
+        if remaining is None or remaining <= 0:
+            return None  # fall through to bulk
+        if remaining <= 8:
+            return 1
+        if remaining <= 16:
+            return 2
+        if remaining <= 32:
+            return 4
+        return None  # remaining > 32 -> bulk
+
+    def effective_cap(self, state: GrabState) -> int:
+        cap = self._cap_for_remaining(state.remaining_to_train)
+        if cap is not None:
+            return cap
+        return self._bulk.effective_cap(state)
+
+    def mode_label(self, state: GrabState) -> str:
+        cap = self._cap_for_remaining(state.remaining_to_train)
+        if cap is None:
+            return "normal"
+        return f"GRAD_TAIL_{cap}"
+
+
 class AllEnginesTrainingPolicy(GrabPolicy):
     """TailSplit OR all inference engines have flipped to training mode.
 
@@ -140,6 +186,8 @@ def make_grab_policy(name: str | None) -> GrabPolicy:
         return BulkPolicy()
     if name == "tail_split":
         return TailSplitPolicy()
+    if name == "graduated_tail_split":
+        return GraduatedTailSplitPolicy()
     if name == "all_engines_training":
         return AllEnginesTrainingPolicy()
     raise ValueError(
