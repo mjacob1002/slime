@@ -129,6 +129,39 @@ class StreamingWorkQueue:
             f"train_groups_total={len(self._completed_train_groups)}/{self._num_train_groups}"
         )
 
+    def unmark_engine_completed(self, engine_rank: int):
+        """Reverse engine_completed bookkeeping so an engine can take more work.
+
+        Used by intra-group migration balancing: when work is re-dispatched
+        back onto a previously-drained engine, the work queue's accounting
+        (which would otherwise allow the train group to flip to training
+        with that engine's new work still in flight) needs to be rolled
+        back. The engine's normal completion path (`engine_completed`)
+        will re-fire when the new work finishes.
+
+        Raises if the engine's train group has already been *consumed* by
+        `get_newly_completed_train_groups()` — at that point the driver has
+        flipped the group to training and un-draining is illegal.
+        """
+        train_group = engine_rank // self._engines_per_train_group
+        assert train_group not in self._consumed_train_groups, (
+            f"unmark_engine_completed({engine_rank}): train_group={train_group} "
+            f"has already been consumed by the driver (already flipped to training)"
+        )
+        self._completed_engines.discard(engine_rank)
+        self._consumed_engines.discard(engine_rank)
+        bucket = self._engines_done_by_group.get(train_group)
+        if bucket is not None:
+            bucket.discard(engine_rank)
+        # If the train group was pre-marked ready (all engines drained) but not
+        # yet consumed, removing one engine drops it back below the threshold.
+        self._completed_train_groups.discard(train_group)
+        logger.info(
+            f"[WORK_QUEUE] unmark_engine_completed({engine_rank}) → train_group={train_group} "
+            f"({len(bucket) if bucket else 0}/{self._engines_per_train_group}), "
+            f"engines_total={len(self._completed_engines)}/{self._num_engines}"
+        )
+
     def mark_generation_complete(self):
         """Signal that all generation is done — no more data will be pushed."""
         self._generation_complete = True
