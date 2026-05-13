@@ -175,14 +175,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--migration-policy",
                 type=str,
-                choices=["none", "train_group_aware"],
+                choices=["none", "train_group_aware", "train_group_proactive"],
                 default="none",
                 help=(
                     "Request migration policy for streaming training. "
                     "'none' keeps all requests on their assigned engine. "
                     "'train_group_aware' aborts in-flight requests on a lagging "
                     "engine when its train group is otherwise drained, and "
-                    "re-dispatches them to a still-inferring train group."
+                    "re-dispatches them to a still-inferring train group. "
+                    "'train_group_proactive' is a strict superset of "
+                    "train_group_aware: it behaves identically while multiple "
+                    "train groups are still inferring, and additionally — once "
+                    "only one train group remains in inference — proactively "
+                    "rebalances loads within that group (including un-draining "
+                    "an early-drained engine to take on its sibling's tail). "
+                    "Requires the driver to skip eager sleep_engine on that "
+                    "lone group's engines; the gate is applied automatically "
+                    "based on this CLI choice."
                 ),
             )
             parser.add_argument(

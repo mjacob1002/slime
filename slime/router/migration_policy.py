@@ -260,11 +260,217 @@ class TrainGroupAwareMigration(MigrationPolicy):
         return decisions
 
 
+class ProactiveTrainGroupMigration(TrainGroupAwareMigration):
+    """Combined inter + intra-group migration with a global-state trigger.
+
+    Two modes, routed at the top of `on_request_completed` by counting how
+    many train groups still have ≥1 engine in "inferring" status:
+
+      • Mode A (≥ 2 inferring groups): identical to TrainGroupAwareMigration
+        — inter-group migration on drain. Delegated via super().
+      • Mode B (exactly 1 inferring group): proactively rebalance loads
+        within that lone group on every request completion, including
+        un-draining and re-dispatching onto an engine that drained earlier
+        in the rollout if needed. No drain trigger required.
+
+    Mode B exploits the fact that once only one train group X remains in
+    inference, all of X's GPUs are effectively pinned until X flips, so
+    leaving an engine "drained" in X is pointless idle. Un-draining and
+    re-dispatching costs an abort + re-prefill but reclaims wall-clock by
+    finishing X's residual work in parallel.
+
+    Correctness of un-drain (see G2 in the plan):
+      Mode B fires only when ≥1 engine in X is "inferring" → X's bucket
+      in the work queue is not full → X is not in `_completed_train_groups`
+      → the driver cannot consume X during this RPC sequence → the
+      `unmark_engine_completed` assertion holds trivially.
+
+    Anti-ping-pong guards (cleared in `reset()`):
+      1. Per-train-group min-completion cooldown.
+      2. One-time un-drain guard per engine per rollout.
+    """
+
+    # Skip if total in-group load is below this — not enough to parallelize.
+    MIN_LOAD_TO_BALANCE = 2
+    # Skip if max - min load across the group is below this — already balanced.
+    # The proactive trigger fires on every completion in the lone group, so a
+    # diff-based gate prevents nuisance migrations when both engines are
+    # already roughly balanced.
+    MIN_LOAD_DIFF_TO_BALANCE = 2
+    # Wait at least this many in-group completions before re-firing intra-group
+    # balancing for the same train group. Prevents ping-pong.
+    MIN_COMPLETIONS_BETWEEN_INTRA = 2
+
+    def reset(self) -> None:
+        super().reset()
+        # train_group -> snapshot of sum(completed_per_engine[e] for e in group)
+        # at the moment of the last intra-fire.
+        self._intra_fire_snapshot: dict[int, int] = {}
+        # Engines that have been un-drained once already this rollout.
+        self._unredrained_engines: set[int] = set()
+        # Train groups for which we've already logged the "lone group detected"
+        # transition — log once per group per rollout.
+        self._lone_group_logged: set[int] = set()
+
+    def _inferring_train_groups(self, ctx: MigrationContext) -> set[int]:
+        """Train groups with ≥1 engine currently in 'inferring' status."""
+        return {
+            g
+            for g in range(ctx.num_train_groups)
+            if any(
+                ctx.engine_status.get(e) == "inferring"
+                for e in ctx.engines_for_train_group(g)
+            )
+        }
+
+    async def on_request_completed(
+        self,
+        src_engine: int,
+        completed_group: list[Sample],
+        ctx: MigrationContext,
+    ) -> list[MigrationDecision]:
+        inferring_groups = self._inferring_train_groups(ctx)
+
+        # Mode A: multiple train groups still inferring. Defer to parent's
+        # inter-group drain-triggered logic.
+        if len(inferring_groups) >= 2:
+            return await super().on_request_completed(src_engine, completed_group, ctx)
+        # All drained — no work to balance.
+        if len(inferring_groups) == 0:
+            return []
+
+        # Mode B: lone-group rebalancing.
+        my_group = next(iter(inferring_groups))
+        if my_group not in self._lone_group_logged:
+            self._lone_group_logged.add(my_group)
+            logger.info(
+                f"[MIGRATION-PROACTIVE] lone-group rebalancing engaged for "
+                f"train_group={my_group}; status={dict(ctx.engine_status)}"
+            )
+
+        group_engines = ctx.engines_for_train_group(my_group)
+
+        # Per-group cooldown: require N completions since the last intra-fire.
+        completions_now = sum(ctx.completed_per_engine.get(e, 0) for e in group_engines)
+        prev_snapshot = self._intra_fire_snapshot.get(my_group)
+        if (
+            prev_snapshot is not None
+            and (completions_now - prev_snapshot) < self.MIN_COMPLETIONS_BETWEEN_INTRA
+        ):
+            return []
+
+        # Imbalance & total-load gates.
+        loads = {e: ctx.in_flight_count.get(e, 0) for e in group_engines}
+        total = sum(loads.values())
+        if total < self.MIN_LOAD_TO_BALANCE:
+            return []
+        if max(loads.values()) - min(loads.values()) < self.MIN_LOAD_DIFF_TO_BALANCE:
+            return []
+
+        n = len(group_engines)
+        target = total // n
+
+        # Plan migrations. Donors are engines with load > target. Recipients
+        # have load < target; prefer still-inferring engines first (no un-drain
+        # cost) and only fall back to drained engines that haven't been
+        # un-drained this rollout.
+        local_load = dict(loads)
+        local_added: dict[int, int] = {e: 0 for e in group_engines}
+        out: list[MigrationDecision] = []
+        donors = sorted(
+            [e for e in group_engines if local_load[e] > target],
+            key=lambda e: -local_load[e],
+        )
+        for donor in donors:
+            # Migrate least-decoded groups first: cheap abort + the most
+            # remaining decode to parallelize onto the recipient.
+            ranked = sorted(
+                ctx.in_flight_groups.get(donor, []),
+                key=lambda g: sum(s.response_length for s in g),
+            )
+            for grp in ranked:
+                if local_load[donor] <= target:
+                    break
+                # Recipient priority: inferring first (no un-drain), then drained
+                # engines we haven't yet un-drained.
+                inferring_recips = sorted(
+                    [
+                        e for e in group_engines
+                        if local_load[e] < target
+                        and ctx.engine_status.get(e) == "inferring"
+                        and e != donor
+                    ],
+                    key=lambda e: local_load[e],
+                )
+                drained_recips = sorted(
+                    [
+                        e for e in group_engines
+                        if local_load[e] < target
+                        and ctx.engine_status.get(e) == "drained"
+                        and e not in self._unredrained_engines
+                    ],
+                    key=lambda e: local_load[e],
+                )
+                recips = inferring_recips + drained_recips
+                if not recips:
+                    break
+                added = _estimate_added_tokens_for_group(
+                    grp, ctx.max_new_tokens_per_sample, ctx.replay_lengths_per_sample,
+                )
+                chosen: int | None = None
+                feasibility_reason = ""
+                for cand in recips:
+                    if ctx.feasibility_checker is None:
+                        chosen = cand
+                        break
+                    ok, _snap, reason = await ctx.feasibility_checker.can_accept_migration(
+                        cand, local_added[cand] + added
+                    )
+                    if ok:
+                        chosen = cand
+                        break
+                    feasibility_reason = reason
+                    logger.info(
+                        f"[MIGRATION-INTRAGROUP] donor {donor} -> cand {cand} skip ({reason})"
+                    )
+                if chosen is None:
+                    if feasibility_reason:
+                        logger.info(
+                            f"[MIGRATION-INTRAGROUP] no feasible dst for donor {donor} "
+                            f"in train_group {my_group} — leaving group put. "
+                            f"Last reason: {feasibility_reason}"
+                        )
+                    continue
+                out.append(MigrationDecision(
+                    group=grp,
+                    src_engine=donor,
+                    dst_engine=chosen,
+                    reason=(
+                        f"intra-group balance tg={my_group} {donor}->{chosen} "
+                        f"(loads={loads}, target={target})"
+                    ),
+                ))
+                local_load[donor] -= 1
+                local_load[chosen] += 1
+                local_added[chosen] += added
+
+        # Stamp cooldown + one-time un-drain guard AFTER planning, so multiple
+        # groups can target the same drained recipient within a single fire
+        # (one un-drain pulls in many migrated groups).
+        if out:
+            self._intra_fire_snapshot[my_group] = completions_now
+            for d in out:
+                if ctx.engine_status.get(d.dst_engine) == "drained":
+                    self._unredrained_engines.add(d.dst_engine)
+        return out
+
+
 def make_migration_policy(args) -> MigrationPolicy:
     name = getattr(args, "migration_policy", "none") or "none"
     factories: dict[str, type[MigrationPolicy]] = {
         "none": NoMigration,
         "train_group_aware": TrainGroupAwareMigration,
+        "train_group_proactive": ProactiveTrainGroupMigration,
     }
     if name not in factories:
         raise ValueError(f"Unknown migration policy: {name!r}. Choices: {sorted(factories)}")

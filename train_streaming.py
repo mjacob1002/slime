@@ -237,8 +237,16 @@ def train(args):
                     logger.error(f"[DRIVER] generate FAILED: {e}")
                     raise
 
-            # Per-engine: emit trace + eager sleep. Safe to deregister/release
-            # because the engine has no more in-flight work for this rollout.
+            # Per-engine: emit trace + (optionally) eager sleep. Safe to
+            # deregister/release because the engine has no more in-flight work
+            # for this rollout — UNLESS the migration policy may later un-drain
+            # and re-dispatch onto this engine (train_group_proactive). In that
+            # case the eager sleep would destroy SGLang state we'd need to
+            # send a new request to, so the eager-sleep call is gated on the
+            # policy. See plan §Risk #1.
+            policy_may_un_drain = (
+                getattr(args, "migration_policy", "none") == "train_group_proactive"
+            )
             def _drain_completed_engines():
                 for engine_idx in ray.get(work_queue.get_newly_completed_engines.remote()):
                     if engine_idx in sleeped_engines:
@@ -247,7 +255,7 @@ def train(args):
                                 start=engine_inference_start[engine_idx],
                                 end=time.perf_counter(), rollout_id=rollout_id,
                                 engine_idx=engine_idx)
-                    if engines_per_train_group > 1:
+                    if engines_per_train_group > 1 and not policy_may_un_drain:
                         # Only useful when sibling engines might still be busy on the
                         # same GPUs; with 1:1 mapping, switch_engine_to_training does
                         # the same work below.

@@ -346,6 +346,19 @@ class StreamingRouter:
                     f"completed={completed_per_engine[decision.src_engine]}) → engine_completed"
                 )
 
+            # If dst is currently drained (intra-group balancing case), un-drain
+            # it in the work queue + status map BEFORE re-dispatching so the
+            # train group doesn't prematurely flip while the new work is in
+            # flight. The normal completion path below re-fires engine_completed
+            # when the migrated work finishes.
+            if engine_status[decision.dst_engine] == "drained":
+                ray.get(self.work_queue.unmark_engine_completed.remote(decision.dst_engine))
+                engine_status[decision.dst_engine] = "inferring"
+                logger.info(
+                    f"[MIGRATION-INTRAGROUP] un-drained engine {decision.dst_engine} "
+                    f"to accept migrated group ({decision.reason})"
+                )
+
             # Re-dispatch on dst.
             dst_args = self.engine_local_args[decision.dst_engine]
             new_task = asyncio.create_task(
