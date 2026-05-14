@@ -1,6 +1,8 @@
 import itertools
+import json as _json
 import logging
 import multiprocessing
+import os
 import random
 import time
 from pathlib import Path
@@ -46,11 +48,14 @@ class RolloutManager:
 
         self.args = args
         self.pg = pg
+        print(f"DEBUG: made it to _start_router")
         _start_router(args)
         # TODO make args immutable
+        print(f"DEBUG: made it to init_tracking: ")
         init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
+        print(f"DEBUG: made it to init_http_client")
         init_http_client(args)
-
+        print(f"DEBUG: initializing data_source and all the functions")
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
 
@@ -64,6 +69,7 @@ class RolloutManager:
             self.custom_convert_samples_to_train_data_func = load_function(
                 self.args.custom_convert_samples_to_train_data_path
             )
+        print(f"Got passed the load_function calls")
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
@@ -73,11 +79,16 @@ class RolloutManager:
             num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
             num_engines = args.rollout_num_gpus // num_gpu_per_engine
             self.all_rollout_engines = [None] * num_engines
+        print(f"About to init rollout engines...")
         self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
+        print(f"Initializing the nodes per engine")
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
+        print(f"Initializing the rollout engine lock...")
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
-
         self._metric_checker = MetricChecker.maybe_create(args)
+        # SLIME_TIMELINE: per-rollout, per-engine spans for driver-side Perfetto emission.
+        # Populated in generate() from raw Sample wall-clock timestamps; drained by pop_engine_spans().
+        self._engine_spans_by_rollout: dict[int, list[dict]] = {}
         if self.args.use_fault_tolerance:
             self._health_monitor = RolloutHealthMonitor(self, args)
 
@@ -94,6 +105,14 @@ class RolloutManager:
     def get_rollout_engines_and_lock(self):
         return self.rollout_engines, self.rollout_engine_lock, self.num_new_engines
 
+    def pop_engine_spans(self, rollout_id):  # SLIME_TIMELINE
+        """Return per-engine wall-clock spans for the given rollout and clear from memory.
+
+        Used by the driver (train_async.py) to emit one Perfetto bar per engine per rollout.
+        Returns [] if generate() was never called for this rollout_id (e.g., debug runs).
+        """
+        return self._engine_spans_by_rollout.pop(rollout_id, [])
+
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
         return len(self.data_source.dataset) // self.args.rollout_batch_size
@@ -103,6 +122,8 @@ class RolloutManager:
         start_time = time.time()
         try:
             data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+            _write_timeline(rollout_id, data)  # SLIME_TIMELINE
+            self._engine_spans_by_rollout[rollout_id] = _compute_engine_spans(data)  # SLIME_TIMELINE
             self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
             _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
             data = self._convert_samples_to_train_data(data)
@@ -410,6 +431,49 @@ class RolloutManager:
         return rollout_data_refs
 
 
+def _compute_engine_spans(samples):  # SLIME_TIMELINE
+    """Group samples by engine_rank; return one (rank, min_start, max_end, n_samples) span per engine.
+
+    Times are wall-clock time.time() values from the engines. The driver converts them to
+    its own perf_counter epoch before calling tracer.emit().
+    """
+    by_rank: dict[int, list] = {}
+    for s in samples:
+        if s.engine_rank < 0 or s.generation_start_time <= 0 or s.generation_end_time <= 0:
+            continue
+        by_rank.setdefault(s.engine_rank, []).append(s)
+    spans = []
+    for rank, group in by_rank.items():
+        spans.append({
+            "rank": rank,
+            "start_walltime": min(s.generation_start_time for s in group),
+            "end_walltime": max(s.generation_end_time for s in group),
+            "n_samples": len(group),
+        })
+    return spans
+
+
+def _write_timeline(rollout_id, samples):  # SLIME_TIMELINE
+    """Write per-sample timeline JSON for Gantt-chart visualization."""
+    log_dir = "/tmp/slime_rollout_logs"
+    os.makedirs(log_dir, exist_ok=True)
+    timeline = []
+    for sample in samples:
+        timeline.append({
+            "sample_index": sample.index,
+            "engine_rank": sample.engine_rank,
+            "generation_start_time": sample.generation_start_time,
+            "generation_end_time": sample.generation_end_time,
+            "generation_latency": sample.generation_latency,
+            "response_length": sample.response_length,
+            "status": sample.status.value,
+        })
+    path = f"{log_dir}/timeline_rollout_{rollout_id}.json"
+    with open(path, "w") as f:
+        _json.dump(timeline, f)
+    logger.info(f"SLIME_TIMELINE: wrote {len(timeline)} samples to {path}")
+
+
 def init_rollout_engines(args, pg, all_rollout_engines):
     if args.debug_train_only:
         return 0
@@ -598,9 +662,20 @@ def _start_router(args):
     if args.sglang_router_port is None:
         args.sglang_router_port = find_available_port(random.randint(3000, 4000))
 
+    # --use-queued-slime-router implies --use-slime-router.
+    if getattr(args, "use_queued_slime_router", False) and not args.use_slime_router:
+        args.use_slime_router = True
+
     if args.use_slime_router:
         assert args.prefill_num_servers is None, "slime router does not support prefill_num_servers."
-        from slime.router.router import run_router
+        if getattr(args, "use_queued_slime_router", False):
+            from slime.router.queued_router import run_queued_router as run_router
+            logger.info(
+                f"Using QueuedSlimeRouter with max_per_worker="
+                f"{getattr(args, 'slime_router_max_per_worker', 16)}"
+            )
+        else:
+            from slime.router.router import run_router
 
         router_args = args
 

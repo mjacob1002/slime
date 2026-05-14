@@ -38,6 +38,8 @@ class SlimeRouter:
         self.worker_request_counts: dict[str, int] = {}
         # URL -> Consecutive Failures
         self.worker_failure_counts: dict[str, int] = {}
+        # SLIME_TIMELINE: URL -> engine rank (assigned in registration order)
+        self.worker_ranks: dict[str, int] = {}
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
         self.max_weight_version = None
@@ -147,10 +149,16 @@ class SlimeRouter:
             try:
                 # Prefer parsing JSON if possible
                 data = json.loads(content)
+                # SLIME_TIMELINE: inject engine identity into response
+                if isinstance(data, dict) and "meta_info" in data and worker_url in self.worker_ranks:
+                    data["meta_info"]["engine_rank"] = self.worker_ranks[worker_url]
+                # SLIME_TIMELINE: Drop content-length — JSONResponse will set the correct value
+                # for the (possibly modified) body after engine_rank injection.
+                fwd_headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
                 return JSONResponse(
                     content=data,
                     status_code=response.status_code,
-                    headers=dict(response.headers),
+                    headers=fwd_headers,
                 )
             except Exception:
                 # Fall back to raw body with original content type
@@ -189,6 +197,8 @@ class SlimeRouter:
         if worker_url not in self.worker_request_counts:
             self.worker_request_counts[worker_url] = 0
             self.worker_failure_counts[worker_url] = 0
+            # SLIME_TIMELINE: track engine rank per worker
+            self.worker_ranks[worker_url] = len(self.worker_ranks)
             if self.verbose:
                 print(f"[slime-router] Added new worker: {worker_url}")
 

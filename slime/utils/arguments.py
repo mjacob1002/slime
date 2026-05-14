@@ -104,6 +104,140 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
 
+            # Elastic group arguments
+            parser.add_argument(
+                "--num-elastic-nodes",
+                type=int,
+                default=0,
+                help=(
+                    "Number of nodes for elastic group (0 = disabled). "
+                    "Elastic groups use separate Ray actors for training and inference on the same GPUs, "
+                    "avoiding torch_memory_saver conflicts."
+                ),
+            )
+            parser.add_argument(
+                "--num-elastic-gpus-per-node",
+                type=int,
+                default=None,
+                help=(
+                    "GPUs per node for elastic group (defaults to num_gpus_per_node). "
+                    "Each GPU runs both a training actor (0.4 GPU) and inference engine (0.2 GPU)."
+                ),
+            )
+            parser.add_argument(
+                "--overlap-inference-tp",
+                type=int,
+                default=None,
+                help=(
+                    "TP size of the SGLang engines colocated with training GPUs in "
+                    "OverlappedRLElasticGroup (used by train_async_overlapped.py). "
+                    "If None, defaults to tensor-model-parallel-size."
+                ),
+            )
+            parser.add_argument(
+                "--max-items-per-grab",
+                type=int,
+                default=None,
+                help=(
+                    "Override max items per grab in the streaming work queue. "
+                    "If not set, defaults to n_prompt_groups // (num_groups * 2). "
+                    "Larger values reduce training overhead but may starve other groups."
+                ),
+            )
+            parser.add_argument(
+                "--grab-policy",
+                type=str,
+                default="tail_split",
+                choices=("bulk", "tail_split", "graduated_tail_split",
+                         "all_engines_training"),
+                help=(
+                    "Streaming work-queue grab policy. 'bulk' = legacy "
+                    "max_items_per_grab only. 'tail_split' = also cap at 1 "
+                    "item when <=8 items remain to train on (current default, "
+                    "matches committed 71d3e3aa behavior). "
+                    "'graduated_tail_split' = step the cap down 8->4->2->1 "
+                    "as remaining drops through 32->16->8 thresholds. "
+                    "'all_engines_training' = also cap at 1 once every "
+                    "inference engine has finished (all GPUs in training "
+                    "mode) -- regressed in DAPO smoke (+19s/rollout), kept "
+                    "for future experiments. Default: tail_split."
+                ),
+            )
+            parser.add_argument(
+                "--perfetto-trace-path",
+                type=str,
+                default=None,
+                help=(
+                    "Write a Perfetto-compatible Chrome Trace Event JSON to this path "
+                    "at the end of the run. If not set, tracing is disabled (zero overhead)."
+                ),
+            )
+            parser.add_argument(
+                "--migration-policy",
+                type=str,
+                choices=["none", "train_group_aware", "train_group_proactive"],
+                default="none",
+                help=(
+                    "Request migration policy for streaming training. "
+                    "'none' keeps all requests on their assigned engine. "
+                    "'train_group_aware' aborts in-flight requests on a lagging "
+                    "engine when its train group is otherwise drained, and "
+                    "re-dispatches them to a still-inferring train group. "
+                    "'train_group_proactive' is a strict superset of "
+                    "train_group_aware: it behaves identically while multiple "
+                    "train groups are still inferring, and additionally — once "
+                    "only one train group remains in inference — proactively "
+                    "rebalances loads within that group (including un-draining "
+                    "an early-drained engine to take on its sibling's tail). "
+                    "Requires the driver to skip eager sleep_engine on that "
+                    "lone group's engines; the gate is applied automatically "
+                    "based on this CLI choice."
+                ),
+            )
+            parser.add_argument(
+                "--migration-preserve-tokens",
+                dest="migration_preserve_tokens",
+                action="store_true",
+                default=None,
+                help=(
+                    "When migration fires, keep the partial decoded tokens that "
+                    "were already returned by SGLang's abort response so the "
+                    "destination engine resumes from the buffered prefix instead "
+                    "of re-decoding from scratch. Default True when --migration-"
+                    "policy != none. Pass --no-migration-preserve-tokens for the "
+                    "v1 wipe-and-redo behaviour (debugging / regression)."
+                ),
+            )
+            parser.add_argument(
+                "--no-migration-preserve-tokens",
+                dest="migration_preserve_tokens",
+                action="store_false",
+                help="Disable partial-token preservation across migrations.",
+            )
+            parser.add_argument(
+                "--migration-dst-usage-cap",
+                type=float,
+                default=0.70,
+                help=(
+                    "Maximum projected KV-cache token_usage fraction on a "
+                    "destination engine for a migration to be allowed. The "
+                    "MigrationFeasibilityChecker probes /get_load on each "
+                    "candidate destination and skips it if "
+                    "(num_tokens + estimated_added) / max_total_num_tokens "
+                    "would exceed this. Set to 1.0 to disable the gate."
+                ),
+            )
+            parser.add_argument(
+                "--migration-min-src-usage",
+                type=float,
+                default=0.05,
+                help=(
+                    "Minimum source-engine token_usage fraction below which "
+                    "migration is skipped entirely for that drain event "
+                    "(abort + re-dispatch overhead would dwarf savings)."
+                ),
+            )
+
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)
 
@@ -943,6 +1077,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=3,
                 help="Number of consecutive failures before marking a worker as unhealthy.",
             )
+            parser.add_argument(
+                "--use-queued-slime-router",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use QueuedSlimeRouter: per-worker in-flight cap + shared "
+                    "request queue. Implies --use-slime-router. Lets "
+                    "late-joining workers (e.g. overlap engines) pick up "
+                    "traffic instead of having all requests already committed "
+                    "to the earlier-registered pool."
+                ),
+            )
+            parser.add_argument(
+                "--slime-router-max-per-worker",
+                type=int,
+                default=16,
+                help=(
+                    "QueuedSlimeRouter: per-worker in-flight cap. Requests "
+                    "over this threshold wait in the router queue until a "
+                    "worker frees up or a new worker registers."
+                ),
+            )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
@@ -1117,6 +1273,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="torch",
             )
             parser.add_argument("--check-weight-update-equal", action="store_true")
+            parser.add_argument(
+                "--profiling-record-lengths-path",
+                type=str,
+                default=None,
+                help="Record per-sample response lengths to this JSON file for profiling determinism.",
+            )
+            parser.add_argument(
+                "--profiling-replay-lengths-path",
+                type=str,
+                default=None,
+                help="Replay recorded response lengths from this JSON file with ignore_eos=True.",
+            )
             return parser
 
         def add_network_arguments(parser):
@@ -1397,14 +1565,52 @@ def parse_args(add_custom_arguments=None):
             hf_validate_args(args, hf_config)
 
         args.rank = 0
-        args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        # Compute world_size for Megatron initialization
+        # If we have dedicated trainers, use their world_size
+        # If we only have elastic actors, use elastic world_size for Megatron
+        dedicated_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        elastic_world_size = 0
+        if getattr(args, 'num_elastic_nodes', 0) > 0:
+            if args.num_elastic_gpus_per_node is None:
+                args.num_elastic_gpus_per_node = args.num_gpus_per_node
+            elastic_world_size = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+
+        # Store both world sizes for reference
+        args.dedicated_world_size = dedicated_world_size
+        args.elastic_world_size = elastic_world_size
+
+        # For Megatron initialization: use dedicated trainers if available, otherwise elastic
+        if dedicated_world_size > 0:
+            args.world_size = dedicated_world_size
+        elif elastic_world_size > 0:
+            args.world_size = elastic_world_size
+        else:
+            # Fallback for debug modes
+            args.world_size = max(1, dedicated_world_size)
+
         args = set_default_megatron_args(args)
     else:
         from slime.backends.fsdp_utils.arguments import load_fsdp_args
 
         args = load_fsdp_args(extra_args_provider=add_slime_arguments)
         args.rank = 0  # Primary process rank for wandb initialization
-        args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        # Compute world_size for FSDP initialization
+        dedicated_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+        elastic_world_size = 0
+        if getattr(args, 'num_elastic_nodes', 0) > 0:
+            if args.num_elastic_gpus_per_node is None:
+                args.num_elastic_gpus_per_node = args.num_gpus_per_node
+            elastic_world_size = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+
+        args.dedicated_world_size = dedicated_world_size
+        args.elastic_world_size = elastic_world_size
+
+        if dedicated_world_size > 0:
+            args.world_size = dedicated_world_size
+        elif elastic_world_size > 0:
+            args.world_size = elastic_world_size
+        else:
+            args.world_size = max(1, dedicated_world_size)
 
     slime_validate_args(args)
 
@@ -1421,6 +1627,20 @@ def parse_args(add_custom_arguments=None):
             args.moe_token_dispatcher_type = "alltoall"
 
     sglang_validate_args(args)
+
+    # --use-queued-slime-router implies --use-slime-router. Resolve here so
+    # downstream components (engines deciding /add_worker vs /workers) see
+    # the correct flag, not only the driver-side router-launch logic.
+    if getattr(args, "use_queued_slime_router", False) and not getattr(args, "use_slime_router", False):
+        args.use_slime_router = True
+
+    # --migration-preserve-tokens default: True iff a non-trivial migration
+    # policy is selected. Users can force either way with --[no-]migration-
+    # preserve-tokens; argparse stores None when neither flag was passed.
+    if getattr(args, "migration_preserve_tokens", None) is None:
+        args.migration_preserve_tokens = (
+            getattr(args, "migration_policy", "none") not in (None, "none", "")
+        )
 
     return args
 
@@ -1604,6 +1824,51 @@ def slime_validate_args(args):
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
             if args.use_critic:
                 args.rollout_num_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
+
+    # Elastic group validation
+    if args.num_elastic_nodes > 0:
+        if args.num_elastic_gpus_per_node is None:
+            args.num_elastic_gpus_per_node = args.num_gpus_per_node
+        # Set elastic_mode flag
+        # Note: Elastic actors handle their own offloading internally via switch_to_training()/switch_to_inference()
+        # Do NOT set offload_train/offload_rollout here - those flags control DEDICATED actors/rollout
+        args.elastic_mode = True
+        # Training and inference TP are independent. Inference TP comes from
+        # --rollout-num-gpus-per-engine; training TP comes from --tensor-model-parallel-size.
+        # Both must divide the elastic world size, and tp_train must be a multiple of
+        # tp_infer so each training TP group contains an integer number of inference engines.
+        tp_train = getattr(args, 'tensor_model_parallel_size', 1)
+        tp_infer = getattr(args, 'rollout_num_gpus_per_engine', None) or 1
+        total_elastic_gpus = args.num_elastic_nodes * args.num_elastic_gpus_per_node
+        assert total_elastic_gpus % tp_train == 0, (
+            f"Total elastic GPUs ({total_elastic_gpus}) must be divisible by "
+            f"tensor_model_parallel_size ({tp_train})"
+        )
+        assert total_elastic_gpus % tp_infer == 0, (
+            f"Total elastic GPUs ({total_elastic_gpus}) must be divisible by "
+            f"rollout_num_gpus_per_engine ({tp_infer})"
+        )
+        assert tp_infer <= tp_train, (
+            f"rollout_num_gpus_per_engine ({tp_infer}) must be <= "
+            f"tensor_model_parallel_size ({tp_train}); the tp_infer > tp_train case is not yet supported"
+        )
+        assert tp_train % tp_infer == 0, (
+            f"tensor_model_parallel_size ({tp_train}) must be divisible by "
+            f"rollout_num_gpus_per_engine ({tp_infer}) so each training TP group "
+            f"contains an integer number of inference engines"
+        )
+        # Make tp_infer authoritative for SGLang plumbing; do not override it.
+        args.rollout_num_gpus_per_engine = tp_infer
+        logger.info(
+            f"Elastic group enabled with {args.num_elastic_nodes} nodes x "
+            f"{args.num_elastic_gpus_per_node} GPUs/node = "
+            f"{total_elastic_gpus} total elastic GPUs"
+            f" (tp_train={tp_train}, tp_infer={tp_infer}, "
+            f"num_train_groups={total_elastic_gpus // tp_train}, "
+            f"num_infer_engines={total_elastic_gpus // tp_infer})"
+        )
+    else:
+        args.elastic_mode = False
 
     if args.offload_train is None:
         args.offload_train = False

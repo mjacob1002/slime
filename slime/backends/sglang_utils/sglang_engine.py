@@ -50,6 +50,27 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
+def abort_request_at(server_url: str, rid: str, timeout: float = 5.0) -> bool:
+    """POST /abort_request to a specific SGLang server URL.
+
+    Returns True if the abort was acknowledged (HTTP 2xx). Returns False on any
+    failure — including 404 (rid already gone), 5xx, or transport errors. The
+    caller should treat False as "nothing to do" and continue: by the time we
+    decide to abort, the original task may have completed naturally.
+
+    Args:
+        server_url: Full base URL like "http://10.0.0.1:15000".
+        rid: Request id provided in the original /generate payload.
+        timeout: Per-request timeout in seconds.
+    """
+    try:
+        response = requests.post(f"{server_url}/abort_request", json={"rid": rid}, timeout=timeout)
+        return response.ok
+    except requests.RequestException as e:
+        logger.warning(f"abort_request_at({server_url}, rid={rid}) failed: {e}")
+        return False
+
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 
@@ -181,27 +202,66 @@ class SGLangEngine(RayActor):
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
+        self.register_with_router(bootstrap_port=server_args_dict.get("disaggregation_bootstrap_port"))
 
-        if self.node_rank == 0 and self.router_ip and self.router_port:
+    def register_with_router(self, bootstrap_port: int | None = None) -> None:
+        """Register this engine with the router.
+
+        Args:
+            bootstrap_port: Optional bootstrap port for prefill workers in disaggregation mode.
+        """
+        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+            return
+
+        if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
+            assert (
+                self.worker_type == "regular"
+            ), "pd disaggregation is not supported in old router or slime router."
+            response = requests.post(
+                f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
+            )
+        else:
+            payload = {
+                "url": f"http://{self.server_host}:{self.server_port}",
+                "worker_type": self.worker_type,
+            }
+            if self.worker_type == "prefill" and bootstrap_port is not None:
+                payload["bootstrap_port"] = bootstrap_port
+            response = requests.post(
+                f"http://{self.router_ip}:{self.router_port}/workers",
+                json=payload,
+            )
+        response.raise_for_status()
+        logger.info(f"Registered with router: {self.server_host}:{self.server_port}")
+
+    def deregister_from_router(self) -> None:
+        """Deregister this engine from the router."""
+        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+            return
+
+        worker_url = f"http://{self.server_host}:{self.server_port}"
+        try:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
-                assert (
-                    self.worker_type == "regular"
-                ), "pd disaggregation is not supported in old router or slime router."
                 response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
+                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}"
                 )
+            elif parse(sglang_router.__version__) < parse("0.3.0"):
+                encoded_url = quote(worker_url, safe="")
+                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{encoded_url}")
             else:
-                payload = {
-                    "url": f"http://{self.server_host}:{self.server_port}",
-                    "worker_type": self.worker_type,
-                }
-                if self.worker_type == "prefill":
-                    payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    json=payload,
-                )
+                all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
+                for worker in all_workers:
+                    if worker["url"] == worker_url:
+                        worker_id = worker["id"]
+                        response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}")
+                        break
+                else:
+                    logger.warning(f"Worker {worker_url} not found in router during deregistration")
+                    return
             response.raise_for_status()
+            logger.info(f"Deregistered from router: {worker_url}")
+        except Exception as e:
+            logger.warning(f"Failed to deregister from router: {e}")
 
     def _make_request(self, endpoint: str, payload: dict | None = None):
         """Make a POST request to the specified endpoint with the given payload.
@@ -272,6 +332,12 @@ class SGLangEngine(RayActor):
             payload,
         )
 
+    def abort_request(self, rid: str) -> bool:
+        """Abort an in-flight request on this engine by rid. Returns True on success."""
+        if self.node_rank != 0:
+            return False
+        return abort_request_at(f"http://{self.server_host}:{self.server_port}", rid)
+
     def flush_cache(self):
         """Flush the cache of the server."""
         if self.node_rank != 0:
@@ -296,33 +362,7 @@ class SGLangEngine(RayActor):
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
-        if self.node_rank == 0:
-            worker_url = f"http://{self.server_host}:{self.server_port}"
-            response = None
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
-                )
-            elif parse(sglang_router.__version__) < parse("0.3.0"):
-                worker_url = quote(worker_url, safe="")
-                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
-            else:
-                try:
-                    all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
-                    for worker in all_workers:
-                        if worker["url"] == worker_url:
-                            worker_id = worker["id"]
-                            response = requests.delete(
-                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
-                            )
-                            break
-                    else:
-                        logger.warning(f"Worker {worker_url} not found in router during shutdown.")
-                except Exception as e:
-                    logger.warning(f"Failed to fetch workers list or remove worker: {e}")
-
-            if response is not None:
-                response.raise_for_status()
+        self.deregister_from_router()
         kill_process_tree(self.process.pid)
 
     def get_weight_version(self):
@@ -333,6 +373,10 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response.json()["weight_version"]
 
+    def get_server_info(self) -> tuple[str, int]:
+        """Return (server_host, server_port) for direct engine access."""
+        return (self.server_host, self.server_port)
+
     def get_server_host(self):
         """Return the server host address."""
         return self.server_host
@@ -341,9 +385,9 @@ class SGLangEngine(RayActor):
         """Return the server port."""
         return self.server_port
 
-    def release_memory_occupation(self):
+    def release_memory_occupation(self, tags: list[str] = None):
         self.flush_cache()
-        return self._make_request("release_memory_occupation")
+        return self._make_request("release_memory_occupation", {"tags": tags})
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """
@@ -356,6 +400,24 @@ class SGLangEngine(RayActor):
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
+
+    def get_weights_checksum(self, param_name: str = None) -> float | None:
+        """Compute a hash of model weights via /get_weights_hash endpoint.
+        Works for ALL models including Qwen3.
+        """
+        if self.node_rank != 0:
+            return None
+        try:
+            payload = {}
+            if param_name is not None:
+                payload["param_name"] = param_name
+            result = self._make_request("get_weights_hash", payload)
+            if result and result.get("hash_value") is not None:
+                return result["hash_value"]
+            return None
+        except Exception as e:
+            print(f"[get_weights_checksum] Failed: {e}")
+            return None
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
         return self._make_request(
@@ -465,6 +527,12 @@ def _compute_server_args(
         "random_seed": args.seed + rank,
         # memory
         "enable_memory_saver": args.offload_rollout,
+        # >>> FIX: Enable CPU backup for main model weights during offload/onload <<<
+        # Without this, release_memory_occupation() frees GPU weights without
+        # backing them up to CPU, so resume_memory_occupation() restores garbage.
+        # (enable_draft_weights_cpu_backup only covers MTP draft weights, not main weights)
+        # "enable_weights_cpu_backup": args.offload_rollout,  # TEMPORARILY DISABLED to test update_weights override
+        # >>> END FIX <<<
         # distributed
         "host": host,
         "port": port,

@@ -2,6 +2,8 @@ import asyncio
 import copy
 import inspect
 import logging
+import time
+import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -130,8 +132,13 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status = Sample.Status.TRUNCATED
         return sample
 
+    # Allocate a stable request id once so /abort_request can target this call.
+    if sample.rid is None:
+        sample.rid = uuid.uuid4().hex
+
     # Prepare payload for sglang server
     payload = {
+        "rid": sample.rid,
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
@@ -164,7 +171,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         else:
             new_response_tokens, new_response_log_probs = [], []
 
-        # Update sample with tokens directly - avoiding re-tokenization
+        # Update sample with tokens directly - avoiding re-tokenization.
+        # On a /abort_request mid-flight, SGLang's _handle_abort_req still
+        # populates output_token_logprobs with the partial decode (see
+        # tokenizer_manager.py:1936 where output_ids = state.output_ids), so
+        # this same code path captures partial state for migration.
         sample.tokens = sample.tokens + new_response_tokens
         sample.response_length += len(new_response_tokens)
         sample.response += output["text"]
@@ -184,6 +195,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         )
 
     sample.update_from_meta_info(args, output["meta_info"])
+
+    # SLIME_TIMELINE: extract engine identity injected by Slime router
+    if "engine_rank" in output.get("meta_info", {}):
+        sample.engine_rank = output["meta_info"]["engine_rank"]
 
     return sample
 
@@ -214,6 +229,8 @@ async def generate_and_rm(
             return sample
 
         with state.dp_rank_context() as _:
+            sample.generation_start_time = time.time()       # SLIME_TIMELINE
+            gen_start = time.perf_counter()
             if args.custom_generate_function_path is not None:
                 custom_generate_func = load_function(args.custom_generate_function_path)
                 # if signature has evaluation, pass evaluation
@@ -223,6 +240,8 @@ async def generate_and_rm(
                     sample = await custom_generate_func(args, sample, sampling_params)
             else:
                 sample = await generate(args, sample, sampling_params)
+            sample.generation_latency = time.perf_counter() - gen_start
+            sample.generation_end_time = time.time()         # SLIME_TIMELINE
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -259,8 +278,16 @@ async def generate_and_rm_group(
         return group
 
     tasks = []
+    replay_lengths = sampling_params.pop("__replay_lengths", None)
+    replay_rollout_id = sampling_params.pop("__replay_rollout_id", None)
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
+        if replay_lengths is not None:
+            from slime.utils.profiling_lengths import apply_replay_to_sampling_params
+
+            apply_replay_to_sampling_params(
+                current_sampling_params, sample, replay_lengths, replay_rollout_id
+            )
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
@@ -338,6 +365,15 @@ async def generate_rollout_async(
 
     state = GenerateState(args)
 
+    # Load replay lengths if configured
+    replay_lengths = None
+    if getattr(args, "profiling_replay_lengths_path", None):
+        from slime.utils.profiling_lengths import load_replay_lengths
+
+        replay_lengths = load_replay_lengths(args.profiling_replay_lengths_path)
+        state.sampling_params["__replay_lengths"] = replay_lengths
+        state.sampling_params["__replay_rollout_id"] = rollout_id
+
     # instantiate data filters
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
@@ -396,6 +432,22 @@ async def generate_rollout_async(
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
     all_samples = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
+
+    # Record response lengths if configured
+    if getattr(args, "profiling_record_lengths_path", None):
+        from slime.utils.profiling_lengths import record_lengths
+
+        flat = []
+        for group in all_samples:
+            for item in group:
+                s = item[0] if isinstance(item, list) else item
+                flat.append({"sample_index": s.index, "response_length": s.response_length})
+        record_lengths(args.profiling_record_lengths_path, rollout_id, flat)
+
+    # Clean up replay keys from sampling_params
+    if replay_lengths is not None:
+        state.sampling_params.pop("__replay_lengths", None)
+        state.sampling_params.pop("__replay_rollout_id", None)
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()

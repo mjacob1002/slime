@@ -44,6 +44,15 @@ class Sample:
     train_metadata: dict | None = None
 
     non_generation_time: float = 0.0  # time spent in non-generation steps
+    generation_latency: float = 0.0  # time spent in generation (seconds)
+    generation_start_time: float = 0.0  # SLIME_TIMELINE: wall-clock time.time()
+    generation_end_time: float = 0.0    # SLIME_TIMELINE: wall-clock time.time()
+    engine_rank: int = -1               # SLIME_TIMELINE: which engine/GPU processed this
+
+    # Stable handle for SGLang /abort_request — assigned at first /generate call.
+    rid: str | None = None
+    # If migrated, the original engine_rank before re-dispatch (None otherwise).
+    migrated_from: int | None = None
 
     @dataclass
     class SpecInfo:

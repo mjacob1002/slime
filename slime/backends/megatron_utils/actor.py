@@ -130,14 +130,38 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-        self.weight_updater = update_weight_cls(
-            self.args,
-            self.model,
-            weights_getter=lambda: self.weights_backuper.get("actor"),
-            model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
-            quantization_config=getattr(self.hf_config, "quantization_config", None),
-        )
+        # Select weight updater based on mode
+        model_name = type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name
+        quantization_config = getattr(self.hf_config, "quantization_config", None)
+
+        if getattr(self.args, 'elastic_mode', False):
+            # Elastic mode: use ElasticUpdateWeight adapter
+            from slime.backends.megatron_utils.update_weight.elastic_update_weight import ElasticUpdateWeight
+            self.weight_updater = ElasticUpdateWeight(
+                self.args,
+                self.model,
+                weights_getter=lambda: self.weights_backuper.get("actor"),
+                model_name=model_name,
+                quantization_config=quantization_config,
+            )
+        elif self.args.colocate:
+            update_weight_cls = UpdateWeightFromTensor
+            self.weight_updater = update_weight_cls(
+                self.args,
+                self.model,
+                weights_getter=lambda: self.weights_backuper.get("actor"),
+                model_name=model_name,
+                quantization_config=quantization_config,
+            )
+        else:
+            update_weight_cls = UpdateWeightFromDistributed
+            self.weight_updater = update_weight_cls(
+                self.args,
+                self.model,
+                weights_getter=lambda: self.weights_backuper.get("actor"),
+                model_name=model_name,
+                quantization_config=quantization_config,
+            )
 
         # empty cache after initialization
         clear_memory()
@@ -160,8 +184,9 @@ class MegatronTrainRayActor(TrainRayActor):
         return start_rollout_id
 
     @timer
-    def sleep(self) -> None:
-        assert self.args.offload_train
+    def sleep(self, is_elastic: bool = False) -> None:
+        if not is_elastic:
+            assert self.args.offload_train
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
@@ -172,8 +197,9 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("after offload model")
 
     @timer
-    def wake_up(self) -> None:
-        assert self.args.offload_train
+    def wake_up(self, is_elastic: bool = False) -> None:
+        if not is_elastic:
+            assert self.args.offload_train
         print_memory("before wake_up model")
 
         torch_memory_saver.resume()
@@ -393,18 +419,33 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        import time as _time
+
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+
+        num_local_samples = len(rollout_data["total_lengths"])
+        total_tokens = sum(rollout_data["total_lengths"])
+        logger.info(
+            f"[TRAIN_ACTOR] rollout={rollout_id}: {num_local_samples} samples, "
+            f"{total_tokens} tokens, num_microbatches={num_microbatches}"
+        )
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
+            ref_logprob_time = 0.0
+            actor_logprob_time = 0.0
+            advantages_time = 0.0
+            train_fwd_bwd_time = 0.0
+
             if self.args.compute_advantages_and_returns:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("ref")
+                    _t0 = _time.perf_counter()
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -412,6 +453,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="ref_",
                         )
                     )
+                    ref_logprob_time = _time.perf_counter() - _t0
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
@@ -419,6 +461,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                    _t0 = _time.perf_counter()
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -426,6 +469,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="",
                         )
                     )
+                    actor_logprob_time = _time.perf_counter() - _t0
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
 
@@ -438,9 +482,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self._active_model_tag != "actor":
                     self._switch_model("actor")
 
-                # Calculate adv and returns. Need to performed before training (instead of on the fly),
-                # because we may need normalize the whole rollout.
+                _t0 = _time.perf_counter()
                 compute_advantages_and_returns(self.args, rollout_data)
+                advantages_time = _time.perf_counter() - _t0
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
@@ -450,6 +494,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            _t0 = _time.perf_counter()
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -459,6 +504,16 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_iterator,
                     num_microbatches,
                 )
+            train_fwd_bwd_time = _time.perf_counter() - _t0
+
+            total_train_time = ref_logprob_time + actor_logprob_time + advantages_time + train_fwd_bwd_time
+            logger.info(
+                f"[TRAIN_ACTOR] rollout={rollout_id} phase breakdown: "
+                f"ref_logprob={ref_logprob_time:.2f}s, actor_logprob={actor_logprob_time:.2f}s, "
+                f"advantages={advantages_time:.2f}s, train_fwd_bwd={train_fwd_bwd_time:.2f}s, "
+                f"total={total_train_time:.2f}s, samples={num_local_samples}, tokens={total_tokens}, "
+                f"microbatches={num_microbatches}"
+            )
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -518,14 +573,26 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             reload_process_groups()
 
-        rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
-        )
-        if num_new_engines > 0:
-            self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
-            dist.barrier(group=get_gloo_group())
+        # In elastic mode, weight_updater was already connected via elastic_connect_rollout_engine
+        # Skip the rollout_manager lookup
+        if getattr(self.args, 'elastic_mode', False):
+            rollout_engines = []  # Engines already connected in elastic mode
+        else:
+            rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
+                self.rollout_manager.get_rollout_engines_and_lock.remote()
+            )
+            if num_new_engines > 0:
+                self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
+                dist.barrier(group=get_gloo_group())
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+        # Use torch_memory_saver.disable() for both offload_train and elastic_mode
+        # to ensure weight update allocations stay on GPU
+        use_memory_saver = (
+            self.args.offload_train
+            or getattr(self.args, 'elastic_mode', False)
+            or getattr(self.args, 'overlap_inference_tp', None) is not None
+        )
+        with torch_memory_saver.disable() if use_memory_saver else nullcontext():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
@@ -600,3 +667,168 @@ class MegatronTrainRayActor(TrainRayActor):
             rank=0 if self.role == "actor" else 1,
             group_name=group_name,
         )
+
+    def start_chrome_profile(
+        self,
+        output_dir: str,
+        cycle_id: int | None = None,
+        record_shapes: bool = True,
+        with_stack: bool = False,
+        profile_memory: bool = False,
+        with_flops: bool = True,
+    ) -> None:
+        """
+        Start a torch.profiler Chrome trace capture.
+
+        Creates a continuous profiler (no schedule) that records all CPU and CUDA
+        activity until stop_chrome_profile() is called. The profiler spans
+        sleep/wake cycles — during sleep, no GPU activity is recorded, producing
+        visible gaps in the trace timeline.
+
+        Args:
+            output_dir: Directory where the trace JSON will be written.
+            cycle_id: Optional cycle identifier for per-cycle trace filenames.
+            record_shapes: Record tensor shapes (moderate overhead).
+            with_stack: Capture Python call stacks (high overhead, large traces).
+            profile_memory: Track memory allocations (high overhead, large traces).
+            with_flops: Estimate FLOPs for matrix ops.
+        """
+        import torch.profiler
+
+        os.makedirs(output_dir, exist_ok=True)
+        self._chrome_trace_output_dir = output_dir
+        self._chrome_trace_cycle_id = cycle_id
+        self._chrome_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=record_shapes,
+            with_stack=with_stack,
+            profile_memory=profile_memory,
+            with_flops=with_flops,
+        )
+        self._chrome_profiler.__enter__()
+        logger.info(f"Started Chrome trace profiler, output_dir={output_dir}, cycle_id={cycle_id}")
+
+    def stop_chrome_profile(self) -> str:
+        """
+        Stop the Chrome trace profiler and export the trace.
+
+        Returns:
+            Path to the exported Chrome trace JSON file.
+        """
+        if not hasattr(self, '_chrome_profiler') or self._chrome_profiler is None:
+            raise RuntimeError("Chrome profiler not started — call start_chrome_profile() first")
+
+        self._chrome_profiler.__exit__(None, None, None)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        cycle_id = getattr(self, '_chrome_trace_cycle_id', None)
+        if cycle_id is not None:
+            filename = f"train_actor_rank{rank}_cycle{cycle_id}_trace.json"
+        else:
+            filename = f"train_actor_rank{rank}_trace.json"
+        trace_path = os.path.join(
+            self._chrome_trace_output_dir,
+            filename,
+        )
+        self._chrome_profiler.export_chrome_trace(trace_path)
+        logger.info(f"Exported Chrome trace to {trace_path}")
+
+        self._chrome_profiler = None
+        self._chrome_trace_output_dir = None
+        self._chrome_trace_cycle_id = None
+        return trace_path
+
+    def elastic_connect_rollout_engine(
+        self,
+        engine: ActorHandle,
+        engine_lock: ActorHandle,
+    ) -> None:
+        """
+        Connect this training actor directly to its paired inference engine.
+
+        Used in elastic mode where each training actor has exactly one paired
+        inference engine on the same GPU.
+
+        Args:
+            engine: The inference engine Ray actor for this training actor.
+            engine_lock: Lock actor for coordinating weight updates.
+        """
+        if not getattr(self.args, 'elastic_mode', False):
+            raise RuntimeError("elastic_connect_rollout_engine should only be called in elastic mode")
+
+        self.weight_updater.connect_rollout_engine(engine, engine_lock)
+
+    def connect_overlap_engine(
+        self,
+        engine: ActorHandle,
+        engine_lock: ActorHandle,
+    ) -> None:
+        """
+        Connect this training actor to its paired OVERLAP engine.
+
+        Used by OverlappedRLElasticGroup (non-elastic mode). The overlap engine
+        sits on the same physical GPU as this training actor, so NCCL cannot
+        include it in the primary weight-update group (which is used for the
+        dedicated, off-GPU engines). A separate IPC-based weight-update path
+        is created here via OverlapUpdateWeight.
+
+        Coexists with the primary self.weight_updater (UpdateWeightFromDistributed
+        or similar) — the primary handles dedicated engines via NCCL, this
+        handles the single colocated overlap engine via Ray IPC.
+
+        Collective: must be called on all training actors simultaneously
+        because OverlapUpdateWeight.__init__ creates Gloo groups (collective).
+
+        Args:
+            engine: The overlap SGLang engine Ray actor paired with this actor.
+            engine_lock: Lock actor for serializing pushes.
+        """
+        if getattr(self.args, 'elastic_mode', False):
+            raise RuntimeError(
+                "connect_overlap_engine is for non-elastic mode (train_async_overlapped); "
+                "use elastic_connect_rollout_engine for elastic mode."
+            )
+        from slime.backends.megatron_utils.update_weight.overlap_update_weight import OverlapUpdateWeight
+
+        model_name = (
+            type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name
+        )
+        quantization_config = getattr(self.hf_config, "quantization_config", None)
+
+        self.overlap_weight_updater = OverlapUpdateWeight(
+            self.args,
+            self.model,
+            weights_getter=lambda: self.weights_backuper.get("actor"),
+            model_name=model_name,
+            quantization_config=quantization_config,
+        )
+        self.overlap_weight_updater.connect_engine(engine, engine_lock)
+
+    def update_weights_to_overlap_engine(self) -> None:
+        """Push current weights to the paired overlap engine via IPC.
+
+        Wraps OverlapUpdateWeight.update_weights() with the same memory-saver
+        context the primary update_weights() uses, so the push allocations
+        stay on GPU while torch_memory_saver is otherwise paused.
+
+        Collective: must be called on all training actors simultaneously.
+        """
+        if not hasattr(self, "overlap_weight_updater"):
+            raise RuntimeError(
+                "update_weights_to_overlap_engine called before connect_overlap_engine; "
+                "no overlap weight updater present."
+            )
+
+        from torch_memory_saver import torch_memory_saver
+        from contextlib import nullcontext
+
+        use_memory_saver = (
+            self.args.offload_train
+            or getattr(self.args, "elastic_mode", False)
+            or getattr(self.args, "overlap_inference_tp", None) is not None
+        )
+        with torch_memory_saver.disable() if use_memory_saver else nullcontext():
+            self.overlap_weight_updater.update_weights()

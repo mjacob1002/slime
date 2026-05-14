@@ -162,6 +162,7 @@ class _VocabParallelEntropy(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, vocab_parallel_logits: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
+        print(f"[slime.utils.ppo_utils:_VocabParallelEntropy:forward][DEBUG] vocab_parallel_logits shape: {vocab_parallel_logits.shape}")
 
         @torch.compile(dynamic=True)
         def mul_reduce(a, b):

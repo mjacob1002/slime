@@ -274,6 +274,7 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    print(f"[DEBUG] Entering the get_data_iterator function")
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     dp_group = mpu.get_data_parallel_group()
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -338,10 +339,93 @@ def get_data_iterator(
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             samples = rollout_data["total_lengths"][start:end]
             partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
+            # Sort partitions by descending max sample length to reduce CUDA memory
+            # fragmentation: longest samples run first when the allocator cache is clean.
+            #partitions.sort(key=lambda indices: max(samples[i] for i in indices), reverse=True)
             for j in range(num_mbs):
                 for k in range(len(partitions[j])):
                     partitions[j][k] += start
             micro_batch_indices.extend(partitions)
+
+        assert len(set(sum(micro_batch_indices, []))) == num_local_samples
+
+        data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
+
+    return (
+        data_iterator,
+        num_microbatches,
+    )
+
+
+def get_data_iterator_local(
+    args: Namespace,
+    model: torch.nn.Module | Sequence[torch.nn.Module],
+    rollout_data: RolloutBatch,
+) -> tuple[list["DataIterator"], list[int]]:
+    """Like get_data_iterator() but with NO collective ops.
+
+    For streaming training where ranks have different sample counts and cannot
+    synchronize. All local samples form a single training step.
+
+    - Fixed batch: num_microbatches = [num_local_samples // micro_batch_size]
+    - Dynamic batch: compute num_mbs locally, balance partitions
+
+    The key difference from get_data_iterator() is that the all_reduce at line 322
+    is removed — each rank computes its microbatch schedule independently.
+
+    Returns:
+        (data_iterators, num_microbatches)
+    """
+    vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+    if vpp_size is None:
+        vpp_size = 1
+    if vpp_size > 1:
+        from megatron.core.utils import get_model_config
+
+        config = get_model_config(model[0])
+        microbatch_group_size_per_vp_stage = config.microbatch_group_size_per_vp_stage
+    cp_size = mpu.get_context_parallel_world_size()
+
+    num_local_samples = len(rollout_data["total_lengths"])
+
+    # Edge case: no local samples
+    if num_local_samples == 0:
+        data_iterator = [DataIterator(rollout_data, micro_batch_size=1) for _ in range(vpp_size)]
+        return data_iterator, [0]
+
+    def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
+        data_iterator = []
+        for _ in range(vpp_size):
+            data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
+        return data_iterator
+
+    if not args.use_dynamic_batch_size:
+        num_microbatches = [num_local_samples // args.micro_batch_size]
+        if num_microbatches[0] == 0:
+            return _generate_data_iterator(rollout_data, args.micro_batch_size), [0]
+        data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
+    else:
+        assert args.max_tokens_per_gpu is not None
+        # All local samples as a single step
+        num_mbs = get_minimum_num_micro_batch_size(
+            rollout_data["total_lengths"], args.max_tokens_per_gpu * cp_size
+        )
+
+        # NO all_reduce here — this is the key difference from get_data_iterator()
+
+        if vpp_size > 1:
+            num_mbs = max(1, (num_mbs // microbatch_group_size_per_vp_stage) * microbatch_group_size_per_vp_stage)
+
+        num_microbatches = [num_mbs]
+
+        # Balance the micro batches
+        samples = rollout_data["total_lengths"]
+        partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
+        # Sort partitions by descending max sample length to reduce CUDA memory
+        # fragmentation: longest samples run first when the allocator cache is clean,
+        # shorter samples then reuse existing cached blocks.
+        partitions.sort(key=lambda indices: max(samples[i] for i in indices), reverse=True)
+        micro_batch_indices = partitions
 
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
 
