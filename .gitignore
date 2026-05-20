@@ -192,3 +192,40 @@ glm/
 _examples_synced/
 .env
 .DS_Store
+# === slime experiment artifacts (added 2026-05-20 with B200 port) ===
+# Run-specific artifacts
+logs/
+output_*.txt
+profiling_*.txt
+*.log
+
+# Memory profiling snapshots (large, run-specific)
+memory-snapshots/
+TEMP_MEMORY_SNAPSHOTS/
+
+# Per-run perfetto traces (commit only canonical benchmarks under perfetto-traces/deepseek-r1-8b/)
+perfetto-traces/*
+!perfetto-traces/deepseek-r1-8b/
+
+# Per-run length traces
+rollout-length-traces/
+profiling-lengths/
+
+# Sweep + plot outputs (regenerable)
+sweep_results/
+plots/
+combined_trace/
+response_length_distributions*/
+
+# Internal Claude session cache
+.claude/
+
+# Large trace blobs
+*.trace.json.gz
+*.trace.json
+
+# Experiment branches kept on disk only
+experiments-elastic/
+token-based-simulations/output/
+swe_agent/
+plotting_scripts/

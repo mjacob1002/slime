@@ -1099,6 +1099,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "worker frees up or a new worker registers."
                 ),
             )
+            parser.add_argument(
+                "--sglang-router-per-gpu-tracking",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "When using the SGLang Router (not Slime Router), insert a "
+                    "thin per-engine FastAPI shim that injects engine_rank into "
+                    "response meta_info so per-GPU Perfetto bars (pid 100..107) "
+                    "appear in the trace. Mirrors the injection that Slime Router "
+                    "does at slime/router/router.py:152-154. Adds ~sub-ms per "
+                    "request via one extra localhost hop. Disable with "
+                    "--no-sglang-router-per-gpu-tracking for zero-overhead "
+                    "baseline timing."
+                ),
+            )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 

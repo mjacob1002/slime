@@ -2,6 +2,7 @@ import logging
 import os
 import random
 import socket
+import time as _time_module
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -73,6 +74,8 @@ class MegatronTrainRayActor(TrainRayActor):
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
         }
         dist.barrier(group=get_gloo_group())
+
+        self._init_memory_profiling()
 
         if args.offload_train:
             if (x := args.train_memory_margin_bytes) > 0:
@@ -182,6 +185,40 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    def _init_memory_profiling(self) -> None:
+        snapshot_dir = os.environ.get("SLIME_MEMORY_SNAPSHOT_DIR")
+        self._memory_snapshot_dir = snapshot_dir
+        if not snapshot_dir:
+            return
+
+        os.makedirs(snapshot_dir, exist_ok=True)
+        rank = dist.get_rank()
+        self._memory_snapshot_rank = rank
+        torch.cuda.memory._record_memory_history(max_entries=1000000, stacks="all")
+
+        def _oom_observer(device, alloc, device_alloc, device_free):
+            ts = int(_time_module.time())
+            path = f"{snapshot_dir}/oom_rank{rank}_t{ts}.pickle"
+            logger.info(f"[BASELINE_ACTOR] OOM observed, dumping snapshot to {path}")
+            try:
+                torch.cuda.memory._dump_snapshot(path)
+            except Exception as e:
+                logger.error(f"[BASELINE_ACTOR] OOM snapshot dump failed: {e}")
+
+        torch._C._cuda_attach_out_of_memory_observer(_oom_observer)
+        logger.info(f"[BASELINE_ACTOR] memory profiling enabled, snapshots → {snapshot_dir}")
+
+    def _dump_memory_snapshot(self, label: str, rollout_id: int) -> None:
+        if not getattr(self, "_memory_snapshot_dir", None):
+            return
+        rank = self._memory_snapshot_rank
+        path = f"{self._memory_snapshot_dir}/rank{rank}_rollout{rollout_id}_{label}.pickle"
+        try:
+            torch.cuda.memory._dump_snapshot(path)
+            logger.info(f"[BASELINE_ACTOR] dumped snapshot label={label} → {path}")
+        except Exception as e:
+            logger.error(f"[BASELINE_ACTOR] snapshot dump failed at label={label}: {e}")
 
     @timer
     def sleep(self, is_elastic: bool = False) -> None:
@@ -431,6 +468,8 @@ class MegatronTrainRayActor(TrainRayActor):
             f"{total_tokens} tokens, num_microbatches={num_microbatches}"
         )
 
+        self._dump_memory_snapshot("entry", rollout_id)
+
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
@@ -472,6 +511,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     actor_logprob_time = _time.perf_counter() - _t0
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
+                    self._dump_memory_snapshot("after_actor_logprob", rollout_id)
 
                 if self.args.use_critic:
                     sync_actor_critic_data(
@@ -505,6 +545,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                 )
             train_fwd_bwd_time = _time.perf_counter() - _t0
+            self._dump_memory_snapshot("after_train_fwd_bwd", rollout_id)
 
             total_train_time = ref_logprob_time + actor_logprob_time + advantages_time + train_fwd_bwd_time
             logger.info(

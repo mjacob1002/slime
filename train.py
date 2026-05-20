@@ -112,6 +112,9 @@ def train(args):
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     total_train_start_time = time.time()
+    # SLIME_TIMELINE: tracer emits in perf_counter; engine spans record in time.time().
+    # Single-host Ray means both share the OS clock, so a constant offset is exact.
+    walltime_to_perf_offset = time.perf_counter() - time.time()
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         print(f"[DEBUG] === Starting rollout {rollout_id} ===")
 
@@ -126,6 +129,19 @@ def train(args):
             rollout_data_ref = ray_get_with_timeout(
                 rollout_manager.generate.remote(rollout_id),
                 f"generate rollout {rollout_id}",
+            )
+        # SLIME_TIMELINE: drain per-engine spans and emit per-engine inference events.
+        # Returns [] when Sample.engine_rank is not populated (e.g. without --use-slime-router) — safe no-op.
+        engine_spans = ray.get(rollout_manager.pop_engine_spans.remote(rollout_id))
+        for s in engine_spans:
+            get_tracer().emit(
+                "inference",
+                device=s["rank"],
+                start=s["start_walltime"] + walltime_to_perf_offset,
+                end=s["end_walltime"] + walltime_to_perf_offset,
+                rollout_id=rollout_id,
+                engine_idx=s["rank"],
+                n_samples=s["n_samples"],
             )
         rollout_elapsed = time.time() - rollout_start_time
         print(f"Rollout {rollout_id} took {rollout_elapsed:.2f}s")

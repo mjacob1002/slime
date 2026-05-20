@@ -3,6 +3,7 @@ import ipaddress
 import logging
 import multiprocessing
 import os
+import random
 import time
 from urllib.parse import quote
 
@@ -14,7 +15,8 @@ from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
 from slime.ray.ray_actor import RayActor
-from slime.utils.http_utils import get_host_info
+from slime.router.engine_shim import run_engine_shim
+from slime.utils.http_utils import find_available_port, get_host_info, terminate_process
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +204,51 @@ class SGLangEngine(RayActor):
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
+        # SLIME_TIMELINE: insert a per-engine shim in front of this engine when the
+        # SGLang Router is the dispatch layer, so that responses carry engine_rank in
+        # meta_info — same convention as slime/router/router.py:152-154. The shim
+        # binds a fresh port and forwards to the original engine port; we redirect
+        # self.server_port to the shim so register_with_router and every other
+        # downstream caller (which all construct URLs from self.server_host:self.server_port)
+        # transparently points at the shim. Only on node_rank=0 (the only node that
+        # registers with the router).
+        self._maybe_launch_engine_shim()
         self.register_with_router(bootstrap_port=server_args_dict.get("disaggregation_bootstrap_port"))
+
+    def _maybe_launch_engine_shim(self) -> None:
+        self.shim_proc: multiprocessing.Process | None = None
+        self.engine_port: int = self.server_port
+
+        if self.node_rank != 0:
+            return
+        if self.args.use_slime_router:
+            return
+        if not getattr(self.args, "sglang_router_per_gpu_tracking", True):
+            return
+
+        # Pick a shim port outside the dist-init port range (which starts at 15000
+        # and walks upward — see slime/ray/rollout.py:607-617). Space per-rank to
+        # reduce same-node collision probability before bind.
+        shim_port = find_available_port(20000 + (self.rank * 100) % 5000)
+
+        self.shim_proc = multiprocessing.Process(
+            target=run_engine_shim,
+            args=(self.server_host, shim_port, self.server_host, self.engine_port, self.rank),
+            daemon=True,
+        )
+        self.shim_proc.start()
+
+        _wait_server_healthy(
+            base_url=f"http://{self.server_host}:{shim_port}",
+            api_key=None,
+            is_process_alive=lambda: self.shim_proc.is_alive(),
+        )
+
+        logger.info(
+            f"[engine_shim] rank={self.rank} shim port {shim_port} -> engine port "
+            f"{self.engine_port}; redirecting self.server_port to shim."
+        )
+        self.server_port = shim_port
 
     def register_with_router(self, bootstrap_port: int | None = None) -> None:
         """Register this engine with the router.
@@ -363,6 +409,9 @@ class SGLangEngine(RayActor):
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         self.deregister_from_router()
+        shim_proc = getattr(self, "shim_proc", None)
+        if shim_proc is not None:
+            terminate_process(shim_proc)
         kill_process_tree(self.process.pid)
 
     def get_weight_version(self):
