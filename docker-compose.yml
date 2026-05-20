@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  slime-dev:
+    image: slimerl/slime:latest
+    container_name: slime-dev
+    hostname: slime-dev
+    # Enable GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Mount the slime directory
+    volumes:
+      - .:/workspace/slime
+      - /tmp/.X11-unix:/tmp/.X11-unix  # For GUI apps if needed
+    
+    # Working directory inside container
+    working_dir: /workspace/slime
+    
+    # Keep container running
+    tty: true
+    stdin_open: true
+    
+    # Network configuration
+    network_mode: host
+    
+    # Shared memory size (important for PyTorch)
+    shm_size: 16gb
+    
+    # Environment variables
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=all
+      - PYTHONUNBUFFERED=1
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - RAY_ADDRESS=${RAY_ADDRESS:-}
+    
+    # Privileged mode for full access (optional, use with caution)
+    # privileged: true
+    
+    # IPC mode for shared memory between processes
+    ipc: host
+    
+    command: /bin/bash
+
+  # Optional: Ray head node service
+  slime-ray-head:
+    image: slimerl/slime:latest
+    container_name: slime-ray-head
+    hostname: slime-ray-head
+    profiles: ["ray"]  # Only start with --profile ray
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - .:/workspace/slime
+    working_dir: /workspace/slime
+    network_mode: host
+    shm_size: 16gb
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    command: >
+      bash -c "ray start --head --node-ip-address=0.0.0.0 --dashboard-host=0.0.0.0 --dashboard-port=8265 --disable-usage-stats && tail -f /dev/null"
+
+
+
