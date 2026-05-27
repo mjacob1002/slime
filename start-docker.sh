@@ -52,11 +52,15 @@ if ! docker image inspect "$IMAGE_NAME" &> /dev/null; then
             docker pull "$IMAGE_NAME"
             ;;
         2)
+            # NOTE: the recommended path is `docker compose up --build`, which builds
+            # docker/Dockerfile.megatron-fix (re-pins Megatron + asserts the
+            # B200-validated toolchain). This branch builds the fully-pinned image
+            # from scratch; keep MEGATRON_COMMIT in sync with that Dockerfile.
             echo -e "${BLUE}Building image locally...${NC}"
             cd "$SLIME_DIR/docker"
             docker build \
                 --build-arg SGLANG_VERSION=latest \
-                --build-arg MEGATRON_COMMIT=core_v0.14.0 \
+                --build-arg MEGATRON_COMMIT=3714d81d418c9f1bca4594fc35f9e8289f652862 \
                 -t "$IMAGE_NAME" \
                 -f Dockerfile \
                 .
@@ -154,7 +158,6 @@ docker run -it \
     -v "$SLIME_DIR:/workspace/slime" \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -e NVIDIA_VISIBLE_DEVICES=all \
-    -e CUDA_VISIBLE_DEVICES=all \
     -e PYTHONUNBUFFERED=1 \
     -e WANDB_API_KEY="${WANDB_API_KEY:-}" \
     -e HF_TOKEN="${HF_TOKEN:-}" \

@@ -20,7 +20,7 @@ MODEL_NAME="Qwen3-30B-A3B-Thinking-2507"
 HF_REPO="Qwen/${MODEL_NAME}"
 
 echo "[1/3] Downloading ${HF_REPO} (~64 GB)..."
-huggingface-cli download "${HF_REPO}" \
+hf download "${HF_REPO}" \
     --local-dir "/root/models/${MODEL_NAME}"
 
 echo "[2/3] Symlinking committed datasets to /root/datasets/"

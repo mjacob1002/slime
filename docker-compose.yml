@@ -1,8 +1,20 @@
 version: '3.8'
 
+# Shared image definition. Both services build the same B200-pinned image from
+# docker/Dockerfile.megatron-fix, which re-pins Megatron-LM to the commit slime's
+# code targets and asserts the rest of the toolchain matches the B200-validated
+# set. Build context is the repo root (the Dockerfile COPYs docker/patch/...).
+# First run / after editing the Dockerfile: `docker compose up --build`.
+x-slime-image: &slime-image
+  image: slime:b200-pinned
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.megatron-fix
+  pull_policy: never   # slime:b200-pinned is local-only; never try to pull it
+
 services:
   slime-dev:
-    image: slimerl/slime:latest
+    <<: *slime-image
     container_name: slime-dev
     hostname: slime-dev
     # Enable GPU access
@@ -17,6 +29,9 @@ services:
     # Mount the slime directory
     volumes:
       - .:/workspace/slime
+      - /raid/mjacob2/slime-data/models:/root/models
+      - /raid/mjacob2/slime-data/datasets:/root/datasets
+      - /raid/mjacob2/slime-data/checkpoints/Qwen3-30B-A3B-Thinking-2507_torch_dist:/root/Qwen3-30B-A3B-Thinking-2507_torch_dist
       - /tmp/.X11-unix:/tmp/.X11-unix  # For GUI apps if needed
     
     # Working directory inside container
@@ -31,11 +46,17 @@ services:
     
     # Shared memory size (important for PyTorch)
     shm_size: 16gb
+
+    # File descriptor limit — Ray + SGLang exhaust default 1024 nofile soft limit
+    # and the raylet crashes with "Too many open files". Bump to the hard cap.
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
     
     # Environment variables
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - CUDA_VISIBLE_DEVICES=all
       - PYTHONUNBUFFERED=1
       - WANDB_API_KEY=${WANDB_API_KEY:-}
       - HF_TOKEN=${HF_TOKEN:-}
@@ -47,11 +68,17 @@ services:
     # IPC mode for shared memory between processes
     ipc: host
     
-    command: /bin/bash
+    # On start: re-install our fork in editable mode (the image bakes in THUDM/slime
+    # at /root/slime; we need pip pointing at /workspace/slime). Idempotent. Stay
+    # alive afterwards via sleep so `docker exec -it slime-dev bash` works.
+    # NOTE: literal block scalar (|) — must preserve newlines so `exec sleep infinity`
+    # is its own statement, not piped into tee.
+    command: |
+      bash -c "pip install -e /workspace/slime --no-deps 2>&1 | tee /workspace/slime/.tmp-install.log; exec sleep infinity"
 
   # Optional: Ray head node service
   slime-ray-head:
-    image: slimerl/slime:latest
+    <<: *slime-image
     container_name: slime-ray-head
     hostname: slime-ray-head
     profiles: ["ray"]  # Only start with --profile ray

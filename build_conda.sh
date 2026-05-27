@@ -51,6 +51,10 @@ pip install git+https://github.com/fzyzcjy/Megatron-Bridge.git@dev_rl --no-build
 pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation
 
 # megatron
+# NOTE: this conda lane is a self-consistent matched set — SGLang 5e2cda6 (above)
+# + Megatron core_v0.14.0 (here) + the docker/patch/v0.5.6/* patches (below) move
+# together. Do NOT bump only one. The docker-image lane uses a different matched
+# set (Megatron 3714d81d4 + docker/patch/latest/*); the two lanes are independent.
 cd $BASE_DIR
 git clone https://github.com/NVIDIA/Megatron-LM.git --recursive && \
   cd Megatron-LM/ && git checkout core_v0.14.0 && \

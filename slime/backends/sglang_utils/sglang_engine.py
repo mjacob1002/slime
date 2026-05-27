@@ -15,7 +15,10 @@ from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
 from slime.ray.ray_actor import RayActor
-from slime.router.engine_shim import run_engine_shim
+# engine_shim.py was added as an import target in 9c968c5 but never committed.
+# Per-GPU perfetto tracking shim is disabled until that file lands; uncomment
+# both this line and the _maybe_launch_engine_shim() call below to restore.
+# from slime.router.engine_shim import run_engine_shim
 from slime.utils.http_utils import find_available_port, get_host_info, terminate_process
 
 logger = logging.getLogger(__name__)
@@ -212,7 +215,8 @@ class SGLangEngine(RayActor):
         # downstream caller (which all construct URLs from self.server_host:self.server_port)
         # transparently points at the shim. Only on node_rank=0 (the only node that
         # registers with the router).
-        self._maybe_launch_engine_shim()
+        # Disabled until engine_shim.py is committed (see import note above).
+        # self._maybe_launch_engine_shim()
         self.register_with_router(bootstrap_port=server_args_dict.get("disaggregation_bootstrap_port"))
 
     def _maybe_launch_engine_shim(self) -> None:

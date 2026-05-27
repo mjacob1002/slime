@@ -1,0 +1,94 @@
+# slime B200-pinned image: builds on slimerl/slime, re-pins Megatron-LM to the
+# commit slime's code targets, and ASSERTS the rest of the toolchain matches the
+# exact versions validated on B200. The published slimerl/slime:latest is a
+# floating tag that drifts (its Megatron has wandered ~500 commits to 1dcf0dafa,
+# where model_provider_func() gained config=/pg_collection= kwargs slime does not
+# pass). This layer makes that drift impossible to use silently:
+#   - Megatron is actively reset to 3714d81d4 + slime's patch re-applied.
+#   - The pip toolchain is verified against the B200-validated set; a drifted base
+#     fails the build with a clear message instead of running on untested versions.
+#
+# Canonical use: `docker compose up --build` (see docker-compose.yml).
+#
+# B200-validated toolchain (source of truth — bump here when you re-validate):
+#   Megatron-LM         3714d81d418c9f1bca4594fc35f9e8289f652862 (core_v0.15.0rc7-548)
+#   megatron-core       0.16.0rc0
+#   sglang              0.5.10.post1
+#   torch               2.9.1+cu129
+#   torch_memory_saver  0.0.9.post1
+#   transformer_engine  2.10.0
+#   flash-attn          2.7.4.post1
+#   transformers        5.3.0   (warn-only)
+#   ray                 2.55.1  (warn-only)
+#   sglang-router       0.3.2   (warn-only)
+
+ARG SLIME_BASE_IMAGE=slimerl/slime:latest
+FROM ${SLIME_BASE_IMAGE}
+
+# --- Megatron-LM: actively re-pin to the commit slime's code is written against ---
+# COPY path is relative to the build context, which MUST be the repo root.
+COPY docker/patch/latest/megatron.patch /tmp/megatron.patch
+
+RUN cd /root/Megatron-LM && \
+    git reset --hard 3714d81d418c9f1bca4594fc35f9e8289f652862 && \
+    git apply /tmp/megatron.patch --3way && \
+    if grep -R -n '^<<<<<<< ' . 2>/dev/null; then \
+      echo "ERROR: megatron.patch failed to apply cleanly; conflicts present." && exit 1; \
+    fi && \
+    rm /tmp/megatron.patch && \
+    pip install -e . --no-deps
+
+# --- Toolchain verification ---
+# The rest of the stack is pip-installed in the base image. Reinstalling these
+# risks breaking the carefully-built CUDA stack (sgl-kernel ABI, TE, flash-attn),
+# so we ASSERT instead. Hard-fail on the correctness-critical packages; warn on
+# the looser ones. A drifted base image fails here with actionable output.
+RUN python - <<'PY'
+import importlib.metadata as md
+import sys
+
+REQUIRED = {                       # mismatch -> build fails
+    "megatron-core":      "0.16.0rc0",
+    "sglang":             "0.5.10.post1",
+    "torch":              "2.9.1+cu129",
+    "torch_memory_saver": "0.0.9.post1",
+    "transformer_engine": "2.10.0",
+    "flash-attn":         "2.7.4.post1",
+}
+WARN = {                           # mismatch -> warning only
+    "transformers":   "5.3.0",
+    "ray":            "2.55.1",
+    "sglang-router":  "0.3.2",
+}
+
+def got(pkg):
+    try:
+        return md.version(pkg)
+    except md.PackageNotFoundError:
+        return None
+
+hard_fail = []
+for pkg, want in REQUIRED.items():
+    have = got(pkg)
+    if have != want:
+        hard_fail.append((pkg, want, have))
+
+for pkg, want in WARN.items():
+    have = got(pkg)
+    if have != want:
+        print(f"WARNING: {pkg} is {have}, B200-validated is {want} (continuing).")
+
+if hard_fail:
+    print("\nERROR: base image toolchain drifted from the B200-validated set:")
+    for pkg, want, have in hard_fail:
+        print(f"  {pkg}: expected {want}, found {have}")
+    print(
+        "\nThe slimerl/slime base tag has moved. Either rebuild from a base whose\n"
+        "toolchain matches the set above, or build the fully-pinned image from\n"
+        "docker/Dockerfile (--build-arg MEGATRON_COMMIT=3714d81d418c9f1bca4594fc35f9e8289f652862),\n"
+        "then update the validated set in this file if you intend to move it."
+    )
+    sys.exit(1)
+
+print("Toolchain matches the B200-validated set.")
+PY
