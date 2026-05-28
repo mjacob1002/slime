@@ -18,6 +18,7 @@ and avoids splitting in-flight `asyncio.gather` calls.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -92,6 +93,12 @@ class MigrationContext:
     # worst-case max_new_tokens — usually 4-10× tighter for DAPO-style
     # workloads where actual responses are far shorter than the cap.
     replay_lengths_per_sample: "dict[int, int] | None" = None
+
+    # Total number of prompt groups in this rollout (the denominator for
+    # global completion-fraction policies like StreamTrainerMigration).
+    # Constant for the duration of the rollout. Zero means "unknown" —
+    # policies that depend on it should assert > 0 on first use.
+    total_expected_groups: int = 0
 
 
 class MigrationPolicy(ABC):
@@ -465,13 +472,272 @@ class ProactiveTrainGroupMigration(TrainGroupAwareMigration):
         return out
 
 
+class StreamTrainerMigration(MigrationPolicy):
+    """RollPacker StreamTrainer scale-down (§4.4, Algorithm 1).
+
+    Once the global completion fraction lands in [min, max], drain
+    `flip_fraction` of the train groups by migrating their in-flight work
+    onto the engines that will remain in inference. After this single fire
+    the policy is dormant for the rest of the rollout — the second G_train
+    transition is the natural drain of the residual inferring engines and
+    is handled by the work queue + GroupSwitchController, not by us.
+
+    Mirrors Algorithm 1, lines 14-22:
+      • `_in_completion_window` + `_enough_progress_since_last`  ≡
+            `0.20 ≤ |R_comp|/|R| ≤ 0.50` + `ΔR/|R| ≥ 0.05`
+      • `_pick_scale_down_train_groups`                           ≡  PickScaleDownGPUs(G)
+      • `_meets_scale_criteria`                                   ≡  MeetScaleCriteria(G_free)
+      • `_plan_migrations`                                        ≡  planning half of MigrateRequests
+      (the *execution* half lives in StreamingRouter._execute_migration.)
+    """
+
+    def __init__(
+        self,
+        min_completion_frac: float = 0.20,
+        max_completion_frac: float = 0.50,
+        flip_fraction: float = 0.50,
+        require_progress_step: float = 0.05,
+    ):
+        if not (0.0 <= min_completion_frac <= max_completion_frac <= 1.0):
+            raise ValueError(
+                f"Invalid completion window: "
+                f"[{min_completion_frac}, {max_completion_frac}]"
+            )
+        if not (0.0 < flip_fraction < 1.0):
+            raise ValueError(
+                f"flip_fraction must be in (0, 1), got {flip_fraction} "
+                f"(can't scale down 0% or 100% of train groups)"
+            )
+        self.min_completion_frac = min_completion_frac
+        self.max_completion_frac = max_completion_frac
+        self.flip_fraction = flip_fraction
+        self.require_progress_step = require_progress_step
+        self._fired = False
+        self._last_eval_frac = 0.0
+        self._last_frac = 0.0
+
+    def reset(self) -> None:
+        self._fired = False
+        self._last_eval_frac = 0.0
+        self._last_frac = 0.0
+
+    async def on_request_completed(
+        self,
+        src_engine: int,
+        completed_group: list[Sample],
+        ctx: MigrationContext,
+    ) -> list[MigrationDecision]:
+        # Gate 1: 0.20 ≤ |R_comp|/|R| ≤ 0.50
+        if not self._in_completion_window(ctx):
+            return []
+        # Gate 2: fire-once latch (scaled_down)
+        if self._fired:
+            return []
+        # Gate 3: ΔR/|R| ≥ 0.05 throttle — avoid re-planning on every group
+        if not self._enough_progress_since_last(ctx):
+            return []
+
+        # Algorithm 1 line 15: G_free ← PickScaleDownGPUs(G)
+        victims = self._pick_scale_down_train_groups(ctx)
+        if not victims:
+            return []
+        # Planning half of MigrateRequests
+        plan = self._plan_migrations(victims, ctx)
+        if not plan:
+            return []
+        # Algorithm 1 line 16: MeetScaleCriteria(G_free)
+        if not await self._meets_scale_criteria(plan, ctx):
+            self._maybe_latch_after_failed_feasibility()
+            return []
+
+        # scaled_down ← true
+        self._fired = True
+        logger.info(
+            f"[STREAM-TRAINER] firing at frac={self._last_frac:.3f}: "
+            f"victims={victims}, {len(plan)} group(s) migrated"
+        )
+        return plan
+
+    # ---- Algorithm 1 line 14: 0.20 ≤ |R_comp|/|R| ≤ 0.50 ----------------
+    def _in_completion_window(self, ctx: MigrationContext) -> bool:
+        assert ctx.total_expected_groups > 0, (
+            "StreamTrainerMigration requires MigrationContext.total_expected_groups "
+            "to be set by the router"
+        )
+        completed = sum(ctx.completed_per_engine.values())
+        self._last_frac = completed / ctx.total_expected_groups
+        return self.min_completion_frac <= self._last_frac <= self.max_completion_frac
+
+    # ---- Algorithm 1 line 14: ΔR/|R| ≥ 0.05 throttle --------------------
+    def _enough_progress_since_last(self, ctx: MigrationContext) -> bool:
+        if self._last_frac - self._last_eval_frac < self.require_progress_step:
+            return False
+        self._last_eval_frac = self._last_frac
+        return True
+
+    # ---- Algorithm 1 line 15: PickScaleDownGPUs(G) ----------------------
+    def _pick_scale_down_train_groups(self, ctx: MigrationContext) -> list[int]:
+        """Pick `flip_fraction * num_train_groups` train groups to scale down.
+
+        Train-group granularity (not engine granularity) is the GPU-set unit
+        we operate on — this satisfies RollPacker's "don't split TP groups"
+        constraint by construction, since each train group already IS a TP
+        group in slime's RayElasticGroup placement.
+
+        Excludes train groups already flipped (`flipped_train_groups`) and
+        also any with no inferring engines left (no useful work to migrate).
+
+        Ranking key (cheapest to flip first):
+          (1) smallest sum of in_flight_count over the group's engines
+              — least work to migrate
+          (2) tie-broken by largest completion sum — prefer groups that
+              are already further along (their decode is closer to done).
+        """
+        n_victims = max(1, int(round(self.flip_fraction * ctx.num_train_groups)))
+        candidates: list[int] = []
+        for g in range(ctx.num_train_groups):
+            if g in ctx.flipped_train_groups:
+                continue
+            engines = ctx.engines_for_train_group(g)
+            if not any(ctx.engine_status.get(e) == "inferring" for e in engines):
+                continue
+            candidates.append(g)
+        # Need at least 1 surviving train group; refuse to scale down to nothing.
+        if len(candidates) <= n_victims:
+            return []
+        ranked = sorted(
+            candidates,
+            key=lambda g: (
+                sum(ctx.in_flight_count.get(e, 0) for e in ctx.engines_for_train_group(g)),
+                -sum(ctx.completed_per_engine.get(e, 0) for e in ctx.engines_for_train_group(g)),
+            ),
+        )
+        return ranked[:n_victims]
+
+    # ---- Algorithm 1 line 19: MigrateRequests (planning side) -----------
+    def _plan_migrations(
+        self, victims: list[int], ctx: MigrationContext,
+    ) -> list[MigrationDecision]:
+        """For every in-flight group on a victim engine, pick the least-loaded
+        surviving inferring engine on a non-victim train group as destination.
+
+        No feasibility probes here — MeetScaleCriteria does those in bulk.
+        """
+        victim_set = set(victims)
+        victim_engines = [
+            e for g in victims for e in ctx.engines_for_train_group(g)
+        ]
+        survivor_engines = [
+            e
+            for g in range(ctx.num_train_groups)
+            if g not in victim_set and g not in ctx.flipped_train_groups
+            for e in ctx.engines_for_train_group(g)
+            if ctx.engine_status.get(e) == "inferring"
+        ]
+        if not survivor_engines:
+            return []
+
+        projected_load = dict(ctx.in_flight_count)
+        decisions: list[MigrationDecision] = []
+        for src in victim_engines:
+            for grp in ctx.in_flight_groups.get(src, []):
+                dst = min(survivor_engines, key=lambda e: projected_load.get(e, 0))
+                decisions.append(
+                    MigrationDecision(
+                        group=grp,
+                        src_engine=src,
+                        dst_engine=dst,
+                        reason=(
+                            f"stream_trainer scale-down at frac={self._last_frac:.3f} "
+                            f"(victims={victims})"
+                        ),
+                    )
+                )
+                projected_load[dst] = projected_load.get(dst, 0) + 1
+        return decisions
+
+    # ---- Algorithm 1 line 16: MeetScaleCriteria(G_free) -----------------
+    async def _meets_scale_criteria(
+        self, plan: list[MigrationDecision], ctx: MigrationContext,
+    ) -> bool:
+        """Two checks (paper §4.4 "Scaling Criteria"):
+
+        (a) Communication-group integrity — already enforced structurally
+            because `_pick_scale_down_train_groups` operates at train-group
+            granularity (== TP group in this codebase).
+        (b) KV-cache feasibility — per planned destination engine, the SUM
+            of projected token additions across all decisions targeting it
+            must keep that engine under `migration-dst-usage-cap`. Aggregate
+            per-dst BEFORE probing so we don't double-credit the same engine.
+
+        With no feasibility_checker attached (test setups, debugging), we
+        skip the probe entirely and trust the planner.
+        """
+        if not plan:
+            return False
+        if ctx.feasibility_checker is None:
+            return True
+
+        added_tokens_per_dst: dict[int, int] = {}
+        for d in plan:
+            est = _estimate_added_tokens_for_group(
+                d.group,
+                ctx.max_new_tokens_per_sample,
+                ctx.replay_lengths_per_sample,
+            )
+            added_tokens_per_dst[d.dst_engine] = (
+                added_tokens_per_dst.get(d.dst_engine, 0) + est
+            )
+
+        # Probe destinations concurrently — each is an independent SGLang
+        # HTTP call. async only because feasibility_checker.can_accept_migration
+        # does live HTTP probes.
+        probes = [
+            ctx.feasibility_checker.can_accept_migration(dst, added)
+            for dst, added in added_tokens_per_dst.items()
+        ]
+        results = await asyncio.gather(*probes)
+        for (dst, _added), (ok, _snap, reason) in zip(
+            added_tokens_per_dst.items(), results
+        ):
+            if not ok:
+                logger.info(
+                    f"[STREAM-TRAINER] MeetScaleCriteria FAIL on dst {dst}: {reason}"
+                )
+                return False
+        return True
+
+    def _maybe_latch_after_failed_feasibility(self) -> None:
+        """If we're past max_completion_frac and feasibility still fails,
+        latch _fired so we stop retrying for the rest of the rollout.
+        Otherwise leave _fired False and try again on the next event —
+        destinations may have drained by then."""
+        if self._last_frac >= self.max_completion_frac:
+            self._fired = True
+            logger.info(
+                f"[STREAM-TRAINER] latched _fired after feasibility failure "
+                f"past max_completion_frac (frac={self._last_frac:.3f}); "
+                f"falling back to vanilla synchronous for rest of rollout"
+            )
+
+
 def make_migration_policy(args) -> MigrationPolicy:
     name = getattr(args, "migration_policy", "none") or "none"
+    if name == "stream_trainer":
+        return StreamTrainerMigration(
+            min_completion_frac=float(getattr(args, "stream_trainer_min_completion_frac", 0.20)),
+            max_completion_frac=float(getattr(args, "stream_trainer_max_completion_frac", 0.50)),
+            flip_fraction=float(getattr(args, "stream_trainer_flip_fraction", 0.50)),
+            require_progress_step=float(getattr(args, "stream_trainer_require_progress_step", 0.05)),
+        )
     factories: dict[str, type[MigrationPolicy]] = {
         "none": NoMigration,
         "train_group_aware": TrainGroupAwareMigration,
         "train_group_proactive": ProactiveTrainGroupMigration,
     }
     if name not in factories:
-        raise ValueError(f"Unknown migration policy: {name!r}. Choices: {sorted(factories)}")
+        raise ValueError(
+            f"Unknown migration policy: {name!r}. "
+            f"Choices: {sorted(list(factories) + ['stream_trainer'])}"
+        )
     return factories[name]()

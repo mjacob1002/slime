@@ -251,6 +251,7 @@ class StreamingRouter:
                 feasibility_checker=self.feasibility_checker,
                 max_new_tokens_per_sample=max_new_tokens_per_sample,
                 replay_lengths_per_sample=replay_lengths_per_sample,
+                total_expected_groups=total_groups,
             )
 
         def _find_task_for_group(target_group: list[Sample]) -> asyncio.Task | None:

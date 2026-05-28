@@ -175,7 +175,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--migration-policy",
                 type=str,
-                choices=["none", "train_group_aware", "train_group_proactive"],
+                choices=[
+                    "none", "train_group_aware", "train_group_proactive",
+                    "stream_trainer",
+                ],
                 default="none",
                 help=(
                     "Request migration policy for streaming training. "
@@ -191,7 +194,74 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "an early-drained engine to take on its sibling's tail). "
                     "Requires the driver to skip eager sleep_engine on that "
                     "lone group's engines; the gate is applied automatically "
-                    "based on this CLI choice."
+                    "based on this CLI choice. "
+                    "'stream_trainer' is the RollPacker (arxiv:2509.21009 §4.4) "
+                    "StreamTrainer baseline: once the global completion fraction "
+                    "lands in [--stream-trainer-min-completion-frac, "
+                    "--stream-trainer-max-completion-frac], migrate in-flight "
+                    "work off --stream-trainer-flip-fraction of the train "
+                    "groups onto the survivors so those groups can flip to "
+                    "training while the rest finish decoding. Usually paired "
+                    "with --max-train-switches-per-step 2."
+                ),
+            )
+            parser.add_argument(
+                "--stream-trainer-min-completion-frac",
+                type=float,
+                default=0.20,
+                help=(
+                    "Lower bound of the [min, max] global completion window "
+                    "in which StreamTrainerMigration is permitted to fire. "
+                    "Default 0.20 matches RollPacker Algorithm 1, line 14."
+                ),
+            )
+            parser.add_argument(
+                "--stream-trainer-max-completion-frac",
+                type=float,
+                default=0.50,
+                help=(
+                    "Upper bound of the [min, max] global completion window "
+                    "in which StreamTrainerMigration is permitted to fire. "
+                    "If feasibility fails past this fraction, the policy "
+                    "latches and falls back to vanilla synchronous for the "
+                    "rest of the rollout. Default 0.50."
+                ),
+            )
+            parser.add_argument(
+                "--stream-trainer-flip-fraction",
+                type=float,
+                default=0.50,
+                help=(
+                    "Fraction of train groups to scale down (migrate work off) "
+                    "when StreamTrainerMigration fires. With 4 train groups "
+                    "and 0.5, two groups are victimised per fire. Must be in "
+                    "(0, 1). Default 0.50."
+                ),
+            )
+            parser.add_argument(
+                "--stream-trainer-require-progress-step",
+                type=float,
+                default=0.05,
+                help=(
+                    "Minimum increase in global completion fraction between "
+                    "policy re-evaluations. Throttles the per-event hook so "
+                    "we don't recompute the migration plan on every group. "
+                    "RollPacker uses ΔR/|R| ≥ 0.05; default 0.05."
+                ),
+            )
+            parser.add_argument(
+                "--max-train-switches-per-step",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of G_train membership changes "
+                    "(inference→training flips) permitted per rollout step. "
+                    "Counted per BATCH of admitted flips, not per group — "
+                    "admitting K groups in one tick costs one switch. When "
+                    "unset, every train group flips the instant it drains "
+                    "(pre-controller behaviour). RollPacker StreamTrainer "
+                    "uses 2: one for the scale-down batch, one for the "
+                    "natural tail."
                 ),
             )
             parser.add_argument(

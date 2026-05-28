@@ -36,6 +36,10 @@ from slime.ray.elastic_actor import RayElasticGroup
 from slime.ray.placement_group import create_placement_groups
 from slime.ray.streaming_work_queue import StreamingWorkQueue
 from slime.ray.streaming_rollout import StreamingRolloutManager
+from slime.router.group_switch_controller import (
+    FlipDecisionContext,
+    make_group_switch_controller,
+)
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
 from slime.utils.misc import should_run_periodic_action
@@ -172,6 +176,17 @@ def train(args):
         expected_items_per_rollout=args.rollout_batch_size,
         grab_policy_name=getattr(args, 'grab_policy', None),
     )
+
+    # Group switch controller. Default Eager (no budget) recovers
+    # pre-controller behaviour; --max-train-switches-per-step builds a
+    # BoundedSwitchController that caps G_train membership changes per
+    # rollout step (RollPacker StreamTrainer uses 2).
+    flip_controller = make_group_switch_controller(args)
+    logger.info(
+        f"[DRIVER] Group switch controller: {type(flip_controller).__name__} "
+        f"(max_train_switches_per_step={getattr(args, 'max_train_switches_per_step', None)})"
+    )
+
     all_rollout_metrics = []
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         logger.info(f"[DRIVER] === Streaming rollout {rollout_id} (V1 work-stealing) ===")
@@ -192,6 +207,7 @@ def train(args):
         # work_queue = StreamingWorkQueue.remote(world_size, max_items_per_grab=max_items_per_grab)A
         print(f"Resetting work queue for rollout {rollout_id}")
         work_queue.reset.remote()
+        flip_controller.reset()
 
         # Verify model weights hash before starting rollout
         checksums = ray.get([engine.get_weights_checksum.remote() for engine in elastic_group.inference_engines])
@@ -218,6 +234,11 @@ def train(args):
         poll_count = 0
         first_engine_switch_time = None
         last_engine_done_time = None
+        # Train groups whose engines have all drained per the work queue
+        # but which the GroupSwitchController has deferred from flipping.
+        # The work queue's get_newly_completed_train_groups() is
+        # consumed-on-read, so the driver — not the queue — holds the backlog.
+        pending_flips: set[int] = set()
 
         while len(completed) < num_train_groups:
             time.sleep(0.1)  # poll interval
@@ -265,8 +286,21 @@ def train(args):
             _drain_completed_engines()
 
             # Per-train-group: flip to training when all engines for the group are done.
+            # The work queue's RPC is consumed-on-read, so anything it surfaces
+            # joins pending_flips; the controller then decides which (if any) of
+            # the pending candidates may flip this tick.
             newly_done_groups = ray.get(work_queue.get_newly_completed_train_groups.remote())
-            for group_rank in newly_done_groups:
+            if newly_done_groups:
+                pending_flips.update(newly_done_groups)
+            if pending_flips:
+                flip_ctx = FlipDecisionContext(
+                    num_train_groups=num_train_groups,
+                    num_completed=len(completed),
+                )
+                admitted = flip_controller.admit_flips(sorted(pending_flips), flip_ctx)
+            else:
+                admitted = []
+            for group_rank in admitted:
                 switch_start = time.time()
                 if first_engine_switch_time is None:
                     first_engine_switch_time = switch_start
@@ -283,6 +317,7 @@ def train(args):
                     engine_training_start,
                 )
                 completed.add(group_rank)
+                pending_flips.discard(group_rank)
                 last_engine_done_time = time.time()
                 logger.info(
                     f"[DRIVER] Train group {group_rank} switched to training "
@@ -292,6 +327,10 @@ def train(args):
                 print(f"[PRINT_INFO][DRIVER] Train group {group_rank} switched to training "
                     f"({time.time() - switch_start:.2f}s), "
                     f"{len(completed)}/{num_train_groups} groups in training")
+            # Charge one switch token per admitted BATCH (not per group) — a
+            # batch of K flips is one G_train membership change.
+            if admitted:
+                flip_controller.on_flipped(list(admitted))
 
             # Final drain: an engine_completed() call can land between the
             # get_newly_completed_engines() RPC above and the
