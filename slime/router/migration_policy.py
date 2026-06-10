@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable
 
 from slime.utils.types import Sample
@@ -267,6 +267,36 @@ class TrainGroupAwareMigration(MigrationPolicy):
                 local_load[chosen_dst] = local_load.get(chosen_dst, 0) + 1
                 local_added_tokens[chosen_dst] += grp_added_tokens
         return decisions
+
+
+class TrainGroupAwareAggressiveMigration(TrainGroupAwareMigration):
+    """Aggressive variant of TrainGroupAwareMigration: identical trigger and
+    destination-selection logic, but it NEVER consults the KV-cache
+    feasibility checker. Every eligible tail group is migrated to the
+    lowest-load still-inferring destination regardless of projected KV-cache
+    pressure — no source-side "meaningful work" gate, no destination
+    `/get_load` probe, and `--migration-dst-usage-cap` is ignored.
+
+    Use to measure migration's upper-bound benefit, or when the destination
+    cap is known not to bind on a given workload.
+    """
+
+    async def on_request_completed(
+        self,
+        src_engine: int,
+        completed_group: list[Sample],
+        ctx: MigrationContext,
+    ) -> list[MigrationDecision]:
+        # Force-disable the feasibility probes by nulling the checker on a
+        # shallow copy of the context. The parent already implements the
+        # "no checker" path: it skips the source-side gate and picks the
+        # lowest-load destination without probing /get_load. replace() shares
+        # the context's callables/dicts by reference (read-only by convention),
+        # so this is cheap.
+        aggressive_ctx = replace(ctx, feasibility_checker=None)
+        return await super().on_request_completed(
+            src_engine, completed_group, aggressive_ctx
+        )
 
 
 class ProactiveTrainGroupMigration(TrainGroupAwareMigration):
@@ -735,6 +765,7 @@ def make_migration_policy(args) -> MigrationPolicy:
     factories: dict[str, type[MigrationPolicy]] = {
         "none": NoMigration,
         "train_group_aware": TrainGroupAwareMigration,
+        "train_group_aware_aggressive": TrainGroupAwareAggressiveMigration,
         "train_group_proactive": ProactiveTrainGroupMigration,
     }
     if name not in factories:

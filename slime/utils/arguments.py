@@ -176,8 +176,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--migration-policy",
                 type=str,
                 choices=[
-                    "none", "train_group_aware", "train_group_proactive",
-                    "stream_trainer",
+                    "none", "train_group_aware", "train_group_aware_aggressive",
+                    "train_group_proactive", "stream_trainer",
                 ],
                 default="none",
                 help=(
@@ -186,6 +186,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "'train_group_aware' aborts in-flight requests on a lagging "
                     "engine when its train group is otherwise drained, and "
                     "re-dispatches them to a still-inferring train group. "
+                    "'train_group_aware_aggressive' is 'train_group_aware' with "
+                    "the KV-cache feasibility check disabled: it migrates every "
+                    "eligible tail group to the lowest-load inferring engine "
+                    "unconditionally (no /get_load probe, ignores "
+                    "--migration-dst-usage-cap). "
                     "'train_group_proactive' is a strict superset of "
                     "train_group_aware: it behaves identically while multiple "
                     "train groups are still inferring, and additionally — once "
