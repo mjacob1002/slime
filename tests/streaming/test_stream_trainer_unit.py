@@ -260,6 +260,72 @@ class TestBoundedSwitchController:
         ctrl.reset()
         assert ctrl._switches_used == 0
 
+    def test_single_group_held_until_min_batch_met(self):
+        """Even with budget > 1, a single early-draining group is held until
+        enough siblings arrive to form a half-batch — prevents wasting the
+        first switch on the fastest engine alone (RollPacker "half together")."""
+        ctrl = BoundedSwitchController(max_switches=2)
+        # 4 train groups, 0 completed, budget=2 → min_batch = ceil(4/2) = 2.
+        ctx = FlipDecisionContext(num_train_groups=4, num_completed=0)
+
+        # First engine drains alone — must be held.
+        held = ctrl.admit_flips([0], ctx)
+        assert held == []
+        assert ctrl._switches_used == 0
+
+        # Sibling drains — now we have 2, meets min_batch.
+        admitted = ctrl.admit_flips([0, 1], ctx)
+        assert admitted == [0, 1]
+        ctrl.on_flipped(admitted)
+        assert ctrl._switches_used == 1
+
+    def test_min_batch_recomputed_per_call(self):
+        """min_batch shrinks as completions reduce the remaining set.
+        Useful when the remaining-to-flip count isn't a clean multiple."""
+        ctrl = BoundedSwitchController(max_switches=3)
+        # 6 train groups, budget=3 → min_batch = ceil(6/3) = 2.
+        ctx0 = FlipDecisionContext(num_train_groups=6, num_completed=0)
+        assert ctrl.admit_flips([0], ctx0) == []          # 1 < 2, hold
+        assert ctrl.admit_flips([0, 1], ctx0) == [0, 1]   # 2 >= 2, admit
+        ctrl.on_flipped([0, 1])
+
+        # Now: 4 remaining, budget=2 → min_batch = ceil(4/2) = 2.
+        ctx1 = FlipDecisionContext(num_train_groups=6, num_completed=2)
+        assert ctrl.admit_flips([2], ctx1) == []          # 1 < 2, hold
+        assert ctrl.admit_flips([2, 3], ctx1) == [2, 3]
+        ctrl.on_flipped([2, 3])
+
+        # Now: 2 remaining, budget=1 → final batch path, admit anything.
+        ctx2 = FlipDecisionContext(num_train_groups=6, num_completed=4)
+        assert ctrl.admit_flips([4], ctx2) == []          # not yet all → hold
+        assert ctrl.admit_flips([4, 5], ctx2) == [4, 5]   # will_finish
+        ctrl.on_flipped([4, 5])
+        assert ctrl._switches_used == 3
+
+    def test_explicit_min_batch_override(self):
+        """Caller can pin a stricter floor explicitly."""
+        ctrl = BoundedSwitchController(max_switches=4, min_batch_size=3)
+        # Auto would have been ceil(8/4) = 2; override forces 3.
+        ctx = FlipDecisionContext(num_train_groups=8, num_completed=0)
+        assert ctrl.admit_flips([0, 1], ctx) == []        # 2 < 3, hold
+        assert ctrl.admit_flips([0, 1, 2], ctx) == [0, 1, 2]
+        ctrl.on_flipped([0, 1, 2])
+
+    def test_final_batch_always_admitted_even_below_min(self):
+        """The 'will_finish' branch must override the min-batch gate, otherwise
+        an odd remainder would be stranded forever."""
+        ctrl = BoundedSwitchController(max_switches=2)
+        # Force budget to 1 and a tiny final batch.
+        ctrl.on_flipped([0, 1, 2])   # uses 1 switch; budget now 1
+        # 5 train groups, 3 already flipped → 2 remain. Final batch is just {3}
+        # (then {4} would come) — but actually pretend the remaining 2 come together.
+        ctx = FlipDecisionContext(num_train_groups=5, num_completed=3)
+        # Only 1 of the 2 remaining drained — but it's not yet the final batch.
+        # min_batch = ceil(2/1) = 2 → 1 < 2 and not will_finish → hold.
+        assert ctrl.admit_flips([3], ctx) == []
+        # Both remaining arrive together → will_finish → admit despite no min check.
+        assert ctrl.admit_flips([3, 4], ctx) == [3, 4]
+
 
 # ----------------------- Integration: policy + controller --------------
 

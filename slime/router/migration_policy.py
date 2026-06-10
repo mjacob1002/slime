@@ -151,6 +151,8 @@ def _estimate_added_tokens_for_group(
     for s in grp:
         prefill_len = len(s.tokens) if s.tokens else 0
         per_sample_cap = max_new_tokens_per_sample
+        # TODO: fix this - it is using oracle information to find the decoded tokens.
+        # we need to come up with an estimator of some sort
         if replay_lengths_per_sample and s.index is not None:
             recorded = replay_lengths_per_sample.get(s.index)
             if recorded is not None and recorded > 0:

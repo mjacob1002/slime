@@ -87,16 +87,31 @@ class EagerSwitchController(GroupSwitchController):
 
 
 class BoundedSwitchController(GroupSwitchController):
-    """Cap the number of G_train membership changes per rollout step.
+    """Cap G_train membership changes per rollout step AND require each batch
+    to be at least an even share of the train groups.
 
     With `max_switches=2` reproduces RollPacker StreamTrainer's invariant:
-      1. First batch: when a chunk of train groups drains together (because
-         StreamTrainerMigration migrated their work onto survivors), admit
-         them all at once → consumes 1 switch.
-      2. Final batch: when all remaining inferring engines drain naturally,
-         admit them together → consumes the second switch.
-    Anything that would push a third switch is deferred until it can be
-    bundled into the final batch.
+      1. First batch: when (roughly) half the train groups have drained —
+         either via StreamTrainerMigration moving work off them, or via
+         natural completion — admit them together → consumes 1 switch.
+      2. Final batch: when the rest drain, admit them together → consumes
+         the second switch.
+
+    Why the minimum-batch requirement matters: without it, the *fastest*
+    engine to drain naturally would consume the first switch token alone,
+    leaving the slow tail to fill the second batch. That defeats RollPacker's
+    "scale down half the GPUs together" intent — you want both halves of
+    the topology to flip in lockstep so G_train doubles its membership in
+    one shot, not in a 1-then-N-1 split. The trade is that the fastest
+    engine sits idle for the gap until its batch sibling drains, but the
+    surviving inference engines also get more KV breathing room from the
+    smaller-than-expected concurrent training start.
+
+    Each `admit_flips` call computes the required batch size as
+    `ceil(remaining_train_groups / remaining_switches)` — an even split
+    across the remaining switch budget. Smaller batches are held; the
+    final batch is always admitted regardless of size so we don't strand
+    a small tail.
 
     Counting is per-batch, not per-group: admitting K groups in one call
     counts as ONE switch token consumed. This matches the underlying
@@ -104,10 +119,17 @@ class BoundedSwitchController(GroupSwitchController):
     de-register cycle no matter how many groups are flipping together.
     """
 
-    def __init__(self, max_switches: int):
+    def __init__(self, max_switches: int, min_batch_size: int | None = None):
         if max_switches < 1:
             raise ValueError(f"max_switches must be >= 1, got {max_switches}")
+        if min_batch_size is not None and min_batch_size < 1:
+            raise ValueError(
+                f"min_batch_size must be >= 1 or None (auto), got {min_batch_size}"
+            )
         self.max_switches = max_switches
+        # When None, derived each call as ceil(remaining / remaining_switches).
+        # Setting an explicit value pins every batch to at least that size.
+        self.min_batch_size_override = min_batch_size
         self._switches_used = 0
 
     def reset(self) -> None:
@@ -131,24 +153,42 @@ class BoundedSwitchController(GroupSwitchController):
 
         remaining_budget = self.max_switches - self._switches_used
         candidates_sorted = sorted(candidates)
+        will_finish = (
+            ctx.num_completed + len(candidates_sorted) >= ctx.num_train_groups
+        )
 
-        if remaining_budget > 1:
-            # Plenty of budget — admit as one batch and charge one switch.
-            return candidates_sorted
-
-        # remaining_budget == 1: only fire if THIS batch finishes the rollout.
-        # Otherwise we'd burn the last switch early and have nothing left for
-        # the residual flips, forcing the warning branch above.
-        will_finish = ctx.num_completed + len(candidates_sorted) >= ctx.num_train_groups
+        # Final batch — admit whatever's left, regardless of size, so we
+        # don't strand a small tail. Also covers the remaining_budget == 1
+        # case where we must spend the last token here or warn-and-admit
+        # everything later anyway.
         if will_finish:
             return candidates_sorted
 
-        logger.info(
-            f"[FLIP-CTRL] holding {len(candidates_sorted)} candidate(s) "
-            f"({candidates_sorted}) — last switch reserved for final batch "
-            f"(completed={ctx.num_completed}/{ctx.num_train_groups})"
-        )
-        return []
+        # Compute the minimum batch size for this call.
+        # Explicit override pins every batch to at least min_batch_size_override.
+        # Otherwise: ceil(remaining_to_flip / remaining_budget) — an even split
+        # across the remaining switch budget. For max_switches=2 and 4 train
+        # groups this is 2 (RollPacker's "half together").
+        remaining_to_flip = ctx.num_train_groups - ctx.num_completed
+        if self.min_batch_size_override is not None:
+            min_batch = self.min_batch_size_override
+        else:
+            min_batch = max(
+                1,
+                (remaining_to_flip + remaining_budget - 1) // remaining_budget,
+            )
+
+        if len(candidates_sorted) < min_batch:
+            logger.info(
+                f"[FLIP-CTRL] holding {len(candidates_sorted)} candidate(s) "
+                f"({candidates_sorted}) — need batch of >={min_batch} "
+                f"(remaining_to_flip={remaining_to_flip}, "
+                f"remaining_budget={remaining_budget}, "
+                f"completed={ctx.num_completed}/{ctx.num_train_groups})"
+            )
+            return []
+
+        return candidates_sorted
 
     def on_flipped(self, train_groups: list[int]) -> None:
         if not train_groups:
