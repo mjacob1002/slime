@@ -216,7 +216,7 @@ class RayElasticGroup:
                     placement_group_capture_child_tasks=True,
                     placement_group_bundle_index=bundle_index,
                 ),
-                runtime_env={"env_vars": env_vars},
+                runtime_env={"env_vars": {**env_vars, "SGLANG_ENGINE_RANK": str(engine_idx)}},
             ).remote(elastic_args, rank=engine_idx, worker_type="regular", base_gpu_id=base_gpu_id)
 
             engines.append(engine)
