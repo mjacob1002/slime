@@ -178,6 +178,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=[
                     "none", "train_group_aware", "train_group_aware_aggressive",
                     "train_group_proactive", "stream_trainer",
+                    "train_group_batch_threshold",
+                    "train_group_batch_threshold_aggressive",
                 ],
                 default="none",
                 help=(
@@ -252,6 +254,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "policy re-evaluations. Throttles the per-event hook so "
                     "we don't recompute the migration plan on every group. "
                     "RollPacker uses ΔR/|R| ≥ 0.05; default 0.05."
+                ),
+            )
+            parser.add_argument(
+                "--migration-batch-threshold",
+                type=int,
+                default=8,
+                help=(
+                    "Used by --migration-policy train_group_batch_threshold[_aggressive]. "
+                    "Fire migration when a train group's cumulative in-flight SAMPLE count "
+                    "(summed across its inference engines, where each prompt group "
+                    "contributes n_samples_per_prompt samples) drops strictly below this "
+                    "value. At rollout_batch_size=192, n_samples_per_prompt=4, and 3 train "
+                    "groups, each group peaks at 192*4/3 = 256 samples; threshold=96 fires "
+                    "at ~62%% drained."
+                ),
+            )
+            parser.add_argument(
+                "--migration-min-completed-per-group",
+                type=int,
+                default=64,
+                help=(
+                    "Used by --migration-policy train_group_batch_threshold[_aggressive]. "
+                    "Require the train group to have completed at least this many "
+                    "prompt groups before the trigger is allowed to fire. Default 64 "
+                    "(50%% of a group's original 128-group assignment)."
                 ),
             )
             parser.add_argument(

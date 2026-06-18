@@ -46,6 +46,10 @@ class PerfettoTracer:
         self._devices_seen: set[str | int] = set()
         # Reference time for computing timestamps in microseconds
         self._epoch = time.perf_counter()
+        # Wall-clock anchor at the same instant — lets external timeseries
+        # (e.g. NVML GPM samples) be joined onto the trace by mapping
+        # event ts_us back to wall-clock seconds.
+        self._wall_epoch = time.time()
         # Monotonic logical-event counter. Each public emit/event/instant call
         # produces one id, shared across every duplicated span the call yields.
         self._next_id = 0
@@ -195,6 +199,19 @@ class PerfettoTracer:
                 "name": "process_name",
                 "args": {"name": self._device_label(device)},
             })
+
+        # Wall-clock anchor — instant marker on the driver row so post-hoc
+        # tooling can convert event ts_us -> wall_ts for joining with
+        # external timeseries like NVML GPM samples.
+        events.append({
+            "name": "wall_clock_epoch",
+            "ph": "i",
+            "ts": 0,
+            "pid": self._device_pid("driver"),
+            "tid": 0,
+            "s": "g",
+            "args": {"wall_epoch": self._wall_epoch},
+        })
 
         with open(output, "w") as f:
             json.dump(events, f)

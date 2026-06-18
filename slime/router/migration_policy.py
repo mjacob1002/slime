@@ -299,6 +299,170 @@ class TrainGroupAwareAggressiveMigration(TrainGroupAwareMigration):
         )
 
 
+class TrainGroupBatchThresholdMigration(MigrationPolicy):
+    """Cumulative-batch-threshold migration: more aggressive than the drain-based
+    `TrainGroupAwareMigration`.
+
+    Trigger: on every request completion, compute the train group's
+    `cumulative_samples_in_flight = sum(len(grp) for grp in in_flight_groups[e]
+    for e in engines_of_group)` and
+    `cumulative_completed = sum(completed_per_engine[e] for e in engines_of_group)`.
+    Fire when cumulative_samples_in_flight < `cumulative_batch_threshold` AND
+    cumulative_completed >= `min_completed_per_group`. ONE-SHOT per train group:
+    once a group fires, it's marked and never re-triggers in this rollout.
+
+    NOTE: the threshold counts SAMPLES, not prompt groups. A prompt group bundles
+    `n_samples_per_prompt` samples (typically 4 for GRPO). With
+    rollout_batch_size=192, n_samples_per_prompt=4, and 3 train groups, each
+    train group peaks at 192*4/3 = 256 samples in flight. A threshold of 96
+    samples then fires when the group is ~62% drained.
+
+    Action: migrate ALL remaining in-flight groups across ALL engines in the
+    triggered train group to engines in OTHER groups (still inferring, not
+    flipped). Destination = lowest-load eligible engine that passes the
+    feasibility check (if present).
+
+    Goal: redistribute work *before* any single engine fully drains, keeping
+    receiver engines at max batch longer and shortening the inference tail.
+
+    Why this isn't a TrainGroupAwareMigration subclass:
+      - Trigger is group-level cumulative, not single-engine drain.
+      - Migrates the whole group's residual work in one shot, not just the
+        surviving engine's tail.
+    The destination-selection mechanics (rank by in_flight_count, feasibility
+    probe) mirror what TrainGroupAwareMigration does, so we replicate that
+    pattern inline rather than refactoring shared helpers.
+    """
+
+    def __init__(
+        self,
+        cumulative_batch_threshold: int = 8,
+        min_completed_per_group: int = 64,
+    ):
+        self.cumulative_batch_threshold = cumulative_batch_threshold
+        self.min_completed_per_group = min_completed_per_group
+        self._triggered_groups: set[int] = set()
+
+    def reset(self) -> None:
+        super().reset()
+        self._triggered_groups = set()
+
+    async def on_request_completed(
+        self,
+        src_engine: int,
+        completed_group: list[Sample],
+        ctx: MigrationContext,
+    ) -> list[MigrationDecision]:
+        src_group = ctx.train_group_for_engine(src_engine)
+        if src_group in self._triggered_groups:
+            return []
+
+        sibling_engines = ctx.engines_for_train_group(src_group)
+        # Count SAMPLES in flight on this train group, not prompt groups. Each
+        # group bundles n_samples_per_prompt samples; summing len(grp) handles
+        # variable group sizes robustly without needing n_samples_per_prompt in
+        # the context.
+        cumulative_batch = sum(
+            len(grp)
+            for e in sibling_engines
+            for grp in ctx.in_flight_groups.get(e, [])
+        )
+        cumulative_completed = sum(
+            ctx.completed_per_engine.get(e, 0) for e in sibling_engines
+        )
+
+        if cumulative_batch >= self.cumulative_batch_threshold:
+            return []
+        if cumulative_completed < self.min_completed_per_group:
+            return []
+
+        # Trigger fires once for this group.
+        self._triggered_groups.add(src_group)
+
+        # Candidate destinations: engines on OTHER train groups, not flipped, not drained.
+        candidates = [
+            e
+            for e in range(ctx.num_engines)
+            if ctx.train_group_for_engine(e) != src_group
+            and ctx.train_group_for_engine(e) not in ctx.flipped_train_groups
+            and ctx.engine_status.get(e, "inferring") != "drained"
+        ]
+        if not candidates:
+            logger.info(
+                f"[BATCH-THRESHOLD] group {src_group} triggered "
+                f"(cumulative_batch={cumulative_batch}, completed={cumulative_completed}) "
+                f"but no eligible destinations — no migrations issued"
+            )
+            return []
+
+        local_load = {e: ctx.in_flight_count.get(e, 0) for e in candidates}
+        decisions: list[MigrationDecision] = []
+
+        # Migrate ALL remaining in-flight groups across all sibling engines.
+        for sibling in sibling_engines:
+            for grp in list(ctx.in_flight_groups.get(sibling, [])):
+                # MAT NOTE: do we really need this tbh? We aren't using this information for checking
+                added = _estimate_added_tokens_for_group(
+                    grp,
+                    ctx.max_new_tokens_per_sample,
+                    ctx.replay_lengths_per_sample,
+                )
+                chosen_dst: int | None = None
+                # Pick lowest-loaded destination that the feasibility checker accepts.
+                for dst in sorted(candidates, key=lambda e: local_load[e]):
+                    if ctx.feasibility_checker is None or ctx.feasibility_checker.can_accept_migration(
+                        dst, added
+                    ):
+                        chosen_dst = dst
+                        break
+                if chosen_dst is None:
+                    # Feasibility blocked all destinations; skip this group.
+                    continue
+                decisions.append(
+                    MigrationDecision(
+                        group=grp,
+                        src_engine=sibling,
+                        dst_engine=chosen_dst,
+                        reason=(
+                            f"batch_threshold: group={src_group} "
+                            f"cumulative_samples={cumulative_batch}<"
+                            f"{self.cumulative_batch_threshold} "
+                            f"completed={cumulative_completed}"
+                        ),
+                    )
+                )
+                local_load[chosen_dst] += 1
+
+        if decisions:
+            logger.info(
+                f"[BATCH-THRESHOLD] group {src_group} fired: "
+                f"cumulative_batch={cumulative_batch} (threshold={self.cumulative_batch_threshold}), "
+                f"cumulative_completed={cumulative_completed} (min={self.min_completed_per_group}), "
+                f"migrating {len(decisions)} groups to "
+                f"{sorted({d.dst_engine for d in decisions})}"
+            )
+        return decisions
+
+
+class TrainGroupBatchThresholdAggressiveMigration(TrainGroupBatchThresholdMigration):
+    """Aggressive variant of TrainGroupBatchThresholdMigration: identical
+    trigger and destination-selection logic, but it NEVER consults the
+    KV-cache feasibility checker. Mirrors the TrainGroupAwareMigration ->
+    TrainGroupAwareAggressiveMigration pattern.
+    """
+
+    async def on_request_completed(
+        self,
+        src_engine: int,
+        completed_group: list[Sample],
+        ctx: MigrationContext,
+    ) -> list[MigrationDecision]:
+        aggressive_ctx = replace(ctx, feasibility_checker=None)
+        return await super().on_request_completed(
+            src_engine, completed_group, aggressive_ctx
+        )
+
+
 class ProactiveTrainGroupMigration(TrainGroupAwareMigration):
     """Combined inter + intra-group migration with a global-state trigger.
 
@@ -762,6 +926,20 @@ def make_migration_policy(args) -> MigrationPolicy:
             flip_fraction=float(getattr(args, "stream_trainer_flip_fraction", 0.50)),
             require_progress_step=float(getattr(args, "stream_trainer_require_progress_step", 0.05)),
         )
+    if name in ("train_group_batch_threshold", "train_group_batch_threshold_aggressive"):
+        cls = (
+            TrainGroupBatchThresholdAggressiveMigration
+            if name == "train_group_batch_threshold_aggressive"
+            else TrainGroupBatchThresholdMigration
+        )
+        return cls(
+            cumulative_batch_threshold=int(
+                getattr(args, "migration_batch_threshold", 8)
+            ),
+            min_completed_per_group=int(
+                getattr(args, "migration_min_completed_per_group", 64)
+            ),
+        )
     factories: dict[str, type[MigrationPolicy]] = {
         "none": NoMigration,
         "train_group_aware": TrainGroupAwareMigration,
@@ -771,6 +949,6 @@ def make_migration_policy(args) -> MigrationPolicy:
     if name not in factories:
         raise ValueError(
             f"Unknown migration policy: {name!r}. "
-            f"Choices: {sorted(list(factories) + ['stream_trainer'])}"
+            f"Choices: {sorted(list(factories) + ['stream_trainer', 'train_group_batch_threshold', 'train_group_batch_threshold_aggressive'])}"
         )
     return factories[name]()
