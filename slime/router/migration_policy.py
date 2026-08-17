@@ -917,10 +917,46 @@ class StreamTrainerMigration(MigrationPolicy):
             )
 
 
+class StreamTrainerAggressiveMigration(StreamTrainerMigration):
+    """StreamTrainer with the KV-cache feasibility gate DISABLED.
+
+    Identical trigger (completion window + progress throttle), victim selection,
+    and migration planning as the parent, but `_meets_scale_criteria` never probes
+    `/get_load`: it always returns True (its `feasibility_checker is None` branch).
+    This matches RollPacker's actual code (github.com/Farrrrland/RollPacker), whose
+    scale-down fires purely on a completion trigger with no MeetScaleCriteria /
+    KV-capacity check before migrating requests onto the surviving rollout engines.
+
+    WARNING: without RollPacker's tail batching, the full mixed long-tail KV is still
+    in flight at scale-down, so consolidating onto half the engines can push their KV
+    ~2x over capacity → SGLang retraction, and risks torch_memory_saver "cudaError 2:
+    out of memory" on the inter-rollout resume. Use for measuring the gate-free upper
+    bound / RollPacker parity, not as a safe default.
+    """
+
+    async def on_request_completed(
+        self,
+        src_engine: int,
+        completed_group: list[Sample],
+        ctx: MigrationContext,
+    ) -> list[MigrationDecision]:
+        # Null the checker on a shallow ctx copy; the parent's _meets_scale_criteria
+        # already implements the "no checker → always feasible" path. Mirrors
+        # TrainGroupAwareAggressiveMigration.
+        return await super().on_request_completed(
+            src_engine, completed_group, replace(ctx, feasibility_checker=None)
+        )
+
+
 def make_migration_policy(args) -> MigrationPolicy:
     name = getattr(args, "migration_policy", "none") or "none"
-    if name == "stream_trainer":
-        return StreamTrainerMigration(
+    if name in ("stream_trainer", "stream_trainer_aggressive"):
+        cls = (
+            StreamTrainerAggressiveMigration
+            if name == "stream_trainer_aggressive"
+            else StreamTrainerMigration
+        )
+        return cls(
             min_completion_frac=float(getattr(args, "stream_trainer_min_completion_frac", 0.20)),
             max_completion_frac=float(getattr(args, "stream_trainer_max_completion_frac", 0.50)),
             flip_fraction=float(getattr(args, "stream_trainer_flip_fraction", 0.50)),
@@ -949,6 +985,6 @@ def make_migration_policy(args) -> MigrationPolicy:
     if name not in factories:
         raise ValueError(
             f"Unknown migration policy: {name!r}. "
-            f"Choices: {sorted(list(factories) + ['stream_trainer', 'train_group_batch_threshold', 'train_group_batch_threshold_aggressive'])}"
+            f"Choices: {sorted(list(factories) + ['stream_trainer', 'stream_trainer_aggressive', 'train_group_batch_threshold', 'train_group_batch_threshold_aggressive'])}"
         )
     return factories[name]()

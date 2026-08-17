@@ -177,7 +177,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 choices=[
                     "none", "train_group_aware", "train_group_aware_aggressive",
-                    "train_group_proactive", "stream_trainer",
+                    "train_group_proactive", "stream_trainer", "stream_trainer_aggressive",
                     "train_group_batch_threshold",
                     "train_group_batch_threshold_aggressive",
                 ],
@@ -209,7 +209,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "work off --stream-trainer-flip-fraction of the train "
                     "groups onto the survivors so those groups can flip to "
                     "training while the rest finish decoding. Usually paired "
-                    "with --max-train-switches-per-step 2."
+                    "with --max-train-switches-per-step 2. "
+                    "'stream_trainer_aggressive' is the same but with the KV-cache "
+                    "feasibility gate (--migration-dst-usage-cap) DISABLED, matching "
+                    "RollPacker's actual code (no MeetScaleCriteria probe); it always "
+                    "scales down even if the survivors' projected KV exceeds capacity."
                 ),
             )
             parser.add_argument(
@@ -1401,6 +1405,39 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help="Replay recorded response lengths from this JSON file with ignore_eos=True.",
+            )
+            parser.add_argument(
+                "--replay-dispatch-order",
+                type=str,
+                choices=["longest_first", "shortest_first", "as_recorded"],
+                default="longest_first",
+                help=(
+                    "Order in which replayed requests are dispatched to the engine in the "
+                    "replay-ordered inference limit study (slime.rollout.replay_ordered_rollout). "
+                    "longest_first (LPT) minimizes the makespan tail; the others are for A/B."
+                ),
+            )
+            parser.add_argument(
+                "--replay-tail-metrics-path",
+                type=str,
+                default=None,
+                help=(
+                    "If set, the replay-ordered rollout appends per-rollout makespan and tail "
+                    "percentiles (p50/p95/p99/max completion) to this JSON file."
+                ),
+            )
+            parser.add_argument(
+                "--colocate-throughput-record-path",
+                type=str,
+                default=None,
+                help=(
+                    "If set, the colocate driver (train.py) writes a per-Megatron-step "
+                    "throughput timeseries to this JSON path after each rollout. Each entry "
+                    "has rollout_id, actor_rank, step_id, fwd_bwd_s, total_tokens, "
+                    "total_samples, throughput_tok_s, etc. Also emits one perfetto instant "
+                    "event per step. Opt-in; default off. Path must be on a persistent "
+                    "volume (the container's /tmp is ephemeral)."
+                ),
             )
             return parser
 

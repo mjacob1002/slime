@@ -40,6 +40,18 @@ def run_profiling_experiment(
     # SGLang parameters
     sglang_decode_log_interval: int = 100,
     sglang_mem_fraction_static: float = 0.8,
+    sglang_server_concurrency: int | None = None,
+    sglang_max_running_requests: int | None = None,
+
+    # Replay / limit-study parameters
+    rollout_function_path: str | None = None,
+    profiling_replay_lengths_path: str | None = None,
+    profiling_record_lengths_path: str | None = None,
+    replay_dispatch_order: str | None = None,
+    replay_tail_metrics_path: str | None = None,
+
+    # When True, build and return the train_args string without launching Ray.
+    dry_run: bool = False,
 ) -> tuple[dict, dict, str]:
     """
     Run a profiling experiment with the given parameters.
@@ -68,6 +80,11 @@ def run_profiling_experiment(
         "num_warmups": num_warmups,
         "num_trials": num_trials,
         "megatron_model_type": megatron_model_type,
+        "rollout_function_path": rollout_function_path,
+        "profiling_replay_lengths_path": profiling_replay_lengths_path,
+        "replay_dispatch_order": replay_dispatch_order,
+        "sglang_max_running_requests": sglang_max_running_requests,
+        "sglang_server_concurrency": sglang_server_concurrency,
     }
 
     # Build argument strings
@@ -105,11 +122,35 @@ def run_profiling_experiment(
         f"--sglang-decode-log-interval {sglang_decode_log_interval} "
         f"--sglang-mem-fraction-static {sglang_mem_fraction_static} "
     )
+    if sglang_server_concurrency is not None:
+        sglang_args += f"--sglang-server-concurrency {sglang_server_concurrency} "
+    if sglang_max_running_requests is not None:
+        sglang_args += f"--sglang-max-running-requests {sglang_max_running_requests} "
+
+    # Replay / limit-study args. When a replay path is given, the recorded lengths
+    # drive generation (ignore_eos + max_new_tokens) and --rollout-max-response-len
+    # above is only a safety ceiling.
+    replay_args = ""
+    if rollout_function_path is not None:
+        replay_args += f"--rollout-function-path {rollout_function_path} "
+    if profiling_replay_lengths_path is not None:
+        replay_args += f"--profiling-replay-lengths-path {profiling_replay_lengths_path} "
+    if profiling_record_lengths_path is not None:
+        replay_args += f"--profiling-record-lengths-path {profiling_record_lengths_path} "
+    if replay_dispatch_order is not None:
+        replay_args += f"--replay-dispatch-order {replay_dispatch_order} "
+    if replay_tail_metrics_path is not None:
+        replay_args += f"--replay-tail-metrics-path {replay_tail_metrics_path} "
 
     train_args = (
-        f"{ckpt_args}{rollout_args}{gpu_args}{profiling_args}{sglang_args}"
+        f"{ckpt_args}{rollout_args}{gpu_args}{profiling_args}{sglang_args}{replay_args}"
         f"{U.get_default_wandb_args(__file__)} "
     )
+
+    if dry_run:
+        # Return the fully-built arg string without launching Ray, so callers can
+        # inspect / print the exact command that would run.
+        return params, {"train_args": train_args, "dry_run": True}, train_args
 
     # Execute and capture output
     output = U.execute_train(

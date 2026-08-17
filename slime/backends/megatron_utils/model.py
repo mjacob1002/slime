@@ -24,6 +24,7 @@ from megatron.training.training import get_model
 
 from slime.utils import tracking_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.train_metrics import append_train_metrics
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
@@ -304,26 +305,16 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, dict]:
     """Execute a single pipeline-parallel training step.
 
-    Runs forward/backward over ``num_microbatches``, applies optimizer step and
-    one scheduler step when gradients are valid.
-
-    Args:
-        args (Namespace): Runtime arguments.
-        rollout_id (int): Rollout identifier.
-        step_id (int): Step index within the current rollout.
-        data_iterator (Sequence[DataIterator]): Iterable(s) yielding training batches.
-        model (Sequence[DDP]): Sequence of DDP-wrapped model chunks.
-        optimizer (MegatronOptimizer): Optimizer instance.
-        opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
-        num_microbatches (int): Number of microbatches to process.
-
-    Returns:
-        tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
-        and gradient norm for logging.
+    Returns the reduced loss dict, grad norm, AND a `step_stats` dict (used
+    by the colocate driver to emit per-step throughput to perfetto + a
+    sidecar JSON when --colocate-throughput-record-path is set).
     """
+    import time as _time
+    step_start_perf = _time.perf_counter()
+    step_start_wall = _time.time()
     args = get_args()
 
     # Set grad to zero.
@@ -431,17 +422,36 @@ def train_one_step(
         forward_only=False,
     )
 
-    # Log microbatch stats
+    # Build per-step throughput record. Even on ranks where the local
+    # microbatch stats happen to be empty (e.g. non-last pipeline stages on
+    # some configs), we still emit a record with zeros so the driver knows
+    # the actor stepped.
+    total_mb_samples = sum(s["samples"] for s in train_mb_stats) if train_mb_stats else 0
+    total_mb_tokens = sum(s["tokens"] for s in train_mb_stats) if train_mb_stats else 0
+    total_fwd_time = sum(s["fwd_time_s"] for s in train_mb_stats) if train_mb_stats else 0.0
+    throughput_tok_s = total_mb_tokens / total_fwd_time if total_fwd_time > 0 else 0.0
+    throughput_samples_s = total_mb_samples / total_fwd_time if total_fwd_time > 0 else 0.0
     if train_mb_stats:
-        total_mb_tokens = sum(s["tokens"] for s in train_mb_stats)
-        total_fwd_time = sum(s["fwd_time_s"] for s in train_mb_stats)
-        throughput = total_mb_tokens / total_fwd_time if total_fwd_time > 0 else 0
         logger.info(
             f"[TRAIN_ONE_STEP] rollout={rollout_id} step={step_id}: "
             f"{len(train_mb_stats)} microbatches, {total_mb_tokens} tokens, "
-            f"total_fwd_time={total_fwd_time:.2f}s, throughput={throughput:.0f} tok/s"
+            f"total_fwd_time={total_fwd_time:.2f}s, throughput={throughput_tok_s:.0f} tok/s"
         )
-        train_mb_stats.clear()
+    step_stats = {
+        "rollout_id": rollout_id,
+        "step_id": step_id,
+        "step_start_perf": round(step_start_perf, 6),
+        "step_start_wall": round(step_start_wall, 6),
+        "step_total_s": 0.0,  # filled at end of function
+        "fwd_bwd_s": round(total_fwd_time, 4),
+        "total_tokens": total_mb_tokens,
+        "total_samples": total_mb_samples,
+        "num_microbatches": len(train_mb_stats),
+        "throughput_tok_s": round(throughput_tok_s, 2),
+        "throughput_samples_s": round(throughput_samples_s, 4),
+        "microbatch_stats": list(train_mb_stats),
+    }
+    train_mb_stats.clear()
 
     valid_step = True
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
@@ -475,6 +485,27 @@ def train_one_step(
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
+    step_stats["step_total_s"] = round(_time.perf_counter() - step_start_perf, 4)
+
+    # Per-step training-throughput JSONL (analog of the SGLang decode metrics).
+    # No-op unless SLIME_TRAIN_METRICS_DIR is set. Exclude microbatch_stats to keep rows compact.
+    append_train_metrics(
+        {
+            "phase": "train_step",
+            "dp_rank": mpu.get_data_parallel_rank(),
+            "rollout_id": rollout_id,
+            "step_id": step_id,
+            "total_tokens": total_mb_tokens,
+            "total_samples": total_mb_samples,
+            "num_microbatches": len(step_stats["microbatch_stats"]),
+            "throughput_tok_s": step_stats["throughput_tok_s"],
+            "throughput_samples_s": step_stats["throughput_samples_s"],
+            "fwd_bwd_s": step_stats["fwd_bwd_s"],
+            "step_total_s": step_stats["step_total_s"],
+            "timestamp": _time.time(),
+        }
+    )
+
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         keys = losses_reduced[0]["keys"]
@@ -492,8 +523,8 @@ def train_one_step(
         num_samples_or_tokens = values[0]
         for key, value in zip(keys, values[1:], strict=False):
             loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
-        return loss_reduced, grad_norm
-    return {}, grad_norm
+        return loss_reduced, grad_norm, step_stats
+    return {}, grad_norm, step_stats
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
@@ -518,7 +549,7 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
-) -> None:
+) -> list[dict]:
     """Run training over a rollout consisting of multiple steps.
 
     The model is switched to train mode, training hooks are configured, and
@@ -601,12 +632,13 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    step_stats_list: list[dict] = []
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        loss_dict, grad_norm = train_one_step(
+        loss_dict, grad_norm, step_stats = train_one_step(
             args,
             rollout_id,
             step_id,
@@ -616,6 +648,7 @@ def train(
             opt_param_scheduler,
             num_microbatches[step_id],
         )
+        step_stats_list.append(step_stats)
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
@@ -705,6 +738,8 @@ def train(
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
+
+    return step_stats_list
 
 
 def save(

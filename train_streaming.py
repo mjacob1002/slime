@@ -44,7 +44,7 @@ from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
 from slime.utils.misc import should_run_periodic_action
 from slime.utils.perfetto_tracer import get_tracer, init_tracer
-from slime.utils.tracking_utils import init_tracking
+from slime.utils.tracking_utils import init_tracking, log as track_log
 
 logger = logging.getLogger(__name__)
 
@@ -500,6 +500,24 @@ def train(args):
             rollout_metrics["num_truncated"] = gen_result.get("num_truncated")
             rollout_metrics["num_completed"] = gen_result.get("num_completed")
         all_rollout_metrics.append(rollout_metrics)
+
+        # Log the per-rollout reward curve (and perf) to wandb/tensorboard. wandb
+        # is already initialized via init_tracking() above; the streaming driver
+        # otherwise never emits reward metrics. track_log() no-ops unless
+        # --use-wandb / --use-tensorboard is set. Keys match the rollout/* and
+        # perf/* metric families defined in wandb_utils._init_wandb_common.
+        if gen_result is not None:
+            track_log(args, {
+                "rollout/step": rollout_id,
+                "rollout/raw_reward": gen_result.get("mean_reward"),
+                "rollout/mean_response_length": gen_result.get("mean_response_length"),
+                "rollout/num_truncated": gen_result.get("num_truncated"),
+                "rollout/num_completed": gen_result.get("num_completed"),
+                "rollout/num_samples": gen_result.get("num_samples"),
+                "perf/inference_time_s": inference_elapsed,
+                "perf/training_time_s": training_elapsed,
+                "perf/total_rollout_time_s": rollout_elapsed,
+            }, step_key="rollout/step")
 
         # Periodic eval
         if should_run_periodic_action(rollout_id, args.eval_interval, None):

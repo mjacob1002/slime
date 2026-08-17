@@ -412,7 +412,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
-    def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
+    def train(self, rollout_id: int, rollout_data_ref: Box) -> list[dict]:
+        """Returns the per-step throughput records collected during this
+        rollout (one entry per Megatron train step). Always a list; empty
+        on debug_rollout_only paths."""
         if self.args.offload_train:
             self.wake_up()
 
@@ -420,14 +423,14 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data = self._get_rollout_data(rollout_data_ref)
             if self.args.debug_rollout_only:
                 log_rollout_data(rollout_id, self.args, rollout_data)
-                return
+                return []
 
         if self.role == "critic":
             return self.train_critic(rollout_id, rollout_data)
         else:
             return self.train_actor(rollout_id, rollout_data)
 
-    def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+    def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> list[dict]:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         rollout_data.update(
@@ -446,7 +449,7 @@ class MegatronTrainRayActor(TrainRayActor):
         compute_advantages_and_returns(self.args, rollout_data)
 
         self.args.loss_type = "value_loss"
-        train(
+        return train(
             rollout_id,
             self.model,
             self.optimizer,
@@ -455,7 +458,7 @@ class MegatronTrainRayActor(TrainRayActor):
             num_microbatches,
         )
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> list[dict]:
         import time as _time
 
         # Create data iterator for log_probs and train.
@@ -536,7 +539,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             _t0 = _time.perf_counter()
             with timer("actor_train"):
-                train(
+                step_stats_list = train(
                     rollout_id,
                     self.model,
                     self.optimizer,
@@ -578,6 +581,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args)
+
+        return step_stats_list
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

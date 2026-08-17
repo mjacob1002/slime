@@ -878,7 +878,10 @@ class RayElasticGroup:
         logger.info(f"[ELASTIC] start_work_stealing_train(group={group_rank}, rollout_id={rollout_id})")
         actors = self._actor_groups[group_rank]
         dp_size = self._num_train_groups
-        return [actor.train_work_stealing.remote(work_queue, dp_size) for actor in actors]
+        return [
+            actor.train_work_stealing.remote(work_queue, dp_size, rollout_id, group_rank)
+            for actor in actors
+        ]
 
     def sync_all_and_step(self, rollout_id: int):
         """Collective gradient sync + optimizer step on ALL training actors.

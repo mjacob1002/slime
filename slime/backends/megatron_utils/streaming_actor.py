@@ -21,6 +21,7 @@ from torch_memory_saver import torch_memory_saver
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.ray_utils import Box
 from slime.utils.timer import timer
+from slime.utils.train_metrics import append_train_metrics
 
 from .actor import MegatronTrainRayActor
 from .data import get_batch, get_data_iterator_local
@@ -445,7 +446,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             f"global_rank={global_rank}"
         )
 
-    def train_work_stealing(self, work_queue_handle, dp_size: int) -> dict:
+    def train_work_stealing(self, work_queue_handle, dp_size: int, rollout_id: int = None, train_group: int = None) -> dict:
         """Buffered work-stealing loop: grab data from shared queue, train, repeat.
 
         With TP>1, only TP rank 0 grabs from the queue and broadcasts data
@@ -620,6 +621,21 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                         "t_prefetch_started_perf": t_prefetch_started,
                         "t_process_returned_perf": t_process_returned,
                         "t_clear_memory_done_perf": t_clear_memory_done,
+                    })
+
+                    # Per-chunk training-throughput JSONL (analog of the SGLang decode
+                    # metrics). No-op unless SLIME_TRAIN_METRICS_DIR is set.
+                    append_train_metrics({
+                        "phase": "train_chunk",
+                        "train_group": train_group,
+                        "rollout_id": rollout_id,
+                        "chunk_id": num_chunks,
+                        "total_tokens": result.get("total_tokens", 0),
+                        "num_microbatches": result["num_microbatches"][0],
+                        "throughput_tok_s": result.get("throughput_tok_s", 0),
+                        "fwd_bwd_s": result.get("fwd_bwd_time_s", 0),
+                        "chunk_total_s": result.get("chunk_total_time_s", 0),
+                        "timestamp": time.time(),
                     })
 
                 self._log_memory(f"work_steal:after_chunk_{num_chunks}")
