@@ -7,21 +7,30 @@ env-parameterised (T2S_ROLLOUTS, default 15) so it lines up with the colocated f
 Derived from test_streaming_8xGPU_qwen3_8b_text2sql_10rollout_tuner.py. The tuner config
 is carried over UNCHANGED — the calibration below only holds for this workload:
 
-  --threshold-tuner idle_threshold --tuner-idle-target 0.045
-      Bang-bang control: idle_ratio > target -> B -= 16, else B += 16. One move per
-      rollout. The target sits BETWEEN the measured t32 (4.11%) and t64 (5.06%) idle
-      levels on this exact workload, which is what makes the sign of the feedback point
-      toward the optimum. It is NOT transferable (DAPO sits at ~2.6%).
-  --tuner-b-max 64
-      B may fall but never rise above its starting point. Exploring past 64 is unmeasured
-      upside against a known OOM downside, so it is fenced off rather than tested.
+  --threshold-tuner interior_idle --tuner-interior-target 0.005
+      Bang-bang on INTERIOR idle (between-chunk starvation), not the combined idle_ratio.
+      interior > target -> B -= 16, else B += 16; one move per rollout. See the inline
+      comment on tuner_args for why the combined signal is ~98% trailing at a healthy B
+      and therefore mostly measures the grab policy rather than migration aggression.
+  --tuner-b-min 8 --tuner-b-max 128
+      Opened in both directions so the control law can move. The ceiling carries the
+      high-B OOM risk; see tuner_args.
   --migration-min-completed-per-group 0
       A fixed part of the configuration, NOT a safety knob. Throttling migrations changes
       the very quantity the tuner reads, which invalidates the idle calibration above.
 
 Starting at B=64 is deliberate: it is the KNOWN-BAD value on this workload (measured
 15-rollout ranking t32 4248.8s / t48 4439.1s / t64 slower still). A tuner that only works
-when seeded with the answer is not a tuner — the control law should walk B down toward 32.
+when seeded with the answer is not a tuner.
+
+READ THE RESULT CAREFULLY. The Aug-20 run of this workload with the COMBINED signal and
+b_max 64 was a no-op: 8 of 10 rollouts read "headroom" and tried to raise B into the cap,
+landing at 325.3 s/rollout -- worse than colocate's 283.8 s. Measured interior at B=64
+(0.00486) is likewise just below the 0.005 epsilon, so this run may well climb rather than
+descend. If B ends up at or near 128 and wall gets worse, that is a real finding about the
+signal on this workload, not a bug: Text2SQL idle is only 2-3% and the dominant cost of a
+higher B is migration re-prefill on the INFERENCE side, which no train-phase idle signal
+can see.
 
 Differs from the rollpacker_prefetch arms in BOTH policy and grab policy:
   migration  train_group_batch_threshold (KV feasibility gate ON) — not stream_trainer
@@ -124,14 +133,38 @@ def execute():
         "--streaming-stall-timeout-s 1500 "
     )
 
+    # INTERIOR idle, not the combined signal. At a healthy B the combined idle_ratio is
+    # ~98% TRAILING -- the post-last-chunk wait for the global barrier, which is set by
+    # the GRAB policy's tail split, not by migration aggressiveness. Interior is the term
+    # B actually causes, and it separates cleanly: healthy <0.0008 vs real starvation
+    # >=0.0145 on the committed traces, a ~25x gap, so a single absolute epsilon works
+    # where it cannot on the combined signal. It also charges a train group that flipped
+    # into training and got ZERO chunks its entire span, which is precisely the failure
+    # mode the rollpacker_prefetch arms exhibit.
+    #
+    # Measured interior on THIS workload (graduated_tail_split, per-rollout medians):
+    #     t32  0.00216   t64  0.00486   none  0.00906
+    # so 0.005 sits between t64 and none. Note this means the tuner reads B=64 as
+    # healthy and will try to RAISE it, while measured wall says lower is better on
+    # Text2SQL (t32 4194.1s vs colocate 4511.1s, back-to-back 2026-08-19). Whether
+    # interior transfers to this workload is exactly the open question the
+    # InteriorIdleTuner docstring flags as unconfirmed -- this run is that test.
+    #
+    # b_min 8 / b_max 128 (was 16/64): the fence is opened in BOTH directions so the
+    # control law can actually move. Raising the ceiling reintroduces the high-B OOM
+    # that killed an earlier Text2SQL attempt (migrated multi-turn trajectories
+    # re-prefill ~15k tokens x8 samples on a cold destination). Mitigations, unchanged:
+    # the KV feasibility gate is ON (train_group_batch_threshold, not _aggressive),
+    # --streaming-stall-timeout-s 1500 bounds a wedge to ~25 min rather than 4.5 h, and
+    # --tuner-step 16 bounds one bad reading to a single 16-wide move.
     tuner_args = (
-        "--threshold-tuner idle_threshold "
+        "--threshold-tuner interior_idle "
         "--tuner-apply 1 "
-        "--tuner-idle-target 0.045 "
+        "--tuner-interior-target 0.005 "
         "--tuner-skip-first 0 "
         "--tuner-step 16 "
-        "--tuner-b-min 16 "
-        "--tuner-b-max 64 "
+        "--tuner-b-min 8 "
+        "--tuner-b-max 128 "
     )
 
     perf_args = (
