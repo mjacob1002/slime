@@ -53,9 +53,10 @@ log "waiting for idle GPUs ..."
 USED=$(wait_idle)
 T0=$(date +%s)
 log "=== START $(date '+%F %H:%M:%S') (GPU ${USED} MiB) ==="
-log "script=$SCRIPT policy=$POLICY rollouts=$ROLLOUTS grab=rollpacker_prefetch out=$OUT"
+log "script=$SCRIPT policy=$POLICY rollouts=$ROLLOUTS grab=rollpacker_prefetch steady=${T2S_RP_STEADY:-derived} out=$OUT"
 
 docker exec -e T2S_ST_POLICY="$POLICY" -e T2S_ROLLOUTS="$ROLLOUTS" \
+  -e T2S_RP_STEADY="${T2S_RP_STEADY:-}" \
   -e T2S_RUN_DIR="/workspace/slime/logs/text2sql_${TAG}/${POLICY}" "$CTR" bash -lc \
   "ulimit -n 524288; cd /workspace/slime && python $SCRIPT" >> "$OUT/driver_stdout.log" 2>&1
 EXIT=$?

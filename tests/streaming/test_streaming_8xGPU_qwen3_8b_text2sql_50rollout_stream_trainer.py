@@ -102,6 +102,13 @@ RP_GRAB_BATCH = os.environ.get("T2S_RP_GRAB_BATCH", "64")
 # num_return_sequences_in_group, which evaluates to <= 1 at slime's shape, i.e. inert.
 # 0 disables it explicitly rather than relying on that arithmetic holding.
 RP_DIV_MULTIPLIER = os.environ.get("T2S_RP_DIV_MULTIPLIER", "0")
+# Per-grab cap from the SECOND grab onward (the ramp-down port of RollPacker's
+# prefetch_prompt_count, base_worker.py:548). Empty string -> leave unset so the policy
+# derives scaling_down_train_batch_size // num_train_groups (64//4 = 16 here). "0"
+# restores the pre-fix behaviour exactly. Smaller values trade RollPacker-like sizing for
+# more grabs per rollout, which is what actually spreads work across train groups in
+# slime -- see the grab-granularity note in the module docstring.
+RP_STEADY = os.environ.get("T2S_RP_STEADY", "")
 RUN_DIR = os.environ.get("T2S_RUN_DIR", f"/workspace/slime/logs/text2sql_50rollout/{POLICY}")
 
 # Byte-identical to the colocated arm, plus the two memory fixes every streaming arm on
@@ -209,7 +216,8 @@ def execute():
         "--grab-policy rollpacker_prefetch "
         f"--rollpacker-scaling-down-train-batch-size {RP_GRAB_BATCH} "
         f"--rollpacker-div-multiplier {RP_DIV_MULTIPLIER} "
-        "--streaming-stall-timeout-s 1500 "
+        + (f"--rollpacker-steady-batch-size {RP_STEADY} " if RP_STEADY != "" else "")
+        + "--streaming-stall-timeout-s 1500 "
     )
 
     # Identical to the colocated arm so training cost is comparable.
