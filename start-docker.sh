@@ -155,6 +155,7 @@ docker run -it \
     --network host \
     --ipc host \
     --shm-size=16g \
+    --ulimit nofile=524288:524288 \
     -v "$SLIME_DIR:/workspace/slime" \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -e NVIDIA_VISIBLE_DEVICES=all \

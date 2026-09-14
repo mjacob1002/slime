@@ -21,6 +21,7 @@ Usage:
     tracer.write()                            # write at end of run
 """
 
+import os
 import json
 import logging
 import threading
@@ -212,6 +213,14 @@ class PerfettoTracer:
             "s": "g",
             "args": {"wall_epoch": self._wall_epoch},
         })
+
+        # Create the parent directory rather than losing a completed run's trace
+        # to a missing dir: write() is the last statement in train(), so by the
+        # time this raises, every rollout has already finished and the data is
+        # only in memory.
+        parent = os.path.dirname(output)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
 
         with open(output, "w") as f:
             json.dump(events, f)

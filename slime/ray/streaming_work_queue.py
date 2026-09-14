@@ -41,6 +41,7 @@ class StreamingWorkQueue:
         engines_per_train_group: int | None = None,
         expected_items_per_rollout: int = 0,
         grab_policy_name: str | None = None,
+        grab_policy_kwargs: dict | None = None,
     ):
         from slime.utils.logging_utils import configure_logger
         configure_logger()
@@ -50,7 +51,9 @@ class StreamingWorkQueue:
         # Grab policy decides per-grab item count from queue state. String
         # name keeps Ray serialization simple; the policy object is built
         # inside this actor and never crosses the Ray boundary.
-        self._grab_policy: GrabPolicy = make_grab_policy(grab_policy_name)
+        self._grab_policy: GrabPolicy = make_grab_policy(
+            grab_policy_name, **(grab_policy_kwargs or {})
+        )
         self._grab_policy_name = grab_policy_name or "all_engines_training"
 
         # Train-group bookkeeping. When inference TP < training TP, multiple
@@ -90,6 +93,12 @@ class StreamingWorkQueue:
         self._completed_train_groups: set[int] = set()
         self._consumed_train_groups: set[int] = set()
 
+        # Train groups emptied by a StreamTrainer scale-down (RollPacker
+        # Algorithm 1's G_free). Written by the router when the policy fires,
+        # read by the driver to decide which flips the StreamTrainer switch
+        # controller may admit. Empty for every other migration policy.
+        self._scale_down_groups: set[int] = set()
+
         logger.info(
             f"[WORK_QUEUE] Initialized with num_engines={num_engines}, "
             f"num_train_groups={num_train_groups}, "
@@ -98,6 +107,31 @@ class StreamingWorkQueue:
             f"expected_items_per_rollout={expected_items_per_rollout}, "
             f"grab_policy={self._grab_policy_name}"
         )
+
+    def record_scale_down_groups(self, train_groups: list[int]):
+        """Record the train groups a StreamTrainer scale-down just emptied.
+
+        This is RollPacker Algorithm 1 line 15's `G_free`. The router calls it
+        once, when `StreamTrainerMigration` fires, so the driver's
+        `StreamTrainerSwitchController` can tell a scale-down drain apart from
+        a group that merely finished its own work early. Additive by design —
+        a policy that fires more than once accumulates.
+        """
+        added = set(train_groups) - self._scale_down_groups
+        self._scale_down_groups.update(train_groups)
+        logger.info(
+            f"[WORK_QUEUE] record_scale_down_groups({sorted(train_groups)}) "
+            f"new={sorted(added)} total={sorted(self._scale_down_groups)}"
+        )
+
+    def get_scale_down_groups(self) -> list[int]:
+        """Train groups emptied by a scale-down so far this rollout.
+
+        NOT consumed-on-read (unlike `get_newly_completed_train_groups`): the
+        driver re-reads this on every poll and the controller needs the full
+        set, not a delta.
+        """
+        return sorted(self._scale_down_groups)
 
     def push_data(self, data_ref):
         """Push a completed prompt group's data into the queue.
@@ -221,7 +255,11 @@ class StreamingWorkQueue:
             effective_cap = 0
             mode = self._grab_policy.mode_label(state)
         else:
-            effective_cap = max(1, self._grab_policy.effective_cap(state))
+            raw_cap = self._grab_policy.effective_cap(state)
+            # A policy may return 0 to mean "hand out nothing this call".
+            # Only RollPackerPrefetchPolicy does; every other policy returns
+            # >= 1, so the max(1, ...) floor still applies to them unchanged.
+            effective_cap = 0 if raw_cap <= 0 else max(1, raw_cap)
             mode = self._grab_policy.mode_label(state)
 
         if effective_cap < pending_count:
@@ -260,4 +298,5 @@ class StreamingWorkQueue:
         self._engines_done_by_group.clear()
         self._completed_train_groups.clear()
         self._consumed_train_groups.clear()
+        self._scale_down_groups.clear()
         logger.info("[WORK_QUEUE] Reset")

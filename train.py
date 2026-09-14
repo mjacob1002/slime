@@ -160,6 +160,8 @@ def train(args):
                     tokens=s.get("total_tokens"),
                     samples=s.get("total_samples"),
                     fwd_bwd_s=s.get("fwd_bwd_s"),
+                    fwd_only_s=s.get("fwd_only_s"),
+                    optimizer_s=s.get("optimizer_s"),
                     step_total_s=s.get("step_total_s"),
                     num_microbatches=s.get("num_microbatches"),
                 )

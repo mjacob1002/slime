@@ -175,13 +175,137 @@ class AllEnginesTrainingPolicy(GrabPolicy):
         return self._single_item_reason(state) or "normal"
 
 
-def make_grab_policy(name: str | None) -> GrabPolicy:
+class RollPackerPrefetchPolicy(GrabPolicy):
+    """RollPacker's released prefetch behaviour, ported verbatim.
+
+    Mirrors `prefetch_completed_requests` in RollPacker's
+    `roll/distributed/scheduler/multi_async_generate_scheduler.py:695-760`,
+    called from `roll/pipeline/base_worker.py:396`. It is NOT a tail-split
+    policy: RollPacker never shrinks its grabs, because tail batching (paper
+    §3) has already removed the long tail before the stream trainer runs. It
+    instead uses a fixed batch, a divisibility constraint, and two hard stops.
+
+    The four mechanisms, in the order the reference applies them:
+
+    1. **Global prefetch cap** (`:334`)
+           max_number_of_preftch_completed_prompts
+               = batch_size_of_all_domains - actor_train.world_size
+       Once this many prompts have been handed to the trainer, streaming
+       prefetch stops for the rest of the rollout. The residual is left for
+       the final synchronized step across all DP replicas.
+
+    2. **Near-end guard** (`:722`)
+           if batch_size_of_all_domains - total_valid_prompts <= 1: stop
+       Their comment: "give some time to post processing and reward
+       computation". When generation is nearly done, stop streaming.
+
+    3. **Fixed batch** (`:731`)
+           if cnt < scaling_down_train_batch_size and len(v) >= n_seq
+       A constant per-grab prompt count (64 in their Table 3 config), never
+       graduated.
+
+    4. **Divisibility truncation** (`:741`)
+           while div_multipler > 0 and cnt % div_multipler > 0:
+               pop one prompt; cnt -= 1
+       Discards completed prompts until the batch divides evenly across the
+       training subgroup. The caller passes
+           div_multipler = 2 * per_device_train_batch_size * pg_world_size
+                           // num_return_sequences_in_group
+       (`base_worker.py:357`). NOTE: at slime's Exp1a shape this evaluates to
+       <= 1, so truncation is inert; it is implemented for faithfulness and
+       for configs where it does bite.
+
+    Phase 2 — the final synchronized step. Gates 1 and 2 deliberately refuse
+    to hand out the residual. In RollPacker the main pipeline then distributes
+    it across all DP replicas for the closing step. slime has no separate
+    path: everything flows through this queue. So once `all_engines_done` is
+    true (generation finished, no more pushes coming) we release the queue
+    without limit. Without that escape the residual would sit in `_pending`
+    forever, `is_done()` would never return True, and the driver would hang.
+
+    Unlike every other policy here, `effective_cap` may return **0**, meaning
+    "hand out nothing this call". `StreamingWorkQueue.grab_available` honours
+    a 0 rather than clamping it to 1.
+    """
+
+    def __init__(
+        self,
+        scaling_down_train_batch_size: int = 64,
+        train_world_size: int = 8,
+        div_multiplier: int = 0,
+    ):
+        if scaling_down_train_batch_size <= 0:
+            raise ValueError(
+                "scaling_down_train_batch_size must be > 0; RollPacker asserts "
+                "the same (`start_rlvr_pipeline_async.py:37`) and raises "
+                "NotImplementedError otherwise"
+            )
+        self.scaling_down_train_batch_size = scaling_down_train_batch_size
+        self.train_world_size = train_world_size
+        self.div_multiplier = div_multiplier
+
+    def _max_prefetch(self, state: GrabState) -> int | None:
+        """Gate 1: batch_size_of_all_domains - actor_train.world_size."""
+        if state.expected_items_per_rollout <= 0:
+            return None
+        return max(0, state.expected_items_per_rollout - self.train_world_size)
+
+    def _stop_reason(self, state: GrabState) -> str | None:
+        # Phase 2 overrides every stop: generation is done, drain freely.
+        if state.all_engines_done:
+            return None
+        mp = self._max_prefetch(state)
+        if mp is not None and state.items_grabbed_so_far >= mp:
+            return "RP_CAP"
+        if state.expected_items_per_rollout > 0:
+            # total_valid_prompts ~= already handed out + still queued
+            total_valid = state.items_grabbed_so_far + state.pending_count
+            if state.expected_items_per_rollout - total_valid <= 1:
+                return "RP_NEAREND"
+        return None
+
+    def effective_cap(self, state: GrabState) -> int:
+        if self._stop_reason(state) is not None:
+            return 0
+
+        if state.all_engines_done:
+            # Final synchronized step: no cap, no truncation.
+            return state.pending_count
+
+        cap = self.scaling_down_train_batch_size
+        # Never exceed the global prefetch allowance.
+        mp = self._max_prefetch(state)
+        if mp is not None:
+            cap = min(cap, mp - state.items_grabbed_so_far)
+        cap = min(cap, state.pending_count)
+        # Gate 4: truncate to a multiple of the DP-divisibility multiplier.
+        if self.div_multiplier > 0 and cap >= self.div_multiplier:
+            cap -= cap % self.div_multiplier
+        elif self.div_multiplier > 0:
+            # Fewer than one full multiple available -> wait for more.
+            return 0
+        return max(0, cap)
+
+    def mode_label(self, state: GrabState) -> str:
+        stop = self._stop_reason(state)
+        if stop:
+            return stop
+        if state.all_engines_done:
+            return "RP_FINAL"
+        return f"RP_FIXED_{self.scaling_down_train_batch_size}"
+
+
+def make_grab_policy(name: str | None, **kwargs) -> GrabPolicy:
     """Factory: maps a CLI string to a policy instance.
 
     The work queue's constructor accepts the string (Ray-serialization-safe)
     and calls this; no policy objects ever cross the Ray actor boundary.
     """
     name = (name or "tail_split").lower()
+    if kwargs and name != "rollpacker_prefetch":
+        raise ValueError(
+            f"grab policy {name!r} takes no parameters, got {sorted(kwargs)}"
+        )
     if name in ("bulk", "none"):
         return BulkPolicy()
     if name == "tail_split":
@@ -190,7 +314,12 @@ def make_grab_policy(name: str | None) -> GrabPolicy:
         return GraduatedTailSplitPolicy()
     if name == "all_engines_training":
         return AllEnginesTrainingPolicy()
+    if name == "rollpacker_prefetch":
+        # kwargs are threaded from the driver; bare name yields RollPacker's
+        # own Table 3 defaults.
+        return RollPackerPrefetchPolicy(**kwargs)
     raise ValueError(
         f"Unknown grab policy: {name!r}. "
-        f"Valid choices: bulk, tail_split, all_engines_training."
+        f"Valid choices: bulk, tail_split, graduated_tail_split, "
+        f"all_engines_training, rollpacker_prefetch."
     )

@@ -409,7 +409,15 @@ def train_one_step(
 
         return output_tensor, partial(loss_function, args, batch, num_microbatches)
 
-    # Forward pass.
+    # Forward + backward.
+    #
+    # Timed with the SAME bracket as the streaming path (streaming_actor.py:414-426):
+    # perf_counter around get_forward_backward_func() plus the forward_backward_func call.
+    # Keeping the brackets identical is what makes colocate's `fwd_bwd_s` comparable to
+    # streaming's; previously this path reported sum(fwd_time_s), i.e. FORWARD ONLY, under
+    # the name fwd_bwd_s, which read ~3.2x faster than streaming on matched work and left
+    # the backward pass unattributed.
+    fwd_bwd_start = _time.perf_counter()
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
@@ -421,6 +429,7 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    fwd_bwd_time = _time.perf_counter() - fwd_bwd_start
 
     # Build per-step throughput record. Even on ranks where the local
     # microbatch stats happen to be empty (e.g. non-last pipeline stages on
@@ -428,14 +437,18 @@ def train_one_step(
     # the actor stepped.
     total_mb_samples = sum(s["samples"] for s in train_mb_stats) if train_mb_stats else 0
     total_mb_tokens = sum(s["tokens"] for s in train_mb_stats) if train_mb_stats else 0
+    # Forward-only aggregate is still useful: backward = fwd_bwd_s - fwd_only_s.
     total_fwd_time = sum(s["fwd_time_s"] for s in train_mb_stats) if train_mb_stats else 0.0
-    throughput_tok_s = total_mb_tokens / total_fwd_time if total_fwd_time > 0 else 0.0
-    throughput_samples_s = total_mb_samples / total_fwd_time if total_fwd_time > 0 else 0.0
+    # Divide by fwd+bwd, matching streaming_actor.py:436. Dividing by forward-only (the
+    # previous behaviour) overstated colocate throughput by roughly the fwd+bwd/fwd ratio.
+    throughput_tok_s = total_mb_tokens / fwd_bwd_time if fwd_bwd_time > 0 else 0.0
+    throughput_samples_s = total_mb_samples / fwd_bwd_time if fwd_bwd_time > 0 else 0.0
     if train_mb_stats:
         logger.info(
             f"[TRAIN_ONE_STEP] rollout={rollout_id} step={step_id}: "
             f"{len(train_mb_stats)} microbatches, {total_mb_tokens} tokens, "
-            f"total_fwd_time={total_fwd_time:.2f}s, throughput={throughput_tok_s:.0f} tok/s"
+            f"fwd_only={total_fwd_time:.2f}s, fwd_bwd={fwd_bwd_time:.2f}s, "
+            f"throughput={throughput_tok_s:.0f} tok/s"
         )
     step_stats = {
         "rollout_id": rollout_id,
@@ -443,7 +456,13 @@ def train_one_step(
         "step_start_perf": round(step_start_perf, 6),
         "step_start_wall": round(step_start_wall, 6),
         "step_total_s": 0.0,  # filled at end of function
-        "fwd_bwd_s": round(total_fwd_time, 4),
+        "optimizer_s": 0.0,  # filled at end of function
+        # fwd+bwd wall time, same bracket as streaming. `fwd_only_s` is the sum of the
+        # per-microbatch forward timers, so backward = fwd_bwd_s - fwd_only_s. Analysis
+        # tooling keys on the presence of fwd_only_s to tell a corrected trace from a
+        # legacy one, where fwd_bwd_s held the forward-only value.
+        "fwd_bwd_s": round(fwd_bwd_time, 4),
+        "fwd_only_s": round(total_fwd_time, 4),
         "total_tokens": total_mb_tokens,
         "total_samples": total_mb_samples,
         "num_microbatches": len(train_mb_stats),
@@ -453,6 +472,7 @@ def train_one_step(
     }
     train_mb_stats.clear()
 
+    optimizer_start = _time.perf_counter()
     valid_step = True
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         found_inf_flag = optimizer.prepare_grads()
@@ -485,6 +505,7 @@ def train_one_step(
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
+    step_stats["optimizer_s"] = round(_time.perf_counter() - optimizer_start, 4)
     step_stats["step_total_s"] = round(_time.perf_counter() - step_start_perf, 4)
 
     # Per-step training-throughput JSONL (analog of the SGLang decode metrics).

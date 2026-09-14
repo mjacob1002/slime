@@ -4,6 +4,8 @@ ElasticUpdateWeight: Adapter for elastic 1:1 training-inference mapping.
 Bypasses the rank-based engine mapping in UpdateWeightFromTensor since in elastic
 mode each training actor connects to exactly one paired inference engine.
 """
+import contextlib
+import logging
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -15,6 +17,10 @@ from megatron.core import mpu
 from ray.actor import ActorHandle
 
 from slime.utils.distributed_utils import get_gloo_group
+
+logger = logging.getLogger(__name__)
+
+
 
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
@@ -151,16 +157,88 @@ class ElasticUpdateWeight:
         # Serialize each dtype group
         serialized_tensors = []
         for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            metadata = flattened_tensor_bucket.get_metadata()
+            # Defensive: CUDA IPC cannot export a 0-byte allocation. (This was NOT the cause
+            # of the observed failure -- the offending tensor was a valid 510MB buffer -- but
+            # empty tensors carry no data and would poison the transfer, so drop them.)
+            nonempty = [(n, t) for (n, t) in named_tensors if t.numel() > 0]
+            dropped = [n for (n, t) in named_tensors if t.numel() == 0]
+            if dropped:
+                logger.warning(
+                    f"[update_weights] skipping {len(dropped)} zero-element tensor(s) that "
+                    f"cannot be IPC-shared: {dropped[:8]}{'...' if len(dropped) > 8 else ''}"
+                )
+            if not nonempty:
+                continue
+
+            def _build_bucket():
+                b = FlattenedTensorBucket(named_tensors=nonempty)
+                return b, b.get_metadata(), b.get_flattened_tensor()
+
+            flattened_tensor_bucket, metadata, flat = _build_bucket()
             flattened_tensor_data = {
-                "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                "flattened_tensor": flat,
                 "metadata": metadata,
             }
             long_live_tensors.append(flattened_tensor_data)
-            serialized_tensors.append(
-                MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
-            )
+            try:
+                serialized_tensors.append(
+                    MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+                )
+            except Exception as first_exc:
+                # CUDA IPC cannot export virtual-memory-backed allocations. The streaming
+                # actors allocate inside a torch_memory_saver region (for lightweight
+                # sleep/wake), and torch's caching allocator can later hand one of those
+                # VMM blocks back for this torch.cat -- the failing buffer had
+                # data_ptr=0x5060000000, a VMM range, not a cudaMalloc pointer, which makes
+                # storage._share_cuda_() raise "CUDA error: invalid argument".
+                # empty_cache() returns cached blocks to the driver so the rebuild gets a
+                # fresh ordinary cudaMalloc block, which IS IPC-shareable. Note we are NOT
+                # inside a TMS region here, so torch_memory_saver.disable() is unavailable
+                # (it asserts tms_get_interesting_region()).
+                logger.warning(
+                    f"[update_weights] IPC serialize failed ({type(first_exc).__name__}); "
+                    "releasing cached CUDA blocks and retrying once with a fresh allocation"
+                )
+                del flattened_tensor_data, flat, flattened_tensor_bucket
+                long_live_tensors.pop()
+                torch.cuda.empty_cache()
+                flattened_tensor_bucket, metadata, flat = _build_bucket()
+                flattened_tensor_data = {"flattened_tensor": flat, "metadata": metadata}
+                long_live_tensors.append(flattened_tensor_data)
+                try:
+                    serialized_tensors.append(
+                        MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+                    )
+                    logger.warning("[update_weights] retry after empty_cache SUCCEEDED")
+                except Exception as exc:
+                    # Decisive probe: is EVERY allocation in this process unshareable, or
+                    # only this buffer? Tests a tiny fresh tensor and a same-size fresh
+                    # tensor. tiny OK + big FAIL => size/fragmentation. both FAIL =>
+                    # process-wide allocator (VMM/MemPool) makes nothing IPC-shareable.
+                    def _probe(label, t):
+                        try:
+                            t.untyped_storage()._share_cuda_()
+                            return f"{label}=OK(ptr={hex(t.untyped_storage().data_ptr())})"
+                        except Exception as e:
+                            return f"{label}=FAIL({type(e).__name__})"
+                    probes = [
+                        _probe("tiny_4KB", torch.empty(4096, dtype=torch.uint8, device=flat.device)),
+                        _probe("same_size", torch.empty(flat.numel(), dtype=torch.uint8,
+                                                        device=flat.device)),
+                    ]
+                    logger.error(f"[update_weights] IPC probe: {' '.join(probes)}")
+                    st = flat.untyped_storage()
+                    logger.error(
+                        f"[update_weights] CUDA IPC serialize FAILED after retry: "
+                        f"{type(exc).__name__}: {exc}\n"
+                        f"  flat: shape={tuple(flat.shape)} dtype={flat.dtype} "
+                        f"numel={flat.numel()} device={flat.device} "
+                        f"contiguous={flat.is_contiguous()}\n"
+                        f"  storage: nbytes={st.nbytes()} data_ptr={hex(st.data_ptr())}\n"
+                        f"  bucket: {len(nonempty)} tensors, "
+                        f"numels={[t.numel() for _, t in nonempty[:8]]}"
+                    )
+                    raise
 
         # Gather TP shards: all ranks in the gather group participate,
         # but only the gather source (TP rank 0) collects the results.

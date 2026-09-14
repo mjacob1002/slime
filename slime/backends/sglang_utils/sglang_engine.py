@@ -76,6 +76,35 @@ def abort_request_at(server_url: str, rid: str, timeout: float = 5.0) -> bool:
         return False
 
 
+async def abort_request_at_async(server_url: str, rid: str, timeout: float = 5.0) -> bool:
+    """Async twin of abort_request_at, for callers already on an event loop.
+
+    The synchronous version uses `requests.post`, which BLOCKS the calling thread. slime
+    runs everything on one event loop in one background thread (slime/utils/async_utils.py),
+    and `_execute_migration` calls the abort inline from that loop -- so every abort stalls
+    all coroutines in the process for up to `timeout`.
+
+    That is survivable at low migration rates and fatal at high ones. Measured 2026-08-18:
+    migration threshold 32 issues ~128 migrations over 15 rollouts and is stable, while
+    threshold 64 issues ~237, and the accumulated event-loop stalls starved the aiohttp
+    client badly enough to produce a 374-attempt /generate retry storm that killed the run
+    at rollout 12/15.
+
+    Uses httpx's async client rather than slime.utils.http_utils.post, because that helper
+    retries up to 60 times -- wrong for an abort, where a 404 means "already finished" and
+    must be reported immediately rather than retried.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(f"{server_url}/abort_request", json={"rid": rid})
+            return response.is_success
+    except Exception as e:  # noqa: BLE001 - abort is best effort, never fatal
+        logger.warning(f"abort_request_at_async({server_url}, rid={rid}) failed: {e}")
+        return False
+
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 

@@ -28,6 +28,8 @@ Constraints:
 """
 import json
 import logging
+import os
+import threading
 import time
 
 import ray
@@ -36,17 +38,44 @@ from slime.ray.elastic_actor import RayElasticGroup
 from slime.ray.placement_group import create_placement_groups
 from slime.ray.streaming_work_queue import StreamingWorkQueue
 from slime.ray.streaming_rollout import StreamingRolloutManager
+from slime.router.threshold_tuner import collect_observation, make_threshold_tuner
 from slime.router.group_switch_controller import (
     FlipDecisionContext,
     make_group_switch_controller,
+)
+from slime.router.migration_policy import (
+    StreamTrainerMigration,
+    resolve_migration_policy_cls,
 )
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
 from slime.utils.misc import should_run_periodic_action
 from slime.utils.perfetto_tracer import get_tracer, init_tracer
 from slime.utils.tracking_utils import init_tracking, log as track_log
+from slime.utils.train_metrics import append_train_metrics
 
 logger = logging.getLogger(__name__)
+
+
+
+def _grab_policy_kwargs(args, total_gpus: int) -> dict:
+    """Parameters for the selected grab policy, or {} if it takes none.
+
+    Only `rollpacker_prefetch` is parameterized. `train_world_size` is the
+    total number of training GPUs, matching RollPacker's
+    `actor_train.world_size` in
+    `max_number_of_preftch_completed_prompts = batch_size_of_all_domains
+     - actor_train.world_size`.
+    """
+    if getattr(args, "grab_policy", None) != "rollpacker_prefetch":
+        return {}
+    return {
+        "scaling_down_train_batch_size": int(
+            getattr(args, "rollpacker_scaling_down_train_batch_size", 64)
+        ),
+        "train_world_size": int(total_gpus),
+        "div_multiplier": int(getattr(args, "rollpacker_div_multiplier", 0)),
+    }
 
 
 def validate_streaming_args(args):
@@ -63,6 +92,80 @@ def validate_streaming_args(args):
     assert args.num_elastic_nodes > 0 or args.num_elastic_gpus_per_node > 0, (
         "Streaming training requires elastic nodes"
     )
+
+
+class _StallWatchdog:
+    """Hard-kill the driver if a rollout stops making progress.
+
+    Motivating incident (2026-08-17): an SGLang engine failed to re-allocate KV cache on
+    `resume_memory_occupation` but the endpoint returned HTTP 200. The next collective
+    hung, the NCCL heartbeat monitor killed the training workers ~30 minutes later, and
+    the driver then blocked on `ray.get()` against dead actors. The job sat "RUNNING" for
+    4.5 hours after 22 minutes of useful work, emitting nothing but raylet disk warnings —
+    indistinguishable from healthy progress to any log watcher.
+
+    A watchdog *thread* is required rather than an in-loop check, because the main thread
+    is the thing that blocks. `os._exit` is deliberate: a hung `ray.get` will not unwind
+    from an exception raised in another thread, and SystemExit would be swallowed.
+
+    Disabled by default (0). Set --streaming-stall-timeout-s to enable; pick a few times
+    the expected per-rollout wall time.
+    """
+
+    def __init__(self, stall_seconds: float):
+        self.stall_seconds = stall_seconds
+        self._last = time.time()
+        self._stage = "startup"
+        self._lock = threading.Lock()
+        self._thread = None
+
+    def mark(self, stage: str):
+        """Record forward progress. Cheap; call at each phase boundary."""
+        with self._lock:
+            self._last = time.time()
+            self._stage = stage
+
+    def start(self):
+        if self.stall_seconds <= 0:
+            print("[WATCHDOG] disabled (--streaming-stall-timeout-s not set)", flush=True)
+            return
+
+        def _loop():
+            while True:
+                time.sleep(10.0)
+                with self._lock:
+                    idle = time.time() - self._last
+                    stage = self._stage
+                if idle > self.stall_seconds:
+                    msg = (
+                        f"[WATCHDOG] STALLED: no progress for {idle:.0f}s "
+                        f"(limit {self.stall_seconds:.0f}s), last stage={stage!r}. "
+                        f"Most likely an inference engine died or a collective hung — check "
+                        f"engine logs for 'cudaError 2 (out of memory)' from "
+                        f"torch_memory_saver, and the training actors for NCCL "
+                        f"HeartbeatMonitor / TCPStore errors. Killing the driver so the "
+                        f"failure is visible instead of silently wedging the run."
+                    )
+                    logger.error(msg)
+                    print(msg, flush=True)
+                    try:
+                        import subprocess
+
+                        subprocess.run(
+                            ["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu",
+                             "--format=csv,noheader"],
+                            timeout=15,
+                        )
+                    except Exception:
+                        pass
+                    os._exit(17)
+
+        self._thread = threading.Thread(target=_loop, daemon=True, name="stall-watchdog")
+        self._thread.start()
+        # print(), not logger: driver-side logger.info does not reach the captured job
+        # output, so a logged-only confirmation is invisible and indistinguishable from
+        # the watchdog silently not running.
+        print(f"[WATCHDOG] armed: fail if no progress for {self.stall_seconds:.0f}s", flush=True)
 
 
 def train(args):
@@ -152,6 +255,15 @@ def train(args):
         migration_preserve_tokens=bool(getattr(args, "migration_preserve_tokens", False)),
         migration_dst_usage_cap=float(getattr(args, "migration_dst_usage_cap", 0.70)),
         migration_min_src_usage=float(getattr(args, "migration_min_src_usage", 0.05)),
+        max_train_switches_per_step=getattr(args, "max_train_switches_per_step", None),
+        stream_trainer_scale_down_ratio=float(
+            getattr(args, "stream_trainer_scale_down_ratio", 0.40)),
+        stream_trainer_flip_fraction=float(
+            getattr(args, "stream_trainer_flip_fraction", 0.50)),
+        stream_trainer_max_running_requests=int(
+            getattr(args, "stream_trainer_max_running_requests", 2048)),
+        stream_trainer_max_completion_frac=float(
+            getattr(args, "stream_trainer_max_completion_frac", 0.50)),
     )
 
     # Training loop
@@ -175,20 +287,46 @@ def train(args):
         engines_per_train_group=engines_per_train_group,
         expected_items_per_rollout=args.rollout_batch_size,
         grab_policy_name=getattr(args, 'grab_policy', None),
+        grab_policy_kwargs=_grab_policy_kwargs(args, total_gpus),
     )
 
-    # Group switch controller. Default Eager (no budget) recovers
-    # pre-controller behaviour; --max-train-switches-per-step builds a
-    # BoundedSwitchController that caps G_train membership changes per
-    # rollout step (RollPacker StreamTrainer uses 2).
+    # Group switch controller. The migration policy CLASS decides which one
+    # it needs (base default = Eager, i.e. pre-controller behaviour); an
+    # explicit --max-train-switches-per-step overrides with Bounded.
     flip_controller = make_group_switch_controller(args)
+    # Third control-plane piece: sets B (--migration-batch-threshold) between rollouts.
+    # Default 'fixed' never changes it, so this is inert unless --threshold-tuner is set.
+    threshold_tuner = make_threshold_tuner(args)
+    tuner_apply = bool(int(getattr(args, "tuner_apply", 0) or 0))
+    tuned_threshold = threshold_tuner.current
+    # Resolved from the policy class, not the arg string, so a StreamTrainer
+    # subclass is recognised without being named here.
+    is_stream_trainer = issubclass(
+        resolve_migration_policy_cls(args), StreamTrainerMigration
+    )
     logger.info(
         f"[DRIVER] Group switch controller: {type(flip_controller).__name__} "
-        f"(max_train_switches_per_step={getattr(args, 'max_train_switches_per_step', None)})"
+        f"(migration_policy={getattr(args, 'migration_policy', 'none')}, "
+        f"is_stream_trainer={is_stream_trainer}, "
+        f"max_train_switches_per_step={getattr(args, 'max_train_switches_per_step', None)})"
     )
+    # print(), not logger: driver-side logger.info does not reach the captured
+    # ray-job output (same reason the watchdog prints). Everything downstream
+    # that asserts on flip behaviour reads these lines out of run.log.
+    print(
+        f"[PRINT_INFO][DRIVER] switch_controller={type(flip_controller).__name__} "
+        f"is_stream_trainer={is_stream_trainer}",
+        flush=True,
+    )
+
+    watchdog = _StallWatchdog(
+        stall_seconds=float(getattr(args, "streaming_stall_timeout_s", 0) or 0)
+    )
+    watchdog.start()
 
     all_rollout_metrics = []
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        watchdog.mark(f"rollout {rollout_id} start")
         logger.info(f"[DRIVER] === Streaming rollout {rollout_id} (V1 work-stealing) ===")
         print(f"[PRINT_VERSION][DRIVER] === Streaming rollout {rollout_id} (V1 work-stealing) ===")
         rollout_start = time.time()
@@ -239,6 +377,14 @@ def train(args):
         # The work queue's get_newly_completed_train_groups() is
         # consumed-on-read, so the driver — not the queue — holds the backlog.
         pending_flips: set[int] = set()
+        # perf_counter at which each group became flip-eligible. The gap
+        # between that and its actual flip is real idle GPU time whenever a
+        # switch controller holds the group (StreamTrainer holds every group
+        # that was not part of the scale-down), so it gets its own trace span
+        # rather than showing up as an unlabelled hole.
+        flip_pending_since: dict[int, float] = {}
+        scale_down_seen: set[int] = set()
+        last_held: list[int] = []
 
         while len(completed) < num_train_groups:
             time.sleep(0.1)  # poll interval
@@ -289,9 +435,41 @@ def train(args):
             # The work queue's RPC is consumed-on-read, so anything it surfaces
             # joins pending_flips; the controller then decides which (if any) of
             # the pending candidates may flip this tick.
+            # StreamTrainer publishes G_free (the train groups its scale-down
+            # emptied) through the work queue; the controller admits exactly
+            # those as transition 1 and holds everything else until inference
+            # completes. No-op for every other policy — the set stays empty and
+            # the base controller ignores it.
+            if is_stream_trainer:
+                scale_down_groups = ray.get(work_queue.get_scale_down_groups.remote())
+                if scale_down_groups:
+                    fresh = set(scale_down_groups) - scale_down_seen
+                    if fresh:
+                        scale_down_seen.update(fresh)
+                        get_tracer().instant(
+                            "stream_trainer_scale_down", device="driver",
+                            rollout_id=rollout_id,
+                            scale_down_train_groups=sorted(scale_down_groups),
+                            num_train_groups=num_train_groups,
+                            completed_train_groups=len(completed),
+                        )
+                        logger.info(
+                            f"[DRIVER] StreamTrainer scale-down: train groups "
+                            f"{sorted(scale_down_groups)} may flip now"
+                        )
+                        print(
+                            f"[PRINT_INFO][DRIVER] SCALE-DOWN rollout={rollout_id} "
+                            f"groups={sorted(scale_down_groups)}",
+                            flush=True,
+                        )
+                    flip_controller.on_scale_down(list(scale_down_groups))
+
             newly_done_groups = ray.get(work_queue.get_newly_completed_train_groups.remote())
             if newly_done_groups:
                 pending_flips.update(newly_done_groups)
+                now_pending = time.perf_counter()
+                for g in newly_done_groups:
+                    flip_pending_since.setdefault(g, now_pending)
             if pending_flips:
                 flip_ctx = FlipDecisionContext(
                     num_train_groups=num_train_groups,
@@ -302,12 +480,29 @@ def train(args):
                 admitted = []
             for group_rank in admitted:
                 switch_start = time.time()
+                switch_start_perf = time.perf_counter()
                 if first_engine_switch_time is None:
                     first_engine_switch_time = switch_start
+                # The group was drained but not training for this long. Zero
+                # under EagerSwitchController; non-zero whenever a controller
+                # held it (the price of StreamTrainer's two-transition rule).
+                held_since = flip_pending_since.pop(group_rank, None)
+                if held_since is not None and switch_start_perf - held_since > 1e-3:
+                    get_tracer().emit(
+                        "flip_hold", device=gpus_per_group_cache[group_rank],
+                        start=held_since, end=switch_start_perf,
+                        rollout_id=rollout_id, train_group=group_rank,
+                        held_s=round(switch_start_perf - held_since, 3),
+                    )
                 logger.info(f"[DRIVER] Train group {group_rank} fully done, switching to training...")
                 # Switch this train group to training (non-collective, per-group).
                 # Idempotent w.r.t. already-sleeped engines.
                 elastic_group.switch_engine_to_training(group_rank)
+                get_tracer().emit(
+                    "switch_to_training", device=gpus_per_group_cache[group_rank],
+                    start=switch_start_perf, end=time.perf_counter(),
+                    rollout_id=rollout_id, train_group=group_rank,
+                )
 
                 # Start work-stealing training loop on all actors in group (non-blocking)
                 logger.info(f"[DRIVER] Starting work-stealing train for group {group_rank}...")
@@ -331,6 +526,23 @@ def train(args):
             # batch of K flips is one G_train membership change.
             if admitted:
                 flip_controller.on_flipped(list(admitted))
+                print(
+                    f"[PRINT_INFO][DRIVER] FLIP-BATCH rollout={rollout_id} "
+                    f"groups={sorted(admitted)} "
+                    f"({len(completed)}/{num_train_groups} in training)",
+                    flush=True,
+                )
+            # Print only on change — the poll runs at 10 Hz and a held group can
+            # sit for minutes.
+            held_now = sorted(set(pending_flips) - set(admitted))
+            if held_now != last_held:
+                last_held = held_now
+                if held_now:
+                    print(
+                        f"[PRINT_INFO][DRIVER] FLIP-HOLD rollout={rollout_id} "
+                        f"groups={held_now} (drained, waiting for inference to finish)",
+                        flush=True,
+                    )
 
             # Final drain: an engine_completed() call can land between the
             # get_newly_completed_engines() RPC above and the
@@ -348,7 +560,9 @@ def train(args):
 
         # Ensure generation task is fully done (cleanup)
         logger.info("[DRIVER] Waiting for generate to finish (ray.get(gen_ref))...")
+        watchdog.mark(f"rollout {rollout_id} awaiting generate")
         gen_result = ray.get(gen_ref)
+        watchdog.mark(f"rollout {rollout_id} generate done")
         logger.info("[DRIVER] generate finished")
 
         # Wait for all work-stealing training loops to finish
@@ -478,7 +692,59 @@ def train(args):
 
         rollout_elapsed = time.time() - rollout_start
         logger.info(f"[DRIVER] Streaming rollout {rollout_id} completed in {rollout_elapsed:.2f}s")
+        watchdog.mark(f"rollout {rollout_id} complete")
         print(f"Streaming rollout {rollout_id} took {rollout_elapsed:.2f}s")
+
+        # ---- threshold tuner: observe this rollout, choose B for the next -----------
+        # Placed here because the driver's tracer event list already holds this
+        # rollout's complete per-GPU training/chunk/ws spans (every streaming emit is
+        # driver-side), so the observation needs no new instrumentation and is
+        # byte-identical to what perf_analysis/compare_gpu_time.py reports offline.
+        tuner_obs = collect_observation(
+            rollout_id=rollout_id, threshold=tuned_threshold, wall_s=rollout_elapsed,
+        )
+        if tuner_obs is not None:
+            proposed = threshold_tuner.update(tuner_obs)
+            effective = tuned_threshold
+            if tuner_apply and proposed != tuned_threshold:
+                effective = ray.get(
+                    streaming_rollout_mgr.set_migration_threshold.remote(proposed)
+                )
+                # -1 means the active policy has no threshold to steer (none /
+                # stream_trainer). Keep tracking our own value so the log stays honest.
+                tuned_threshold = proposed if effective == -1 else effective
+            elif tuner_apply:
+                tuned_threshold = proposed
+            append_train_metrics({
+                "phase": "tuner_decision",
+                "rollout_id": rollout_id,
+                "tuner": type(threshold_tuner).__name__,
+                "applied": tuner_apply,
+                "b_before": tuner_obs.threshold,
+                "b_proposed": proposed,
+                "b_effective": tuned_threshold,
+                "idle_ratio": round(tuner_obs.idle_ratio, 6),
+                "training_span_gpu_s": round(tuner_obs.training_span_gpu_s, 3),
+                "busy_gpu_s": round(tuner_obs.busy_gpu_s, 3),
+                # Idle split into the starvation B causes (interior) and the barrier
+                # wait it does not (trailing). Logged for EVERY tuner, including
+                # 'fixed', so any finished run can be replayed against a tuner that
+                # watches either term.
+                "interior_idle_gpu_s": round(tuner_obs.interior_idle_gpu_s or 0.0, 3),
+                "trailing_idle_gpu_s": round(tuner_obs.trailing_idle_gpu_s or 0.0, 3),
+                "interior_idle_ratio": round(tuner_obs.interior_idle_ratio or 0.0, 6),
+                "wall_s": round(rollout_elapsed, 3),
+                "reason": threshold_tuner.explain(),
+                "timestamp": time.time(),
+            })
+            print(
+                f"[PRINT_INFO][TUNER] rollout {rollout_id}: idle_ratio="
+                f"{tuner_obs.idle_ratio:.4f} interior={tuner_obs.interior_idle_ratio:.5f} "
+                f"B {tuner_obs.threshold}->{tuned_threshold}"
+                f"{'' if tuner_apply else ' (SHADOW, not applied)'} :: "
+                f"{threshold_tuner.explain()}",
+                flush=True,
+            )
 
         # Overlap: how much training overlapped with inference
         overlap_time = last_engine_done_time - first_engine_switch_time

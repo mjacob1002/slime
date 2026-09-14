@@ -149,7 +149,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default="tail_split",
                 choices=("bulk", "tail_split", "graduated_tail_split",
-                         "all_engines_training"),
+                         "all_engines_training", "rollpacker_prefetch"),
                 help=(
                     "Streaming work-queue grab policy. 'bulk' = legacy "
                     "max_items_per_grab only. 'tail_split' = also cap at 1 "
@@ -164,6 +164,100 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollpacker-scaling-down-train-batch-size",
+                type=int,
+                default=64,
+                help=(
+                    "Only for --grab-policy rollpacker_prefetch. Fixed per-grab "
+                    "prompt-group count, mirroring RollPacker's "
+                    "scaling_down_train_batch_size (64 in their Table 3 config). "
+                    "Unlike the tail-split policies this never steps down."
+                ),
+            )
+            parser.add_argument(
+                "--rollpacker-div-multiplier",
+                type=int,
+                default=0,
+                help=(
+                    "Only for --grab-policy rollpacker_prefetch. Truncate each "
+                    "grab to a multiple of this, mirroring RollPacker's "
+                    "div_multipler = 2 * per_device_train_batch_size * "
+                    "pg_world_size // num_return_sequences_in_group. 0 disables "
+                    "(their own formula evaluates to <=1 at slime's Exp1a shape, "
+                    "so truncation is inert there)."
+                ),
+            )
+            parser.add_argument(
+                "--streaming-profile-chunks",
+                type=int,
+                default=0,
+                help=(
+                    "Capture a torch.profiler Chrome trace over the first N work-stealing "
+                    "chunks of rollout 0 (0 = off). Scoped to a few chunks on purpose: the "
+                    "per-chunk overhead under investigation is a fixed ~1.2 s that repeats "
+                    "identically every chunk, so a handful is enough to attribute it, while "
+                    "a whole-rollout CPU+CUDA capture would be enormous."
+                ),
+            )
+            parser.add_argument(
+                "--streaming-profile-dir",
+                type=str,
+                default="/workspace/slime/logs/text2sql/torch_profiles",
+                help="Output directory for --streaming-profile-chunks Chrome traces.",
+            )
+            parser.add_argument(
+                "--streaming-profile-ranks",
+                type=str,
+                default="0",
+                help=(
+                    "Comma-separated global ranks to profile, or 'all'. Default rank 0 only "
+                    "-- one rank is enough to characterise per-chunk overhead and keeps the "
+                    "trace size manageable."
+                ),
+            )
+            parser.add_argument(
+                "--streaming-profile-with-stack",
+                action="store_true",
+                default=False,
+                help=(
+                    "Include Python call stacks in the profile. Needed to attribute time to "
+                    "specific call sites (e.g. clear_memory) rather than just to CUDA API "
+                    "calls. Higher overhead and much larger traces."
+                ),
+            )
+            parser.add_argument(
+                "--streaming-stall-timeout-s",
+                type=float,
+                default=0.0,
+                help=(
+                    "Kill train_streaming.py if no rollout phase makes progress for this "
+                    "many seconds. 0 disables. Exists because a silent engine death wedges "
+                    "the driver indefinitely: SGLang's /resume_memory_occupation returns 200 "
+                    "even when torch_memory_saver fails to re-allocate KV cache, so the next "
+                    "collective hangs, NCCL's heartbeat monitor kills the training workers, "
+                    "and ray.get() blocks forever while the job still reports RUNNING. Set "
+                    "to a few times the expected per-rollout wall time."
+                ),
+            )
+            parser.add_argument(
+                "--allow-migration-with-custom-generate",
+                action="store_true",
+                default=False,
+                help=(
+                    "Permit --migration-policy other than 'none' together with "
+                    "--custom-generate-function-path. Off by default because the "
+                    "combination fails as a silent hang, not an error: migration aborts "
+                    "in-flight work via `[s.rid for s in group if s.rid]`, so a custom "
+                    "generate function that never assigns sample.rid leaves nothing to "
+                    "abort and the router's `await src_task` blocks until the trajectory "
+                    "finishes on its own -- stalling the whole dispatch loop, since "
+                    "migrations run inline in it. Multi-turn functions additionally need "
+                    "to honour metadata['migrate_requested'] at each turn boundary, "
+                    "because between turns there is no in-flight request for any rid to "
+                    "name. Pass this only if your generate function does both."
+                ),
+            )
+            parser.add_argument(
                 "--perfetto-trace-path",
                 type=str,
                 default=None,
@@ -172,14 +266,114 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "at the end of the run. If not set, tracing is disabled (zero overhead)."
                 ),
             )
+            # ---- automatic tuning of --migration-batch-threshold (B) ----------------
+            # B is hand-picked today and does not transfer between workloads: the measured
+            # optimum is ~32 on Text2SQL (Qwen3-8B) and ~96 on DAPO-math (DeepSeek-8B).
+            # These drive slime/router/threshold_tuner.py, which runs in the driver once
+            # per rollout. Default 'fixed' never changes B, so runs are unchanged.
+            parser.add_argument(
+                "--threshold-tuner",
+                type=str,
+                default="fixed",
+                choices=("fixed", "idle_ratio", "idle_threshold", "interior_idle"),
+                help=(
+                    "Automatically retune --migration-batch-threshold between rollouts. "
+                    "'fixed' (default) never changes it -- the control arm. 'idle_ratio' "
+                    "drives B from GPU-idle time during the training phase as a fraction "
+                    "of training-phase GPU-time: below its per-run baseline there is "
+                    "headroom so migrate more aggressively, above it training is starving "
+                    "so back off. Only affects policies that HAVE a threshold "
+                    "'idle_threshold' is the same signal without the smoothing: a plain "
+                    "bang-bang test against the absolute --tuner-idle-target, moving B by "
+                    "one step every rollout with no hold state. Only affects policies "
+                    "that HAVE a threshold "
+                    "(train_group_batch_threshold*); it is inert for 'none' and "
+                    "'stream_trainer*'. 'interior_idle' is the same bang-bang law as "
+                    "'idle_threshold' but watches ONLY interior idle -- the "
+                    "between-chunk starvation where a training GPU polls an empty work "
+                    "queue -- instead of the combined idle_ratio, ~98%% of which is the "
+                    "post-last-chunk wait for the global barrier, a quantity the GRAB "
+                    "policy governs and B barely moves. Threshold on it with "
+                    "--tuner-interior-target."
+                ),
+            )
+            parser.add_argument(
+                "--tuner-apply",
+                type=int,
+                default=0,
+                choices=(0, 1),
+                help=(
+                    "1 = push the tuner's decisions to the live policy. 0 (default) = "
+                    "SHADOW MODE: compute and log what the tuner would do without "
+                    "changing B. Shadow mode exists because a bad control law costs a "
+                    "multi-hour run and the ~4.4%% wall-clock noise floor makes a single "
+                    "bad run hard to attribute after the fact."
+                ),
+            )
+            parser.add_argument("--tuner-b-min", type=int, default=8,
+                                help="Lower clamp for the tuned threshold. Never 0: "
+                                     "disabling migration must be an explicit "
+                                     "--migration-policy none, not a controller outcome.")
+            parser.add_argument("--tuner-b-max", type=int, default=256,
+                                help="Upper clamp for the tuned threshold.")
+            parser.add_argument("--tuner-step", type=int, default=16,
+                                help="Maximum change in B per rollout. Bounds the blast "
+                                     "radius of one bad reading.")
+            parser.add_argument("--tuner-warmup", type=int, default=3,
+                                help="Rollouts spent calibrating the per-run baseline "
+                                     "before the tuner may move B. The baseline MUST be "
+                                     "learned per run -- absolute idle-ratio levels are "
+                                     "workload-specific (Text2SQL 4-7%%, DAPO 2.7-2.9%%).")
+            parser.add_argument("--tuner-ewma-alpha", type=float, default=0.4,
+                                help="EWMA weight on the newest rollout. The raw signal "
+                                     "has a measured CV of 26-36%% at fixed B, so acting "
+                                     "on a single rollout is a random walk.")
+            parser.add_argument("--tuner-dead-band", type=float, default=0.20,
+                                help="Fractional band around the baseline in which B is "
+                                     "held.")
+            parser.add_argument("--tuner-patience", type=int, default=2,
+                                help="Consecutive out-of-band rollouts required before B "
+                                     "moves; any in-band reading resets the streak. "
+                                     "Without this a baseline calibrated a few percent "
+                                     "off ratchets B in one direction on noise alone "
+                                     "(measured: 64 -> 32 on a stationary stream).")
+            parser.add_argument("--tuner-idle-target", type=float, default=0.03,
+                                help="ABSOLUTE idle-ratio target for --threshold-tuner "
+                                     "idle_threshold. Above it B drops by --tuner-step, "
+                                     "at or below it B rises. Unlike idle_ratio's learned "
+                                     "baseline this is workload-specific and must be set "
+                                     "per workload (measured means: ~2.6%% DAPO-math, "
+                                     "~4-7%% Text2SQL). Ignored by other tuners.")
+            parser.add_argument("--tuner-interior-target", type=float, default=None,
+                                help="ABSOLUTE interior-idle-ratio epsilon for "
+                                     "--threshold-tuner interior_idle. Below it B rises "
+                                     "by --tuner-step, above it B falls. Unset uses the "
+                                     "measured default 0.005. Interior idle separates "
+                                     "cleanly: healthy runs measured 0.00037-0.00079 "
+                                     "across B=64/96/none, while genuine starvation "
+                                     "measured 0.0145-0.304, so 0.005 sits ~6x above "
+                                     "the noise ceiling and ~3x below the smallest real "
+                                     "event. Deliberately a SEPARATE flag from "
+                                     "--tuner-idle-target: the two epsilons differ by "
+                                     "~6x and sharing one flag invites carrying a stale "
+                                     "value into a new arm.")
+            parser.add_argument("--tuner-skip-first", type=int, default=1, choices=(0, 1),
+                                help="1 (default) = ignore rollout 0 when tuning. Its "
+                                     "idle_ratio is startup-inflated (measured 771s vs "
+                                     "~560s steady state), so acting on it biases the "
+                                     "first decision. 0 = tune from rollout 0, useful on "
+                                     "very short runs where skipping it wastes a quarter "
+                                     "of the decisions.")
             parser.add_argument(
                 "--migration-policy",
                 type=str,
                 choices=[
                     "none", "train_group_aware", "train_group_aware_aggressive",
-                    "train_group_proactive", "stream_trainer", "stream_trainer_aggressive",
+                    "train_group_proactive", "stream_trainer", "stream_trainer_guarded",
+                    "stream_trainer_aggressive",
                     "train_group_batch_threshold",
                     "train_group_batch_threshold_aggressive",
+                    "train_group_batch_threshold_kv_gated",
                 ],
                 default="none",
                 help=(
@@ -202,40 +396,40 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Requires the driver to skip eager sleep_engine on that "
                     "lone group's engines; the gate is applied automatically "
                     "based on this CLI choice. "
-                    "'stream_trainer' is the RollPacker (arxiv:2509.21009 §4.4) "
-                    "StreamTrainer baseline: once the global completion fraction "
-                    "lands in [--stream-trainer-min-completion-frac, "
-                    "--stream-trainer-max-completion-frac], migrate in-flight "
-                    "work off --stream-trainer-flip-fraction of the train "
-                    "groups onto the survivors so those groups can flip to "
-                    "training while the rest finish decoding. Usually paired "
-                    "with --max-train-switches-per-step 2. "
-                    "'stream_trainer_aggressive' is the same but with the KV-cache "
-                    "feasibility gate (--migration-dst-usage-cap) DISABLED, matching "
-                    "RollPacker's actual code (no MeetScaleCriteria probe); it always "
-                    "scales down even if the survivors' projected KV exceeds capacity."
+                    "'stream_trainer' mirrors RollPacker's RELEASED CODE "
+                    "(github.com/Farrrrland/RollPacker), which differs from the "
+                    "paper (arxiv:2509.21009 §4.4): once global completion "
+                    "reaches --stream-trainer-scale-down-ratio (no upper bound, "
+                    "no progress throttle), migrate all in-flight work off the "
+                    "LAST --stream-trainer-flip-fraction of train groups onto "
+                    "the survivors, unconditionally — the paper's "
+                    "MeetScaleCriteria KV forecast does not exist in their code. "
+                    "Destinations are admitted while under "
+                    "--stream-trainer-max-running-requests, mirroring their "
+                    "get_available_dp_rank. "
+                    "'stream_trainer_guarded' adds the paper's KV-cache "
+                    "feasibility gate (--migration-dst-usage-cap) on top; use it "
+                    "when an ungated consolidation OOMs, but check the fire count "
+                    "— the gate has been measured firing zero times over 15 "
+                    "rollouts. 'stream_trainer_aggressive' is a DEPRECATED alias "
+                    "for 'stream_trainer' (the base is now ungated, so the "
+                    "distinction no longer exists)."
                 ),
             )
             parser.add_argument(
-                "--stream-trainer-min-completion-frac",
+                "--stream-trainer-scale-down-ratio",
+                "--stream-trainer-min-completion-frac",  # deprecated alias
+                dest="stream_trainer_scale_down_ratio",
                 type=float,
-                default=0.20,
+                default=0.40,
                 help=(
-                    "Lower bound of the [min, max] global completion window "
-                    "in which StreamTrainerMigration is permitted to fire. "
-                    "Default 0.20 matches RollPacker Algorithm 1, line 14."
-                ),
-            )
-            parser.add_argument(
-                "--stream-trainer-max-completion-frac",
-                type=float,
-                default=0.50,
-                help=(
-                    "Upper bound of the [min, max] global completion window "
-                    "in which StreamTrainerMigration is permitted to fire. "
-                    "If feasibility fails past this fraction, the policy "
-                    "latches and falls back to vanilla synchronous for the "
-                    "rest of the rollout. Default 0.50."
+                    "Global completion fraction at which StreamTrainer scales "
+                    "down. Mirrors RollPacker's infer_scaling_down_progress_ratio; "
+                    "0.40 is the value in their Table 3 config "
+                    "(examples/stream_trainer_table3/rlvr_config_stream_trainer_7B.yaml). "
+                    "Lower bound only — there is no upper window in their code. "
+                    "Values <= 0 disable the policy, matching their -1 default. "
+                    "--stream-trainer-min-completion-frac is a deprecated alias."
                 ),
             )
             parser.add_argument(
@@ -243,21 +437,37 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0.50,
                 help=(
-                    "Fraction of train groups to scale down (migrate work off) "
-                    "when StreamTrainerMigration fires. With 4 train groups "
-                    "and 0.5, two groups are victimised per fire. Must be in "
-                    "(0, 1). Default 0.50."
+                    "Fraction of train groups to scale down when StreamTrainer "
+                    "fires. Victims are the LAST n indices (positional and "
+                    "static, mirroring RollPacker's second_half_ranks), not "
+                    "ranked by load. With 4 train groups and 0.5, groups 2 and "
+                    "3 are victimised. Must be in (0, 1). Default 0.50."
                 ),
             )
             parser.add_argument(
-                "--stream-trainer-require-progress-step",
-                type=float,
-                default=0.05,
+                "--stream-trainer-max-running-requests",
+                type=int,
+                default=2048,
                 help=(
-                    "Minimum increase in global completion fraction between "
-                    "policy re-evaluations. Throttles the per-event hook so "
-                    "we don't recompute the migration plan on every group. "
-                    "RollPacker uses ΔR/|R| ≥ 0.05; default 0.05."
+                    "Per-destination cap on concurrent in-flight groups when "
+                    "placing migrated work. Mirrors RollPacker's "
+                    "max_running_requests (2048 in every shipped config, i.e. "
+                    "effectively non-binding at their batch sizes). If no "
+                    "survivor has headroom the scale-down is deferred to a "
+                    "later completion event rather than abandoned."
+                ),
+            )
+            parser.add_argument(
+                "--stream-trainer-max-completion-frac",
+                type=float,
+                default=0.50,
+                help=(
+                    "Only used by 'stream_trainer_guarded'. If its KV-cache "
+                    "feasibility gate is still failing past this completion "
+                    "fraction, the policy latches and falls back to vanilla "
+                    "synchronous for the rest of the rollout. Ignored by "
+                    "'stream_trainer', which has no feasibility gate to fail. "
+                    "Default 0.50."
                 ),
             )
             parser.add_argument(
@@ -283,6 +493,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Require the train group to have completed at least this many "
                     "prompt groups before the trigger is allowed to fire. Default 64 "
                     "(50%% of a group's original 128-group assignment)."
+                ),
+            )
+            parser.add_argument(
+                "--migration-kv-gate-latch-when-blocked",
+                action="store_true",
+                default=False,
+                help=(
+                    "Only for --migration-policy train_group_batch_threshold_kv_gated. "
+                    "Keep the parent's strict one-shot trigger: if the KV gate blocks "
+                    "some groups, the train group is still burned and never retries. "
+                    "Default (flag absent) releases the trigger when anything was "
+                    "blocked so the next completion re-evaluates against fresh "
+                    "/get_load probes, since destinations drain continuously. Set this "
+                    "to isolate the gate from the retry behaviour when comparing "
+                    "against train_group_batch_threshold."
                 ),
             )
             parser.add_argument(
@@ -1701,6 +1926,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
     return add_slime_arguments
 
 
+# Megatron core_v0.16 renamed several TransformerConfig fields and now auto-generates the
+# CLI from the dataclass, keeping the OLD flag names as aliases onto the NEW attributes:
+#   --norm-epsilon        -> args.layernorm_epsilon           (was args.norm_epsilon)
+#   --apply-layernorm-1p  -> args.layernorm_zero_centered_gamma (was args.apply_layernorm_1p)
+# The flags still parse, so scripts/models/*.sh are unaffected, but code reading the old
+# ATTRIBUTE names raises AttributeError on >=0.16. Map the old names back so slime works on
+# both core_v0.14 and core_v0.16+. Only sets what is missing, so 0.14 is untouched.
+_MEGATRON_RENAMED_ATTRS = {
+    "norm_epsilon": "layernorm_epsilon",
+    "apply_layernorm_1p": "layernorm_zero_centered_gamma",
+}
+
+
+def _apply_megatron_version_compat(args):
+    """Back-fill attribute names that Megatron renamed between core_v0.14 and core_v0.16."""
+    for old, new in _MEGATRON_RENAMED_ATTRS.items():
+        if not hasattr(args, old) and hasattr(args, new):
+            setattr(args, old, getattr(args, new))
+
+
 def parse_args(add_custom_arguments=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     configure_logger()
@@ -1714,6 +1959,7 @@ def parse_args(add_custom_arguments=None):
         from slime.backends.megatron_utils.arguments import validate_args as megatron_validate_args
 
         args = megatron_parse_args(extra_args_provider=add_slime_arguments)
+        _apply_megatron_version_compat(args)
         if args.hf_checkpoint:
             hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
             hf_validate_args(args, hf_config)
@@ -1794,6 +2040,34 @@ def parse_args(add_custom_arguments=None):
     if getattr(args, "migration_preserve_tokens", None) is None:
         args.migration_preserve_tokens = (
             getattr(args, "migration_policy", "none") not in (None, "none", "")
+        )
+
+    # A StreamTrainer policy brings its own GroupSwitchController (it enforces
+    # RollPacker's two G_train transitions: the scale-down batch, then the rest
+    # when inference completes). --max-train-switches-per-step builds a
+    # BoundedSwitchController instead, which caps transitions by COUNT with no
+    # idea which groups the scale-down actually emptied. Two controllers
+    # claiming the same decision is always a mistake, so reject rather than
+    # silently picking one.
+    # Resolved through the policy registry rather than a name prefix, so a
+    # StreamTrainer subclass is covered without being spelled out here.
+    # Imported lazily to keep arguments.py free of a router dependency.
+    from slime.router.migration_policy import (
+        StreamTrainerMigration,
+        resolve_migration_policy_cls,
+    )
+
+    _policy = getattr(args, "migration_policy", "none") or "none"
+    if issubclass(resolve_migration_policy_cls(args), StreamTrainerMigration) and (
+        getattr(args, "max_train_switches_per_step", None) is not None
+    ):
+        raise ValueError(
+            f"--migration-policy {_policy} already enforces RollPacker's two "
+            f"G_train transitions via StreamTrainerSwitchController; it cannot "
+            f"be combined with --max-train-switches-per-step "
+            f"({args.max_train_switches_per_step}). Drop the flag to use "
+            f"StreamTrainer's controller, or pick a different migration policy "
+            f"if you want the count-based BoundedSwitchController."
         )
 
     return args

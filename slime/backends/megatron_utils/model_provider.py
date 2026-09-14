@@ -91,7 +91,13 @@ def get_model_provider_func(
         provider.finalize()
         return provider.provide
 
-    def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
+    def model_provider(
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: int | None = None,
+        config: "TransformerConfig | None" = None,
+        pg_collection=None,
+    ) -> GPTModel:
         """Builds the model.
 
         If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -99,15 +105,24 @@ def get_model_provider_func(
         Args:
             pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
             post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
-
+            vp_stage (int, optional): Virtual pipeline stage.
+            config (TransformerConfig, optional): Megatron >=core_v0.16 builds the config in
+                get_model() and passes it here; older versions do not pass it at all. When it
+                is None we build it ourselves, so this works on both.
+            pg_collection (ProcessGroupCollection, optional): Megatron >=core_v0.16 passes the
+                process-group collection it resolved (defaulting to the global mpu groups) and
+                expects it threaded into the model. Not passed by older versions.
 
         Returns:
             Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
         """
         use_te = args.transformer_impl == "transformer_engine"
 
-        # Experimental loading arguments from yaml
-        config: TransformerConfig = core_transformer_config_from_args(args)
+        # Megatron core_v0.16+ hands us a config; older releases do not. Prefer the one we are
+        # given (it is what get_model() will validate the model against) and only fall back to
+        # building it from args for pre-0.16 Megatron.
+        if config is None:
+            config = core_transformer_config_from_args(args)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -177,6 +192,14 @@ def get_model_provider_func(
 
         if vp_stage is not None:
             kwargs["vp_stage"] = vp_stage
+
+        # Thread through the process-group collection Megatron core_v0.16+ resolved for us.
+        # Omitting it would leave GPTModel to fall back to the global mpu groups -- harmless at
+        # TP=1/PP=1 but NOT equivalent once tensor/pipeline parallelism is on, which is exactly
+        # the configuration the benchmarks run. Guarded so pre-0.16 Megatron (which neither
+        # passes nor accepts it) is unaffected.
+        if pg_collection is not None:
+            kwargs["pg_collection"] = pg_collection
 
         if args.mtp_num_layers:
             from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec

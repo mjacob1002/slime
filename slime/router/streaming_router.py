@@ -23,13 +23,14 @@ from typing import Any
 
 import ray
 
-from slime.backends.sglang_utils.sglang_engine import abort_request_at
+from slime.backends.sglang_utils.sglang_engine import abort_request_at_async
 from slime.router.migration_feasibility import MigrationFeasibilityChecker
 from slime.router.migration_policy import (
     MigrationContext,
     MigrationDecision,
     MigrationPolicy,
     NoMigration,
+    StreamTrainerMigration,
 )
 from slime.utils.ray_utils import Box
 from slime.utils.types import Sample
@@ -96,6 +97,10 @@ class StreamingRouter:
                 f"dst_usage_cap={dst_cap}, min_src_usage={min_src}"
             )
 
+        # G_free as last published to the work queue; re-set per rollout in
+        # dispatch_and_collect so a re-fire after reset is published again.
+        self._published_scale_down_groups: list[int] = []
+
     # ---------- topology helpers (also exposed to MigrationContext) ----------
 
     def _train_group_for_engine(self, engine: int) -> int:
@@ -104,6 +109,36 @@ class StreamingRouter:
     def _engines_for_train_group(self, group: int) -> list[int]:
         start = group * self.engines_per_train_group
         return list(range(start, start + self.engines_per_train_group))
+
+    def _publish_scale_down_groups(self) -> None:
+        """Forward the StreamTrainer scale-down's G_free to the work queue.
+
+        RollPacker Algorithm 1 line 15 picks a set of GPUs to repurpose; the
+        driver's `StreamTrainerSwitchController` needs to know which train
+        groups those were, so it can admit exactly them as transition 1 and
+        hold anything that merely drained early. The work queue is the channel
+        because it is the one object both this router (inside the rollout
+        actor) and the driver already hold handles to.
+
+        Gated on the policy TYPE, not on "a policy returned decisions", so no
+        other migration policy can populate G_free even by accident.
+        """
+        if not isinstance(self.migration_policy, StreamTrainerMigration):
+            return
+        victims = list(self.migration_policy.last_scale_down_groups)
+        if not victims or victims == self._published_scale_down_groups:
+            return
+        self._published_scale_down_groups = victims
+        work_queue = getattr(self, "work_queue", None)
+        if work_queue is None:
+            logger.warning(
+                f"[ROUTER] scale-down emptied train groups {victims} but no "
+                f"work_queue is attached — the driver will not learn about it "
+                f"and those groups will be held until inference completes"
+            )
+            return
+        ray.get(work_queue.record_scale_down_groups.remote(victims))
+        logger.info(f"[ROUTER] published scale-down train groups {victims} to work queue")
 
     def _parse_engine_urls(self) -> dict[int, Any]:
         """Parse engine URLs into per-engine args with host/port overrides."""
@@ -157,6 +192,7 @@ class StreamingRouter:
 
         # Reset migration policy state at the start of every rollout.
         self.migration_policy.reset()
+        self._published_scale_down_groups: list[int] = []
 
         # Split samples across engines
         samples_per_engine = self._split_samples_across_engines(samples)
@@ -272,18 +308,52 @@ class StreamingRouter:
                 return
 
             src_url = self.engine_urls[decision.src_engine]
+
+            # Cooperative cancellation, for multi-turn generate functions.
+            #
+            # An rid names a live request inside SGLang's scheduler. A multi-turn
+            # trajectory that is between turns (running a tool) has NO request in flight,
+            # so its cached `sample.rid` is the previous, already-retired turn's: the abort
+            # below 404s, nothing stops, and the trajectory happily issues its next turn on
+            # the engine we are trying to drain. `await src_task` would then block until
+            # the entire remaining trajectory finished -- and because migrations execute
+            # inline in the completion loop, that stalls all harvesting, so no other engine
+            # can drain or flip either.
+            #
+            # Setting this flag first gives such a loop a way to stop at its next turn
+            # boundary. It must be set BEFORE the first suspension point below (the awaits
+            # in the abort/settle path), so a coroutine that wakes up in between observes
+            # it. Single-turn generate functions ignore the flag entirely.
+            for sample in decision.group:
+                if sample.metadata is None:
+                    sample.metadata = {}
+                sample.metadata["migrate_requested"] = True
+
             rids = [s.rid for s in decision.group if s.rid]
             logger.info(
                 f"[MIGRATION] aborting {len(rids)} rid(s) on engine {decision.src_engine} "
                 f"-> dst engine {decision.dst_engine} ({decision.reason})"
             )
-            for rid in rids:
-                ok = abort_request_at(src_url, rid)
-                logger.info(f"[MIGRATION] abort_request_at({src_url}, {rid}) ok={ok}")
+            # Concurrently, and without blocking the event loop. The sync
+            # abort_request_at uses requests.post, which stalls every coroutine
+            # in the process for up to its timeout; a StreamTrainer scale-down
+            # fires one large plan (every in-flight group on half the engines),
+            # so serial blocking aborts would freeze all harvesting for the
+            # duration of the fire. See abort_request_at_async's docstring for
+            # the run this killed.
+            if rids:
+                results = await asyncio.gather(
+                    *(abort_request_at_async(src_url, rid) for rid in rids)
+                )
+                logger.info(
+                    f"[MIGRATION] aborted {sum(1 for ok in results if ok)}/"
+                    f"{len(rids)} rid(s) on {src_url}"
+                )
 
             # Wait for the original task to settle. It may raise on abort or
-            # return abort-flagged samples; either is acceptable — we discard
-            # whatever state was accumulated and re-dispatch from scratch.
+            # return abort-flagged samples; either is acceptable. What we do
+            # with the accumulated state depends on --migration-preserve-tokens
+            # (default True → keep the partial decode, see just below).
             try:
                 await src_task
             except Exception as e:
@@ -315,6 +385,12 @@ class StreamingRouter:
                 sample.status = Sample.Status.PENDING
                 sample.migrated_from = decision.src_engine
                 sample.rid = None  # will be re-allocated by generate()
+                # Clear the cancellation flag now that the source task has settled.
+                # Leaving it set would make the re-dispatched coroutine bail immediately at
+                # its first turn-boundary check and report ABORTED forever, so the group
+                # would never finish.
+                if sample.metadata:
+                    sample.metadata.pop("migrate_requested", None)
             if preserve_tokens and buffered_per_sample:
                 mean_buf = sum(buffered_per_sample) / len(buffered_per_sample)
                 logger.info(
@@ -456,8 +532,17 @@ class StreamingRouter:
                     decisions = await self.migration_policy.on_request_completed(
                         engine_rank, group_samples, ctx
                     )
+                    # Serial on purpose: _execute_migration mutates the
+                    # in_flight_groups / groups_currently_assigned / engine_status
+                    # bookkeeping across await points, so running decisions
+                    # concurrently would interleave those updates. The blocking
+                    # cost that used to matter — the per-rid abort — is now
+                    # gathered inside each call, so what remains here is a
+                    # non-blocking await that other coroutines run through.
                     for d in decisions:
                         await _execute_migration(d)
+                    if decisions:
+                        self._publish_scale_down_groups()
 
         # Record response lengths if configured
         if getattr(self.args, "profiling_record_lengths_path", None):

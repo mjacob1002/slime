@@ -31,6 +31,36 @@ from .model import finalize_model_grads_with_empty_cache
 logger = logging.getLogger(__name__)
 
 
+def _inchunk_clear_gateable() -> bool:
+    """Whether the two IN-CHUNK clear_memory() calls honour the reserved-memory gate.
+
+    These two calls (after actor logprob, after advantages) are the only clear_memory()
+    sites in the work-stealing path that NO existing knob reaches -- both
+    SLIME_CLEAR_MEM_RESERVED_GB and SLIME_CHUNK_MEMPOOL guard only the between-chunk call,
+    which surfaces in traces as `ws_clear_memory`. They are therefore unconditional today,
+    and they are what the `remainder` row of the GPU-time breakdown is made of: measured
+    0.340 GPU-h on DAPO t64 (~153 s wall on 8 GPUs, 2.6%) and 0.142 GPU-h on Text2SQL t64
+    (~64 s, 2.2%).
+
+    Gating them is a REAL behaviour change, not a no-op, so it is opt-in behind its own
+    env var rather than folded into SLIME_CLEAR_MEM_RESERVED_GB:
+
+      * default (unset/0) -> byte-identical to the previous unconditional calls, on every
+        workload including the DAPO-math benchmark;
+      * SLIME_GATE_INCHUNK_CLEAR_MEM=1 -> the pair honours the same
+        SLIME_CLEAR_MEM_RESERVED_GB threshold the between-chunk call already uses, so one
+        threshold governs all three and the change is A/B-testable by flipping one var.
+
+    Keeping it on a separate var matters because the two effects are otherwise
+    inseparable: unsetting SLIME_CLEAR_MEM_RESERVED_GB to get the old in-chunk behaviour
+    would also ungate the between-chunk call, which on Text2SQL costs 255.5 s.
+
+    Note it is a no-op unless SLIME_CLEAR_MEM_RESERVED_GB is also set to a positive value
+    -- clear_memory() ignores `gateable` when no threshold is configured.
+    """
+    return os.environ.get("SLIME_GATE_INCHUNK_CLEAR_MEM", "0") == "1"
+
+
 class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
     """Training actor for streaming synchronous training.
 
@@ -130,6 +160,67 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             model_chunk.zero_grad_buffer()
         self.optimizer.zero_grad()
 
+    # ------------------------------------------------------------------
+    # Cross-chunk gradient accumulation (OPT-IN workaround for Megatron core_v0.16.1)
+    # ------------------------------------------------------------------
+    # train_work_stealing zeroes the grad buffer ONCE and lets every chunk accumulate inside
+    # the DDP buffer across separate forward_backward_func() calls. Measured (TEST4 in
+    # tests/batch_invariance_runner.py) by comparing that against summing the same chunk
+    # gradients OUTSIDE the buffer in fp64:
+    #
+    #     Megatron core_v0.14.0    max_abs_diff 2.98e-08   OK   (fp32 rounding only)
+    #     Megatron core_v0.16.0rc0 max_abs_diff 2.98e-08   OK
+    #     Megatron core_v0.16.1    max_abs_diff 1.5 - 3.0  BROKEN
+    #
+    # So in-buffer accumulation is CORRECT on the versions slime actually runs on, and
+    # core_v0.16.1 regresses it. This is a Megatron regression, not a slime bug: the
+    # zero-once-accumulate-across-chunks pattern is legitimate.
+    #
+    # Enabling SLIME_STREAM_GRAD_ACCUM_FIX=1 makes each chunk start from a zeroed buffer and
+    # harvests its gradients into an fp32 accumulator held outside DDP. That is correct on any
+    # version, but costs one extra fp32 copy of all gradients (~2x gradient memory), so it is
+    # OFF by default -- turn it on only when running a Megatron whose in-buffer accumulation
+    # is broken (re-check with: tests/test_batch_invariance_launcher.py --only t4).
+    def _grad_accum_enabled(self):
+        return os.environ.get("SLIME_STREAM_GRAD_ACCUM_FIX", "0") == "1"
+
+    def _reset_grad_accum(self):
+        self._grad_accum = {}
+
+    def _harvest_grads_into_accum(self):
+        """Add this chunk's gradients into the external accumulator, then zero the buffer."""
+        acc = getattr(self, "_grad_accum", None)
+        if acc is None:
+            acc = self._grad_accum = {}
+        for mc_idx, model_chunk in enumerate(self.model):
+            for name, param in model_chunk.named_parameters():
+                g = getattr(param, "main_grad", None)
+                if g is None:
+                    continue
+                key = (mc_idx, name)
+                if key not in acc:
+                    acc[key] = g.detach().clone()
+                else:
+                    acc[key].add_(g.detach())
+        # Next chunk must start from a zeroed buffer -- that is the part that makes
+        # cross-call accumulation correct.
+        self._zero_grads()
+
+    def _restore_accum_into_grads(self):
+        """Write the accumulated gradients back into main_grad before sync + step."""
+        acc = getattr(self, "_grad_accum", None)
+        if not acc:
+            return
+        for mc_idx, model_chunk in enumerate(self.model):
+            for name, param in model_chunk.named_parameters():
+                g = getattr(param, "main_grad", None)
+                if g is None:
+                    continue
+                src = acc.get((mc_idx, name))
+                if src is not None:
+                    g.copy_(src)
+        self._grad_accum = {}
+
     def _setup_training_config(self):
         """Setup training config and suppress collective gradient sync.
 
@@ -218,12 +309,19 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             ]
 
     def _process_chunk(self, rollout_data: dict, dp_size: int) -> dict:
-        # NOTE: unsure about the dynamic_global_batch_size thing - funky thing is happening there
-        
         """Process a chunk of rollout data: forward+backward with no collective sync.
 
-        Sets dynamic_global_batch_size = num_samples * dp_size to ensure
-        equal per-sample gradient contribution regardless of chunk size.
+        Sets dynamic_global_batch_size = args.global_batch_size (a constant,
+        NOT the per-chunk sample count) so every sample contributes exactly
+        1/global_batch_size to the accumulated gradient regardless of which
+        chunk it landed in. This is what makes streaming gradients identical
+        to the colocated path.
+
+        RollPacker (arxiv:2509.21009 §4.4, "Preserving On-Policy Semantics")
+        reaches the same guarantee differently: it re-normalizes each replica's
+        local gradients by the number of samples that replica processed, as a
+        correction after the fact. Pinning the denominator up front removes the
+        bias instead of correcting it, so there is no equivalent step here.
 
         Args:
             rollout_data: Dict of training data (tokens, loss_masks, etc.)
@@ -279,13 +377,13 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                 )
                 actor_logprob_time = time.perf_counter() - t0
                 self._log_memory("_process_chunk:after_actor_logprob")
-                clear_memory()
+                clear_memory(gateable=_inchunk_clear_gateable())
 
             t0 = time.perf_counter()
             compute_advantages_and_returns(args, rollout_data)
             advantages_time = time.perf_counter() - t0
             self._log_memory("_process_chunk:after_advantages")
-            clear_memory()
+            clear_memory(gateable=_inchunk_clear_gateable())
 
         # Reset data iterator after log prob forward passes consumed it
         for iterator in data_iterator:
@@ -446,6 +544,98 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             f"global_rank={global_rank}"
         )
 
+    def _maybe_gc_freeze(self) -> None:
+        """Move the long-lived object graph into gc's permanent generation, once.
+
+        Why: `clear_memory()` = ``gc.collect()`` + ``torch.cuda.empty_cache()`` and is
+        called 3x per work-stealing chunk (streaming_actor.py:340, :346 inside
+        _process_chunk, and :659 between chunks). A torch.profiler capture over 4 chunks
+        measured clear_memory at 551.6 ms/call, of which empty_cache was only 43.5 ms --
+        so ~508 ms/call is gc.collect() walking the static graph (Megatron params and
+        optimizer state, Ray internals, SGLang client objects). Across a 15-rollout run
+        that is ~3,058 GPU-s, roughly 6x the margin by which streaming lost to colocate.
+
+        ``gc.freeze()`` moves everything currently tracked into a permanent generation
+        that collections never traverse, so each gc.collect() only walks objects created
+        afterwards -- i.e. the transient per-chunk tensors it actually needs to reclaim.
+        Semantics are otherwise unchanged: same call sites, same empty_cache().
+
+        Called at the top of the work-stealing loop rather than at __init__ because the
+        model, optimizer and distributed state must already exist to be worth freezing,
+        while per-chunk data does not yet, so nothing transient gets frozen (which would
+        leak). Idempotent -- the flag makes every later call a no-op.
+
+        Opt-in via SLIME_GC_FREEZE=1 so the change is A/B-testable and revertible.
+        """
+        if getattr(self, "_gc_frozen", False):
+            return
+        self._gc_frozen = True
+        if os.environ.get("SLIME_GC_FREEZE", "0") != "1":
+            return
+        import gc
+
+        t0 = time.perf_counter()
+        gc.collect()
+        n_before = len(gc.get_objects())
+        gc.freeze()
+        frozen = gc.get_freeze_count()
+        print(
+            f"[GC_FREEZE] froze {frozen:,} objects ({n_before:,} tracked before) "
+            f"in {time.perf_counter() - t0:.2f}s -- gc.collect() will no longer walk them",
+            flush=True,
+        )
+
+    # ---- torch.profiler capture over the first N work-stealing chunks ----------------
+    # Scoped deliberately: the per-chunk overhead under investigation is a fixed ~1.2 s
+    # that repeats identically every chunk and sits outside every internal timer
+    # (actor_logprob_s / fwd_bwd_s / advantages_s). A handful of chunks is enough to
+    # attribute it; a whole-rollout CPU+CUDA capture would be enormous.
+
+    def _prof_selected_ranks(self):
+        spec = str(getattr(get_args(), "streaming_profile_ranks", "0") or "0").strip()
+        if spec.lower() == "all":
+            return None
+        return {int(x) for x in spec.split(",") if x.strip()}
+
+    def _prof_should_capture(self, rollout_id, chunks_done: int) -> bool:
+        a = get_args()
+        n = int(getattr(a, "streaming_profile_chunks", 0) or 0)
+        if n <= 0 or chunks_done != 0:
+            return False
+        if rollout_id not in (0, None):
+            return False
+        if getattr(self, "_prof_active", False) or getattr(self, "_prof_done", False):
+            return False
+        ranks = self._prof_selected_ranks()
+        if ranks is None:
+            return True
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        return rank in ranks
+
+    def _prof_start(self, rollout_id) -> None:
+        a = get_args()
+        self.start_chrome_profile(
+            output_dir=str(getattr(a, "streaming_profile_dir", "/workspace/slime/logs/torch_profiles")),
+            cycle_id=rollout_id if rollout_id is not None else 0,
+            record_shapes=False,
+            with_stack=bool(getattr(a, "streaming_profile_with_stack", False)),
+            profile_memory=False,
+            with_flops=False,
+        )
+        self._prof_active = True
+        print(f"[TORCH_PROFILE] started (rollout={rollout_id})", flush=True)
+
+    def _prof_maybe_stop(self, rollout_id, chunks_done: int) -> None:
+        if not getattr(self, "_prof_active", False):
+            return
+        n = int(getattr(get_args(), "streaming_profile_chunks", 0) or 0)
+        if chunks_done < n:
+            return
+        path = self.stop_chrome_profile()
+        self._prof_active = False
+        self._prof_done = True
+        print(f"[TORCH_PROFILE] wrote {path} after {chunks_done} chunk(s)", flush=True)
+
     def train_work_stealing(self, work_queue_handle, dp_size: int, rollout_id: int = None, train_group: int = None) -> dict:
         """Buffered work-stealing loop: grab data from shared queue, train, repeat.
 
@@ -461,6 +651,8 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         """
         import ray
         import torch.distributed as dist
+
+        self._maybe_gc_freeze()
 
         tp_rank = mpu.get_tensor_model_parallel_rank()
         tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -493,9 +685,14 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
             torch._C._cuda_attach_out_of_memory_observer(_oom_observer)
 
-        # Zero gradients ONCE before the work-stealing loop.
-        # Gradients accumulate across chunks; _process_chunk does NOT zero.
+        # Zero gradients before the work-stealing loop.
+        # With SLIME_STREAM_GRAD_ACCUM_FIX enabled (default), each chunk starts from a
+        # zeroed buffer and its gradients are harvested into an external fp32 accumulator
+        # after the backward -- leaving the buffer un-zeroed across chunks silently produces
+        # WRONG gradients (see _harvest_grads_into_accum for the measurements).
         self._zero_grads()
+        if self._grad_accum_enabled():
+            self._reset_grad_accum()
 
         # Optional per-rollout MemPool for transient chunk allocations
         # (activations, log-prob outputs, advantages). When enabled, replaces
@@ -573,6 +770,11 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                     prefetcher.start_prefetch()
                 t_prefetch_started = time.perf_counter()
 
+                # Bracket exactly one chunk iteration: _process_chunk -> grad harvest ->
+                # clear_memory. That span is the fixed ~1.2 s gap being attributed.
+                if self._prof_should_capture(rollout_id, num_chunks):
+                    self._prof_start(rollout_id)
+
                 # Wrap _process_chunk in the chunk pool when enabled, so all
                 # transient allocations route through it; pool's memory is
                 # released on context exit (O(1)) instead of via clear_memory
@@ -582,6 +784,10 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                         result = self._process_chunk(merged, dp_size=dp_size)
                 else:
                     result = self._process_chunk(merged, dp_size=dp_size)
+                # Harvest this chunk's grads out of the DDP buffer and re-zero it, so the
+                # next chunk's backward starts clean. See _harvest_grads_into_accum.
+                if self._grad_accum_enabled():
+                    self._harvest_grads_into_accum()
                 t_process_returned = time.perf_counter()
                 del merged
                 if not use_chunk_pool:
@@ -591,6 +797,9 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                     # unconditional clear_memory() call.
                     clear_memory(gateable=True)
                 t_clear_memory_done = time.perf_counter()
+                # Stop AFTER clear_memory so the capture includes it -- prime suspect for
+                # the fixed per-chunk cost, and invisible to every internal timer.
+                self._prof_maybe_stop(rollout_id, num_chunks + 1)
                 total_samples += result["num_local_samples"]
                 total_tokens_processed += chunk_total_tokens if is_tp_src else 0
                 num_chunks += 1
@@ -689,6 +898,8 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                     f"total_tokens={chunk_total_tokens}, avg_len={chunk_avg:.0f}, max_len={chunk_max}"
                 )
             result = self._process_chunk(merged, dp_size=dp_size)
+            if self._grad_accum_enabled():
+                self._harvest_grads_into_accum()
             del merged
             clear_memory()
             total_samples += result["num_local_samples"]
@@ -757,6 +968,10 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         args = get_args()
 
         # 1. Collective gradient allreduce
+        # Write the externally-accumulated gradients back into main_grad before the
+        # collective reduce + optimizer step.
+        if self._grad_accum_enabled():
+            self._restore_accum_into_grads()
         finalize_model_grads_with_empty_cache(self.model)
         self._log_memory("sync_grads:after_finalize")
 

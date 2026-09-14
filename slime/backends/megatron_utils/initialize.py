@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 
 import numpy as np
@@ -58,6 +59,35 @@ def init(args):
     if args.enable_experimental:
         logger.info("Enable megatron experimental")
         set_experimental_flag(True)
+
+    # Batch-invariant kernels. Two ways to ask for them:
+    #   --batch-invariant-mode      Megatron >=0.16 flag (also pins flash attn num_splits=1)
+    #   SLIME_BATCH_INVARIANT=1     slime-level switch, works on ANY Megatron version
+    # Megatron installs the ATen overrides from megatron/training/initialize.py, which slime
+    # never calls (it has its own init()), so without this the flag only pins attention and
+    # the forward stays batch-shape dependent. We prefer megatron's own module when present
+    # and fall back to slime's vendored copy otherwise -- the copy exists so batch invariance
+    # works on core_v0.16.0rc0, which is the version that runs end-to-end here.
+    _want_bi = bool(getattr(args, "batch_invariant_mode", False)) or \
+        os.environ.get("SLIME_BATCH_INVARIANT", "0") == "1"
+    if _want_bi:
+        try:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                enable_batch_invariant_mode,
+                is_batch_invariant_mode_enabled,
+            )
+            _src = "megatron"
+        except ImportError:
+            from slime.utils.batch_invariant_kernels import (
+                enable_batch_invariant_mode,
+                is_batch_invariant_mode_enabled,
+            )
+            _src = "slime-vendored"
+        enable_batch_invariant_mode()
+        logger.info(
+            f"[batch-invariant] ATen overrides enabled from {_src}: "
+            f"{is_batch_invariant_mode_enabled()} (mm/addmm/_log_softmax/mean.dim)"
+        )
 
     # Pytorch distributed.
     _initialize_distributed(args)

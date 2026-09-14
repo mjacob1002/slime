@@ -306,8 +306,14 @@ class RayElasticGroup:
     def _allocate_engine_ports(self) -> dict:
         """Allocate ports for inference engines."""
         addr_and_ports = {}
-        # Use 16000 to avoid conflict with dedicated rollout engines (which use 15000)
-        start_port = 16000
+        # Use 16000 to avoid conflict with dedicated rollout engines (which use 15000).
+        # Overridable because a killed run can leave listening sockets owned by
+        # unreaped zombies (PID 1 is `sleep infinity` in this image, so it never
+        # reaps). Those ports are unrecoverable without a container restart, and a
+        # leak anywhere inside the consecutive dist-init block makes SGLang fail with
+        # EADDRINUSE even though the block's first port probed free. Point this at a
+        # clean range to work around it.
+        start_port = int(os.environ.get("SLIME_ELASTIC_PORT_BASE", "16000"))
 
         for rank, engine in enumerate(self._inference_engines):
             # Get host and allocate ports from the engine's node
@@ -374,6 +380,41 @@ class RayElasticGroup:
             ray.get([engine.resume_memory_occupation.remote() for engine in self.inference_engines])
         else:
             ray.get([engine.resume_memory_occupation.remote(tags=tags) for engine in self.inference_engines])
+
+    def _verify_engines_live(self, stage: str, timeout: float = 60.0):
+        """Assert every inference engine can actually serve after a resume.
+
+        SGLang's /resume_memory_occupation returns HTTP 200 even when the underlying
+        allocation failed: torch_memory_saver reports
+        `cuMemCreate CUDA_ERROR_OUT_OF_MEMORY` / `cudaError 2 (out of memory)` on stderr
+        from C++ and the endpoint still succeeds. Nothing then propagates, so the next
+        collective involving that engine hangs, the NCCL heartbeat monitor kills the
+        training workers ~30 min later, and the driver blocks on ray.get() indefinitely.
+        Observed on 2026-08-17: a 5-hour wedge after 22 minutes of useful work.
+
+        /health_generate actually exercises the KV cache, so it fails loudly when the
+        resume silently did not take effect. Raising here turns that wedge into an
+        immediate, attributable error naming the engine.
+        """
+        engines = self._inference_engines
+        results = ray.get(
+            [engine.health_generate.remote(timeout=timeout) for engine in engines],
+            timeout=timeout * 2,
+        )
+        dead = [i for i, ok in enumerate(results) if not ok]
+        if dead:
+            raise RuntimeError(
+                f"[ELASTIC] engine health check FAILED after {stage}: engines {dead} cannot "
+                f"serve. The usual cause is that resume_memory_occupation could not "
+                f"re-allocate KV cache (look for 'cudaError 2 (out of memory)' from "
+                f"torch_memory_saver in the engine logs). Lower "
+                f"--sglang-mem-fraction-static, or reduce migration pressure on the "
+                f"destination engines (--migration-min-completed-per-group, "
+                f"--migration-dst-usage-cap)."
+            )
+        # print(), not logger: driver-side logger.info is not captured in the job output,
+        # so there would be no way to confirm the check actually ran.
+        print(f"[ELASTIC] engine health check passed after {stage} ({len(engines)} engines)", flush=True)
 
     def switch_to_training(self):
         """
@@ -643,6 +684,11 @@ class RayElasticGroup:
                 engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE])
                 for engine in self._inference_engines
             ])
+
+        # Fail fast if a resume silently failed to re-allocate KV cache. Must happen
+        # before the engines are registered with the router, so a dead engine never
+        # receives work.
+        self._verify_engines_live("update_weights_and_switch_to_inference")
 
         # Step 5: Register engines with router
         with _tracer.event("register_with_router", device="all"):

@@ -66,6 +66,32 @@ class StreamingRolloutManager:
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
 
+    def set_migration_threshold(self, threshold: int) -> int:
+        """Control-plane hook: retune B (`--migration-batch-threshold`) between rollouts.
+
+        The driver owns the `ThresholdTuner` (it has the per-rollout timing signal), but
+        the policy instance lives here, in the actor. B is plain mutable state read fresh
+        at every decision (`TrainGroupBatchThresholdMigration.cumulative_batch_threshold`),
+        so retuning is a single field write — no policy rebuild, no router restart.
+
+        Returns the value actually in effect afterwards, so the caller can log what the
+        policy really has rather than what it asked for. Returns -1 when the active policy
+        has no threshold to set (e.g. `none`, `stream_trainer`), which the driver treats
+        as "tuning not applicable" rather than an error — that keeps the tuner harmless if
+        it is enabled alongside a policy it cannot steer.
+        """
+        policy = getattr(self.router, "migration_policy", None) if self.router else None
+        if policy is None or not hasattr(policy, "cumulative_batch_threshold"):
+            return -1
+        old = policy.cumulative_batch_threshold
+        policy.cumulative_batch_threshold = int(threshold)
+        if old != policy.cumulative_batch_threshold:
+            logger.info(
+                f"[TUNER] migration_batch_threshold {old} -> "
+                f"{policy.cumulative_batch_threshold}"
+            )
+        return policy.cumulative_batch_threshold
+
     def set_engine_urls(self, engine_urls: list[str]):
         """Set engine URLs and initialize the generation state + router.
 
@@ -94,6 +120,27 @@ class StreamingRolloutManager:
         # Build migration policy via factory (handles "none" and "train_group_aware").
         migration_policy = make_migration_policy(self.args)
         policy_name = getattr(self.args, "migration_policy", "none") or "none"
+
+        # Fail fast on migration + a custom generate function, because the failure mode is
+        # a silent hang rather than an error. `_execute_migration` aborts by
+        # `[s.rid for s in group if s.rid]`; a custom generate function that never sets
+        # `sample.rid` (e.g. examples/retool) leaves that list empty, so nothing is
+        # aborted and `await src_task` blocks until the trajectory finishes on its own —
+        # stalling the whole dispatch loop, since migrations run inline in it.
+        # Multi-turn functions additionally need a cooperative cancellation flag, since
+        # between turns there is no in-flight request for any rid to name.
+        custom_gen = getattr(self.args, "custom_generate_function_path", None)
+        if policy_name != "none" and custom_gen and not getattr(self.args, "allow_migration_with_custom_generate", False):
+            raise ValueError(
+                f"--migration-policy {policy_name} with --custom-generate-function-path "
+                f"{custom_gen} is not supported yet: migration aborts by sample.rid, and a "
+                "custom generate function must (a) assign sample.rid before every "
+                "/generate call and (b) honour the migrate-cancellation flag at each turn "
+                "boundary, or migration silently degrades into a dispatch-loop stall. "
+                "Use --migration-policy none, or pass "
+                "--allow-migration-with-custom-generate if your generate function "
+                "implements both."
+            )
 
         # Train-group geometry — derived the same way as in train_streaming.py.
         # Falls back to 1:1 mapping (engines_per_train_group=1) if the args
