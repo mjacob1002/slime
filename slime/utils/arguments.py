@@ -175,6 +175,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollpacker-steady-batch-size",
+                type=int,
+                default=None,
+                help=(
+                    "Only for --grab-policy rollpacker_prefetch. Per-grab prompt-group "
+                    "cap from the SECOND grab onward, porting RollPacker's "
+                    "prefetch_prompt_count ramp-down (base_worker.py:370 starts it at -1 "
+                    "so the first grab is bounded only by "
+                    "--rollpacker-scaling-down-train-batch-size; base_worker.py:548 then "
+                    "pins every later grab to pg_prompt_count). Unset derives "
+                    "scaling_down_train_batch_size // num_train_groups, which is the "
+                    "'don't monopolize' bound appropriate to slime, where a grab goes to "
+                    "ONE train group rather than being scattered across DP ranks. "
+                    "0 restores the pre-fix behaviour exactly -- no ramp-down and an "
+                    "unbounded final drain -- so previously measured runs stay "
+                    "reproducible."
+                ),
+            )
+            parser.add_argument(
                 "--rollpacker-div-multiplier",
                 type=int,
                 default=0,

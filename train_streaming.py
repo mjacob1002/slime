@@ -69,12 +69,19 @@ def _grab_policy_kwargs(args, total_gpus: int) -> dict:
     """
     if getattr(args, "grab_policy", None) != "rollpacker_prefetch":
         return {}
+    steady = getattr(args, "rollpacker_steady_batch_size", None)
     return {
         "scaling_down_train_batch_size": int(
             getattr(args, "rollpacker_scaling_down_train_batch_size", 64)
         ),
         "train_world_size": int(total_gpus),
         "div_multiplier": int(getattr(args, "rollpacker_div_multiplier", 0)),
+        # Consumer count, used to derive the steady-state cap when it is not set
+        # explicitly. RollPacker scatters a grab across pg_world_size ranks; slime
+        # hands it to a single train group, so the number of train groups is the
+        # right divisor here.
+        "num_train_groups": int(total_gpus // args.tensor_model_parallel_size),
+        "steady_state_batch_size": None if steady is None else int(steady),
     }
 
 
