@@ -109,6 +109,13 @@ RP_DIV_MULTIPLIER = os.environ.get("T2S_RP_DIV_MULTIPLIER", "0")
 # more grabs per rollout, which is what actually spreads work across train groups in
 # slime -- see the grab-granularity note in the module docstring.
 RP_STEADY = os.environ.get("T2S_RP_STEADY", "")
+# Grab policy. Default is RollPacker's own prefetch, which is what makes this a
+# fidelity port. Setting it to `graduated_tail_split` builds the HYBRID arm:
+# RollPacker's migration policy + switch controller with slime's fine-grained tail
+# ladder. That isolates the two halves -- the August stream_trainer run could not,
+# because it predates switch_controller() being bound to the policy class and so ran
+# with EagerSwitchController.
+GRAB = os.environ.get("T2S_GRAB", "rollpacker_prefetch")
 RUN_DIR = os.environ.get("T2S_RUN_DIR", f"/workspace/slime/logs/text2sql_50rollout/{POLICY}")
 
 # Byte-identical to the colocated arm, plus the two memory fixes every streaming arm on
@@ -213,10 +220,17 @@ def execute():
         "--stream-trainer-flip-fraction 0.50 "
         "--stream-trainer-max-running-requests 2048 "
         "--allow-migration-with-custom-generate "
-        "--grab-policy rollpacker_prefetch "
-        f"--rollpacker-scaling-down-train-batch-size {RP_GRAB_BATCH} "
-        f"--rollpacker-div-multiplier {RP_DIV_MULTIPLIER} "
-        + (f"--rollpacker-steady-batch-size {RP_STEADY} " if RP_STEADY != "" else "")
+        f"--grab-policy {GRAB} "
+        # The rollpacker-* knobs are inert for other grab policies
+        # (_grab_policy_kwargs returns {} unless grab_policy == rollpacker_prefetch),
+        # but omit them anyway so the launched command states only what applies.
+        + (
+            f"--rollpacker-scaling-down-train-batch-size {RP_GRAB_BATCH} "
+            f"--rollpacker-div-multiplier {RP_DIV_MULTIPLIER} "
+            + (f"--rollpacker-steady-batch-size {RP_STEADY} " if RP_STEADY != "" else "")
+            if GRAB == "rollpacker_prefetch"
+            else ""
+        )
         + "--streaming-stall-timeout-s 1500 "
     )
 
