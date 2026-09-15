@@ -62,6 +62,12 @@ T2S_ENV = {
     "SLIME_GC_FREEZE": "1",
     "SLIME_CLEAR_MEM_RESERVED_GB": (os.environ.get("T2S_CLEAR_MEM_GB") or "110"),
     "SLIME_GATE_INCHUNK_CLEAR_MEM": (os.environ.get("T2S_GATE_INCHUNK") or "1"),
+    # Skip torch._C._host_emptyCache() inside sleep_lightweight. Default "0" =
+    # unchanged behaviour; "1" opts this run into the experiment. Threaded from the
+    # outer env so the A/B is a launcher variable, not a code edit -- both arms run
+    # the identical binary. Measured cost of the call it skips: ~437 ms/GB of pinned
+    # host cache, ~1974 s over a 15-rollout run (33% of wall).
+    "SLIME_SLEEP_SKIP_HOST_CACHE": (os.environ.get("T2S_SKIP_HOST_CACHE") or "0"),
 }
 
 

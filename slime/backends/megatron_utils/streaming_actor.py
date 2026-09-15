@@ -87,6 +87,29 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             f"peak={peak:.2f}GB | sys_used={used:.2f}GB sys_free={free/1e9:.2f}GB"
         )
 
+    # Env gate for the host-cache free inside sleep_lightweight. DEFAULT "0" =
+    # today's behaviour, byte-identical, so every existing launcher (DAPO math
+    # colocate and streaming, the committed benchmarks, async_overlapped) is
+    # unaffected unless it opts in explicitly. Same opt-in discipline as
+    # SLIME_GC_FREEZE / SLIME_CLEAR_MEM_RESERVED_GB / SLIME_GATE_INCHUNK_CLEAR_MEM.
+    SKIP_HOST_CACHE_ENV = "SLIME_SLEEP_SKIP_HOST_CACHE"
+
+    def _host_free_gb(self) -> float:
+        """Host memory still available, or -1 when it cannot be read.
+
+        Watched because skipping the host-cache free lets pinned host memory
+        accumulate, and this box runs at ~924/1511 GB with swap exhausted.
+        Read from /proc/meminfo rather than psutil so it needs no new dependency.
+        """
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / 1e6  # kB -> GB
+        except OSError:
+            pass
+        return -1.0
+
     @timer
     def sleep_lightweight(self) -> None:
         """Offload model tensors but keep NCCL alive.
@@ -94,14 +117,39 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         Unlike sleep() which calls destroy_process_groups(), this only
         calls torch_memory_saver.pause() to offload tensors to CPU.
         NCCL groups remain initialized for the final collective sync.
+
+        MEASURED COST OF THE HOST-CACHE FREE (2026-09-15, this box, one process):
+        `clear_memory(clear_host_memory=True)` calls torch._C._host_emptyCache(),
+        which frees the pinned host-memory cache at ~437 ms per GB and scales
+        linearly (2 GB -> 484.8 ms, 8 GB -> 2737.3 ms, 24 GB -> 10493.4 ms). The
+        other three steps of that call are noise: synchronize 0.0 ms, gc.collect
+        ~40 ms (SLIME_GC_FREEZE working), empty_cache 0.1 ms.
+
+        That is why sleep runs 1.3-797.1 s while its mirror image
+        wake_up_lightweight -- same tensors, opposite direction, no host free --
+        runs 0.7-1.8 s every time. Over a 15-rollout Text2SQL run the host free
+        cost ~1974 s, a third of total wall.
+
+        The comment on the second clear_memory() says the free is so "SGLang can
+        reclaim them", but SGLang reclaims GPU memory, and the [MEM] samples show
+        the host free barely moves GPU memory (33.86 -> 31.49 GB) while pause()
+        does the real work (31.49 -> 2.46 GB). Hence the gate -- off by default
+        until an A/B confirms both the speedup AND that host memory stays bounded.
         """
+        skip_host = os.environ.get(self.SKIP_HOST_CACHE_ENV, "0") == "1"
         self._log_memory("sleep_lightweight:before")
-        clear_memory(clear_host_memory=True)
+        if skip_host:
+            logger.info(
+                f"[MEM sleep_lightweight:host_cache SKIPPED] "
+                f"host_avail={self._host_free_gb():.1f}GB"
+            )
+        clear_memory(clear_host_memory=not skip_host)
         self._log_memory("sleep_lightweight:after_clear")
         print_memory("before lightweight offload")
         torch_memory_saver.pause()
         clear_memory()  # Release blocks freed by pause() so SGLang can reclaim them
         self._log_memory("sleep_lightweight:after_pause")
+        logger.info(f"[MEM sleep_lightweight:done] host_avail={self._host_free_gb():.1f}GB")
         print_memory("after lightweight offload")
 
     @timer
