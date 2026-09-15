@@ -20,8 +20,13 @@
 set -u
 SLIME=/m-coriander/coriander/mjacob2/slime
 ARM=colocate
-OUT=$SLIME/logs/text2sql_50rollout/$ARM
-DRIVER_LOG=$SLIME/logs/text2sql_50rollout/driver_${ARM}.log
+# T2S_ROLLOUTS / T2S_TAG added so the same driver can run a short control arm
+# back-to-back with the streaming arms on identical box state. Defaults reproduce
+# the original 50-rollout invocation exactly.
+ROLLOUTS=${T2S_ROLLOUTS:-50}
+TAG=${T2S_TAG:-50rollout}
+OUT=$SLIME/logs/text2sql_${TAG}/$ARM
+DRIVER_LOG=$SLIME/logs/text2sql_${TAG}/driver_${ARM}.log
 CTR=slime-dev-yi
 SCRIPT=tests/streaming/test_colocate_8xGPU_qwen3_8b_text2sql_50rollout.py
 mkdir -p "$OUT"
@@ -50,11 +55,11 @@ log "waiting for idle GPUs ..."
 USED=$(wait_idle)
 T0=$(date +%s)
 log "=== START $(date '+%F %H:%M:%S') (GPU ${USED} MiB) ==="
-log "script=$SCRIPT rollouts=50 out=$OUT"
+log "script=$SCRIPT rollouts=$ROLLOUTS out=$OUT"
 
 # ulimit -n 524288 is mandatory: the soft limit in a docker exec shell is 1024 and the
 # raylet dies with "Too many open files" once Ray enumerates 230+ CPUs.
-docker exec "$CTR" bash -lc \
+docker exec -e T2S_ROLLOUTS="$ROLLOUTS" -e T2S_RUN_DIR="/workspace/slime/logs/text2sql_${TAG}/${ARM}" "$CTR" bash -lc \
   "ulimit -n 524288; cd /workspace/slime && python $SCRIPT" >> "$OUT/driver_stdout.log" 2>&1
 EXIT=$?
 T1=$(date +%s)
