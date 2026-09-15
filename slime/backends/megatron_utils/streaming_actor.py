@@ -104,6 +104,25 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
     SLEEP_MODE_ENV = "SLIME_SLEEP_MODE"
     SLEEP_MODES = ("full", "no_host_cache", "resident")
 
+    def _sleep_mode(self) -> str:
+        """Resolve SLIME_SLEEP_MODE. Read by BOTH sleep and wake.
+
+        sleep_lightweight and wake_up_lightweight are a matched pair: pause() and
+        resume() must be called the same number of times on the same tensors.
+        torch_memory_saver enforces it -- resuming something never paused aborts the
+        worker with "Cannot resume allocation that is not paused", which surfaces as
+        an opaque Ray ActorDiedError several seconds later. Hence one resolver rather
+        than each method reading the env separately.
+        """
+        mode = os.environ.get(self.SLEEP_MODE_ENV, "full")
+        if mode not in self.SLEEP_MODES:
+            raise ValueError(
+                f"{self.SLEEP_MODE_ENV}={mode!r} is not one of {self.SLEEP_MODES}. "
+                "Refusing to guess: an unrecognised value silently falling back to "
+                "'full' would make an A/B look like a null result."
+            )
+        return mode
+
     def _host_free_gb(self) -> float:
         """Host memory still available, or -1 when it cannot be read.
 
@@ -146,13 +165,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         does the real work (31.49 -> 2.46 GB). Hence the gate -- off by default
         until an A/B confirms both the speedup AND that host memory stays bounded.
         """
-        mode = os.environ.get(self.SLEEP_MODE_ENV, "full")
-        if mode not in self.SLEEP_MODES:
-            raise ValueError(
-                f"{self.SLEEP_MODE_ENV}={mode!r} is not one of {self.SLEEP_MODES}. "
-                "Refusing to guess: an unrecognised value silently falling back to "
-                "'full' would make an A/B look like a null result."
-            )
+        mode = self._sleep_mode()
         self._log_memory("sleep_lightweight:before")
         clear_memory(clear_host_memory=(mode == "full"))
         self._log_memory("sleep_lightweight:after_clear")
@@ -206,9 +219,17 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         calls torch_memory_saver.resume() to restore tensors from CPU.
         Non-collective — can be called independently per rank.
         """
+        mode = self._sleep_mode()
         self._log_memory("wake_up_lightweight:before_resume")
         print_memory("before lightweight wake_up")
-        torch_memory_saver.resume()
+        if mode == "resident":
+            # Nothing was paused, so there is nothing to resume. MUST mirror
+            # sleep_lightweight exactly: calling resume() here aborts the worker with
+            # "Cannot resume allocation that is not paused" (torch_memory_saver
+            # csrc/core.cpp), which Ray reports only as an ActorDiedError.
+            logger.info("[MEM wake_up_lightweight:resume SKIPPED mode=resident]")
+        else:
+            torch_memory_saver.resume()
         self._log_memory("wake_up_lightweight:after_resume")
         clear_memory()
         self._log_memory("wake_up_lightweight:after_clear")

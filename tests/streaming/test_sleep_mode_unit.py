@@ -26,7 +26,7 @@ from unittest import mock
 import pytest
 
 
-def _invoke_sleep(monkeypatch, env_value, paused=None):
+def _invoke(monkeypatch, env_value, which="sleep", record=None):
     """Call StreamingMegatronTrainRayActor.sleep_lightweight unbound, recording the
     clear_memory calls. Unbound + a stub self avoids constructing a real actor
     (which needs Megatron global state and a GPU)."""
@@ -43,8 +43,10 @@ def _invoke_sleep(monkeypatch, env_value, paused=None):
     calls = []
     monkeypatch.setattr(mod, "clear_memory", lambda **kw: calls.append(kw), raising=True)
     monkeypatch.setattr(mod, "print_memory", lambda *a, **k: None, raising=True)
-    pauses = [] if paused is None else paused
-    saver = types.SimpleNamespace(pause=lambda: pauses.append(1), resume=lambda: None)
+    rec = [] if record is None else record
+    saver = types.SimpleNamespace(
+        pause=lambda: rec.append("pause"), resume=lambda: rec.append("resume")
+    )
     monkeypatch.setattr(mod, "torch_memory_saver", saver, raising=True)
 
     stub = mock.Mock()
@@ -54,10 +56,15 @@ def _invoke_sleep(monkeypatch, env_value, paused=None):
     stub.SLEEP_MODES = mod.StreamingMegatronTrainRayActor.SLEEP_MODES
     stub._assert_resident_fits = lambda: None
 
-    fn = mod.StreamingMegatronTrainRayActor.sleep_lightweight
+    stub._sleep_mode = lambda: mod.StreamingMegatronTrainRayActor._sleep_mode(stub)
+    fn = getattr(mod.StreamingMegatronTrainRayActor, f"{which}_lightweight")
     fn = getattr(fn, "__wrapped__", fn)      # strip @timer
     fn(stub)
     return calls
+
+
+def _invoke_sleep(monkeypatch, env_value, paused=None):
+    return _invoke(monkeypatch, env_value, "sleep", paused)
 
 
 class TestSleepModeDefault:
@@ -70,19 +77,19 @@ class TestSleepModeDefault:
         assert calls[0] == {"clear_host_memory": True}, (
             "default changed! every streaming run, DAPO math included, would be affected"
         )
-        assert paused == [1], "default must still call torch_memory_saver.pause()"
+        assert paused == ["pause"], "default must still call torch_memory_saver.pause()"
 
     def test_explicit_full_matches_unset(self, monkeypatch):
         paused = []
         calls = _invoke_sleep(monkeypatch, "full", paused)
         assert calls[0] == {"clear_host_memory": True}
-        assert paused == [1]
+        assert paused == ["pause"]
 
     def test_no_host_cache_still_pauses(self, monkeypatch):
         paused = []
         calls = _invoke_sleep(monkeypatch, "no_host_cache", paused)
         assert calls[0] == {"clear_host_memory": False}
-        assert paused == [1], "no_host_cache must NOT change the offload"
+        assert paused == ["pause"], "no_host_cache must NOT change the offload"
 
     def test_resident_skips_the_pause(self, monkeypatch):
         paused = []
@@ -96,6 +103,21 @@ class TestSleepModeDefault:
         like a null result, which is exactly how a wrong conclusion gets published."""
         with pytest.raises(ValueError):
             _invoke_sleep(monkeypatch, val)
+
+    def test_sleep_and_wake_are_symmetric(self, monkeypatch):
+        """THE regression this exists for. pause() and resume() must be called the
+        same number of times: skipping the offload but still resuming aborts the
+        worker with "Cannot resume allocation that is not paused", which Ray reports
+        only as an opaque ActorDiedError. Cost: one failed 4-rollout run."""
+        for mode in (None, "full", "no_host_cache", "resident"):
+            rec = []
+            _invoke(monkeypatch, mode, "sleep", rec)
+            _invoke(monkeypatch, mode, "wake_up", rec)
+            assert rec.count("pause") == rec.count("resume"), (
+                f"mode={mode}: pause/resume asymmetry {rec} — this kills the actor"
+            )
+            expected = [] if mode == "resident" else ["pause", "resume"]
+            assert rec == expected, f"mode={mode}: got {rec}, expected {expected}"
 
     def test_second_clear_is_unconditional(self, monkeypatch):
         """The post-pause clear_memory() hands GPU blocks back to SGLang and must
