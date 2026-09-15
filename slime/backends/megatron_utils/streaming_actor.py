@@ -87,12 +87,22 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
             f"peak={peak:.2f}GB | sys_used={used:.2f}GB sys_free={free/1e9:.2f}GB"
         )
 
-    # Env gate for the host-cache free inside sleep_lightweight. DEFAULT "0" =
-    # today's behaviour, byte-identical, so every existing launcher (DAPO math
-    # colocate and streaming, the committed benchmarks, async_overlapped) is
-    # unaffected unless it opts in explicitly. Same opt-in discipline as
-    # SLIME_GC_FREEZE / SLIME_CLEAR_MEM_RESERVED_GB / SLIME_GATE_INCHUNK_CLEAR_MEM.
-    SKIP_HOST_CACHE_ENV = "SLIME_SLEEP_SKIP_HOST_CACHE"
+    # Single knob for what sleep_lightweight does. DEFAULT "full" = today's
+    # behaviour, byte-identical, so every existing launcher (DAPO math colocate and
+    # streaming, the committed benchmarks, async_overlapped) is unaffected unless it
+    # opts in explicitly. Same opt-in discipline as SLIME_GC_FREEZE /
+    # SLIME_CLEAR_MEM_RESERVED_GB / SLIME_GATE_INCHUNK_CLEAR_MEM.
+    #
+    #   full           clear_memory(host=True) -> pause() -> clear_memory()   [default]
+    #   no_host_cache  drop the host-cache free only. MEASURED: no benefit in situ
+    #                  (360.0s -> 349.5s), kept because it is real work a different
+    #                  memory regime could make matter again.
+    #   resident       skip pause() entirely -- training tensors stay on the GPU.
+    #                  Only valid when SGLang's static reservation and the training
+    #                  peak both fit: on this box 100.7 + 32.8 = 133.4 of 143.8 GB.
+    #                  Asserted at runtime, see _assert_resident_fits.
+    SLEEP_MODE_ENV = "SLIME_SLEEP_MODE"
+    SLEEP_MODES = ("full", "no_host_cache", "resident")
 
     def _host_free_gb(self) -> float:
         """Host memory still available, or -1 when it cannot be read.
@@ -136,21 +146,57 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         does the real work (31.49 -> 2.46 GB). Hence the gate -- off by default
         until an A/B confirms both the speedup AND that host memory stays bounded.
         """
-        skip_host = os.environ.get(self.SKIP_HOST_CACHE_ENV, "0") == "1"
-        self._log_memory("sleep_lightweight:before")
-        if skip_host:
-            logger.info(
-                f"[MEM sleep_lightweight:host_cache SKIPPED] "
-                f"host_avail={self._host_free_gb():.1f}GB"
+        mode = os.environ.get(self.SLEEP_MODE_ENV, "full")
+        if mode not in self.SLEEP_MODES:
+            raise ValueError(
+                f"{self.SLEEP_MODE_ENV}={mode!r} is not one of {self.SLEEP_MODES}. "
+                "Refusing to guess: an unrecognised value silently falling back to "
+                "'full' would make an A/B look like a null result."
             )
-        clear_memory(clear_host_memory=not skip_host)
+        self._log_memory("sleep_lightweight:before")
+        clear_memory(clear_host_memory=(mode == "full"))
         self._log_memory("sleep_lightweight:after_clear")
         print_memory("before lightweight offload")
-        torch_memory_saver.pause()
+        if mode == "resident":
+            # Keep training tensors on the GPU. Nothing to release, so no D2H at all.
+            self._assert_resident_fits()
+            logger.info(
+                f"[MEM sleep_lightweight:pause SKIPPED mode=resident] "
+                f"host_avail={self._host_free_gb():.1f}GB"
+            )
+        else:
+            torch_memory_saver.pause()
         clear_memory()  # Release blocks freed by pause() so SGLang can reclaim them
         self._log_memory("sleep_lightweight:after_pause")
-        logger.info(f"[MEM sleep_lightweight:done] host_avail={self._host_free_gb():.1f}GB")
+        logger.info(
+            f"[MEM sleep_lightweight:done mode={mode}] host_avail={self._host_free_gb():.1f}GB"
+        )
         print_memory("after lightweight offload")
+
+    def _assert_resident_fits(self) -> None:
+        """Fail loudly and early if 'resident' cannot possibly work on this GPU.
+
+        Staying resident is only safe when SGLang's reservation plus the training
+        peak fit in one card. Getting that wrong surfaces as an SGLang OOM several
+        seconds later inside resume_memory_occupation, which is a far worse place to
+        learn about it. This check is advisory about the training side only -- it
+        cannot see SGLang's target -- so it reports rather than guesses, and only
+        hard-fails when the training peak alone has already eaten the card.
+        """
+        free, total = torch.cuda.mem_get_info()
+        peak_gb = torch.cuda.memory_stats()['allocated_bytes.all.peak'] / 1e9
+        total_gb, free_gb = total / 1e9, free / 1e9
+        logger.info(
+            f"[MEM resident-check] train_peak={peak_gb:.1f}GB free={free_gb:.1f}GB "
+            f"total={total_gb:.1f}GB"
+        )
+        if free_gb < 0.10 * total_gb:
+            raise RuntimeError(
+                f"SLIME_SLEEP_MODE=resident but only {free_gb:.1f}GB of {total_gb:.1f}GB "
+                f"is free after training (peak {peak_gb:.1f}GB). SGLang cannot resume "
+                f"into that. Use the default mode, or lower "
+                f"--sglang-mem-fraction-static / --max-tokens-per-gpu."
+            )
 
     @timer
     def wake_up_lightweight(self) -> None:

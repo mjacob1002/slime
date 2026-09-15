@@ -38,9 +38,9 @@ log "waiting for idle GPUs ..."
 USED=$(wait_idle)
 T0=$(date +%s)
 log "=== START $(date '+%F %H:%M:%S') (GPU ${USED} MiB) ==="
-log "script=$SCRIPT rollouts=$ROLLOUTS tuner=interior_idle B0=64 skip_host_cache=${T2S_SKIP_HOST_CACHE:-0} out=$OUT"
+log "script=$SCRIPT rollouts=$ROLLOUTS tuner=interior_idle B0=64 sleep_mode=${T2S_SLEEP_MODE:-full} out=$OUT"
 
-docker exec -e T2S_ROLLOUTS="$ROLLOUTS" -e T2S_SKIP_HOST_CACHE="${T2S_SKIP_HOST_CACHE:-0}" \
+docker exec -e T2S_ROLLOUTS="$ROLLOUTS" -e T2S_SLEEP_MODE="${T2S_SLEEP_MODE:-full}" \
   -e T2S_RUN_DIR="/workspace/slime/logs/text2sql_${TAG}/tuner" "$CTR" bash -lc \
   "ulimit -n 524288; cd /workspace/slime && python $SCRIPT" >> "$OUT/driver_stdout.log" 2>&1
 EXIT=$?
