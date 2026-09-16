@@ -52,6 +52,70 @@ class StreamingRouter:
             colocated layout).
     """
 
+    @staticmethod
+    def _warn_if_client_semaphore_can_bind(args, num_engines: int) -> None:
+        """Warn when slime's client-side semaphore can hold samples back from SGLang.
+
+        `GenerateState.semaphore` (slime/rollout/sglang_rollout.py:46) is a PROCESS-WIDE
+        budget of `sglang_server_concurrency * rollout_num_gpus // rollout_num_gpus_per_engine`
+        permits, acquired at sglang_rollout.py:226 before a sample ever reaches an engine.
+
+        It matters here because `--migration-count-unit samples` derives liveness from
+        `task.done()`, which is true from task CREATION -- so a sample queued on that
+        semaphore counts as live while it is doing nothing. With the shipped defaults
+        (512 * 8 = 4096 permits vs 1024 samples) it never binds, and SGLang's own waiting
+        queue was non-empty in only 2.2%% of sampled metrics rows on the 50-rollout run.
+        But the budget scales with GPU COUNT while in-flight samples scale with BATCH, so
+        fewer GPUs or a bigger batch can make it bind silently -- and multi-turn
+        workloads hold a permit across tool calls too, making it likelier still.
+
+        A warning rather than an error: the run is still correct, the live-sample counts
+        just include semaphore-queued samples.
+        """
+        try:
+            in_flight = int(args.rollout_batch_size) * int(args.n_samples_per_prompt)
+            per_engine = max(1, int(getattr(args, "rollout_num_gpus_per_engine", 1) or 1))
+            conc = int(getattr(args, "sglang_server_concurrency", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+
+        # Prefer the REAL permit count over recomputing the formula. The singleton has
+        # already been built by StreamingRolloutManager.set_engine_urls() (which logs
+        # "SGGenerateState initialized, semaphore permits=..." just before constructing
+        # this router), and nothing has acquired yet, so _value is still the capacity.
+        # Reading it avoids re-deriving a formula whose inputs differ between paths --
+        # which is exactly what broke the first version of this check.
+        budget = None
+        try:
+            from slime.rollout.sglang_rollout import GenerateState
+            from slime.utils.misc import SingletonMeta
+
+            state = SingletonMeta._instances.get(GenerateState)
+            if state is not None:
+                budget = int(state.semaphore._value)
+        except Exception:                                        # noqa: BLE001
+            budget = None
+
+        if budget is None:
+            # Fallback: mirror set_engine_urls()'s override. In the STREAMING path
+            # `rollout_num_gpus` is 0 (every GPU belongs to the elastic group), and the
+            # manager substitutes the engine count before sizing the semaphore. Using the
+            # raw 0 here computed a budget of 0, declared the semaphore "binding", and
+            # then divided by zero building the advice string -- killing a run in setup.
+            gpus = int(getattr(args, "rollout_num_gpus", 0) or 0) or int(num_engines)
+            budget = conc * gpus // per_engine
+
+        if budget <= 0 or budget >= in_flight:
+            return
+        # Permits are a GLOBAL budget across engines, so the advice is in the same terms.
+        need = -(-in_flight * per_engine // max(1, int(num_engines)))
+        logger.warning(
+            f"[ROUTER] client-side generation semaphore may bind: {budget} permits vs "
+            f"{in_flight} samples in flight. Samples queued on it have not reached an "
+            f"engine but still count as live under --migration-count-unit samples. "
+            f"Raise --sglang-server-concurrency to >= {need}."
+        )
+
     def __init__(
         self,
         engine_urls: list[str],
@@ -67,6 +131,7 @@ class StreamingRouter:
         self.migration_policy = migration_policy or NoMigration()
         self.args = args
         self.convert_samples_fn = convert_samples_fn
+        self._warn_if_client_semaphore_can_bind(args, self.num_engines)
 
         if engines_per_train_group <= 0 or self.num_engines % engines_per_train_group != 0:
             raise ValueError(
@@ -225,6 +290,50 @@ class StreamingRouter:
         flipped_train_groups: set[int] = set()
         # Migrations executed this rollout, oldest first.
         recent_migrations: list[MigrationDecision] = []
+        # sample.index -> that sample's own generation task. Populated by the
+        # `on_sample_task` observer passed into generate_and_rm_group() at BOTH
+        # dispatch sites (initial + migration re-dispatch).
+        #
+        # Why this exists: `in_flight_groups` tracks whole prompt groups, and a group
+        # is only removed when its SLOWEST sample finishes. Measured over 135 independent
+        # trigger firings on the 50-rollout DAPO run, that overstates the work actually
+        # left on a train group by 3.0x at the median (group-implied 56 vs 17 samples
+        # really generating). The factor is not constant -- ~3.3x at low B, ~2.2x at
+        # high B -- and at a FIXED trigger value the true remaining work still spans
+        # 2.6-4.1x (implied=56 -> 10..26 live; implied=72 -> 14..58). That spread is the
+        # defect. B is denominated in samples, so it has never measured what it claims to.
+        #
+        # Liveness is DERIVED from `task.done()` rather than maintained as a counter:
+        # done() is true on success, exception and cancellation alike, and there is no
+        # second source of truth to drift. Rollout-scoped on purpose -- it dies with
+        # this function, so it cannot grow across rollouts. Do not hoist it to self.
+        sample_task: dict[int, asyncio.Task] = {}
+
+        def _track(sample: Sample, task: asyncio.Task) -> None:
+            """Record a sample's generation task as it is created.
+
+            No engine argument: per-engine attribution is read off `in_flight_groups`
+            at query time, and the router already moves a group between engines when it
+            migrates. Re-dispatch overwrites the entry for the same `sample.index`, so
+            the map always names the sample's CURRENT attempt.
+            """
+            sample_task[sample.index] = task
+
+        def _live_in_group(grp: list[Sample]) -> int:
+            """Samples of `grp` still generating. Unknown-index samples count as live."""
+            n = 0
+            for smp in grp:
+                task = sample_task.get(smp.index)
+                if task is None or not task.done():
+                    n += 1
+            return n
+
+        def _live_samples() -> dict[int, int]:
+            """Per-engine count of samples actually still generating right now."""
+            return {
+                e: sum(_live_in_group(grp) for grp in gs)
+                for e, gs in in_flight_groups.items()
+            }
 
         for engine_rank, groups in engine_prompt_groups.items():
             groups_originally_assigned[engine_rank] = len(groups)
@@ -238,7 +347,13 @@ class StreamingRouter:
                     f"group={group_idx}/{len(groups)}, {len(group)} samples"
                 )
                 task = asyncio.create_task(
-                    generate_and_rm_group(local_args, group, sampling_params.copy(), evaluation=False)
+                    generate_and_rm_group(
+                        local_args,
+                        group,
+                        sampling_params.copy(),
+                        evaluation=False,
+                        on_sample_task=_track,
+                    )
                 )
                 tasks[task] = (engine_rank, group_idx, group)
                 in_flight_groups[engine_rank].append(group)
@@ -278,6 +393,8 @@ class StreamingRouter:
                 engines_for_train_group=self._engines_for_train_group,
                 in_flight_groups={e: list(gs) for e, gs in in_flight_groups.items()},
                 in_flight_count={e: len(gs) for e, gs in in_flight_groups.items()},
+                live_samples=_live_samples(),
+                live_in_group=_live_in_group,
                 groups_originally_assigned=dict(groups_originally_assigned),
                 groups_currently_assigned=dict(groups_currently_assigned),
                 completed_per_engine=dict(completed_per_engine),
@@ -439,7 +556,16 @@ class StreamingRouter:
             # Re-dispatch on dst.
             dst_args = self.engine_local_args[decision.dst_engine]
             new_task = asyncio.create_task(
-                generate_and_rm_group(dst_args, decision.group, sampling_params.copy(), evaluation=False)
+                generate_and_rm_group(
+                    dst_args,
+                    decision.group,
+                    sampling_params.copy(),
+                    evaluation=False,
+                    # Re-register the fresh attempt. The group itself has already moved
+                    # to dst in `in_flight_groups` above, so these samples are counted
+                    # against dst from here on with no special-casing.
+                    on_sample_task=_track,
+                )
             )
             tasks[new_task] = (decision.dst_engine, -1, decision.group)
             in_flight_groups[decision.dst_engine].append(decision.group)

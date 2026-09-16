@@ -101,6 +101,22 @@ class MigrationContext:
     # policies that depend on it should assert > 0 on first use.
     total_expected_groups: int = 0
 
+    # ---- live-sample counts (see --migration-count-unit) --------------------
+    # Per-engine count of samples STILL GENERATING, and the same for one group.
+    # `in_flight_groups` holds whole prompt groups and only drops one when its
+    # SLOWEST sample finishes, so group-derived counts overstate the work a train
+    # group really has left. Measured over 135 independent trigger firings on the
+    # 50-rollout DAPO run: median group-implied 56 vs 17 samples actually generating
+    # (3.0x), and at a FIXED trigger value the true remaining work still spans
+    # 2.6-4.1x. Since B is denominated in SAMPLES, these fields let a policy measure
+    # what B has always claimed to measure.
+    #
+    # None means the router did not supply them (an older caller, or a hand-built
+    # context in a test). Policies MUST fall back to group-derived counting then,
+    # never treat it as zero.
+    live_samples: dict[int, int] | None = None
+    live_in_group: "Callable[[list[Sample]], int] | None" = None
+
 
 class MigrationPolicy(ABC):
     """Policy is consulted on every group completion. Returns 0+ decisions."""
@@ -359,10 +375,35 @@ class TrainGroupBatchThresholdMigration(MigrationPolicy):
         self,
         cumulative_batch_threshold: int = 8,
         min_completed_per_group: int = 64,
+        count_unit: str = "groups",
     ):
+        if count_unit not in ("groups", "samples"):
+            raise ValueError(
+                f"count_unit must be 'groups' or 'samples', got {count_unit!r}"
+            )
         self.cumulative_batch_threshold = cumulative_batch_threshold
         self.min_completed_per_group = min_completed_per_group
+        self.count_unit = count_unit
         self._triggered_groups: set[int] = set()
+
+    def _cumulative_batch(self, sibling_engines, ctx: "MigrationContext") -> int:
+        """Samples this train group still has to produce.
+
+        'groups' (default) is the historical reading: every sample of an in-flight
+        prompt group counts until the group's SLOWEST sample lands. 'samples' counts
+        only those still generating -- what B, denominated in samples, always meant.
+        The two differ by ~3x at the median firing, so B does NOT carry across units.
+
+        Falls back to the group reading whenever the router did not supply live counts,
+        so a hand-built context or an older caller behaves exactly as before.
+        """
+        if self.count_unit == "samples" and ctx.live_samples is not None:
+            return sum(ctx.live_samples.get(e, 0) for e in sibling_engines)
+        return sum(
+            len(grp)
+            for e in sibling_engines
+            for grp in ctx.in_flight_groups.get(e, [])
+        )
 
     def reset(self) -> None:
         super().reset()
@@ -383,11 +424,7 @@ class TrainGroupBatchThresholdMigration(MigrationPolicy):
         # group bundles n_samples_per_prompt samples; summing len(grp) handles
         # variable group sizes robustly without needing n_samples_per_prompt in
         # the context.
-        cumulative_batch = sum(
-            len(grp)
-            for e in sibling_engines
-            for grp in ctx.in_flight_groups.get(e, [])
-        )
+        cumulative_batch = self._cumulative_batch(sibling_engines, ctx)
         cumulative_completed = sum(
             ctx.completed_per_engine.get(e, 0) for e in sibling_engines
         )
@@ -1537,6 +1574,7 @@ def make_migration_policy(args) -> MigrationPolicy:
             min_completed_per_group=int(
                 getattr(args, "migration_min_completed_per_group", 64)
             ),
+            count_unit=str(getattr(args, "migration_count_unit", "groups") or "groups"),
         )
         # Only the KV-gated subclass has anything more to configure. Its
         # admission test is against full KV capacity, so it deliberately

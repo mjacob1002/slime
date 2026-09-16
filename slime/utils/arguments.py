@@ -504,6 +504,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--migration-count-unit",
+                type=str,
+                default="groups",
+                choices=("groups", "samples"),
+                help=(
+                    "How --migration-batch-threshold (B) measures a train group's "
+                    "remaining work. 'groups' (default) is the historical reading: every "
+                    "sample of an in-flight prompt group counts until that group's "
+                    "SLOWEST sample lands. 'samples' counts only the samples still "
+                    "generating -- which is what B, denominated in samples, has always "
+                    "claimed to measure. Measured over 135 independent trigger firings "
+                    "on the 50-rollout DAPO run, the two differ by 3.0x at the median "
+                    "(group-implied 56 vs 17 actually generating), and at a FIXED "
+                    "trigger value the true remaining work still spans 2.6-4.1x, so B "
+                    "does NOT carry across units: divide a tuned B by ~3 when "
+                    "switching to 'samples'. Affects only the batch-threshold policies; "
+                    "destination load ranking still uses group counts either way."
+                ),
+            )
+            parser.add_argument(
                 "--migration-min-completed-per-group",
                 type=int,
                 default=64,

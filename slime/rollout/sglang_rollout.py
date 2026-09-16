@@ -270,8 +270,31 @@ async def generate_and_rm(
 
 
 async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    on_sample_task: "Callable[[Sample, asyncio.Task], None] | None" = None,
 ) -> list[Sample]:
+    """Generate one prompt group: one asyncio task per sample, gathered.
+
+    `on_sample_task` is an optional observer invoked as `(sample, task)` right after
+    each per-sample task is created. It exists so a caller can track which samples are
+    still generating: `asyncio.gather` below hides the per-sample completions, but the
+    migration policies need live-sample counts, not group counts (a group stays
+    "in flight" until its SLOWEST sample finishes, which overstates remaining work by
+    3.0x at the median -- group-implied 56 vs 17 samples actually generating, measured
+    over 135 independent trigger firings on the 50-rollout DAPO run).
+
+    The observer receives the TASK, not a done-callback, deliberately: the caller can
+    then derive liveness from `task.done()`, which is true on success, exception AND
+    cancellation. A hand-maintained counter would need every dispatch site to remember
+    to decrement, and a site that forgets under-counts silently for the whole run --
+    presenting as "migration fires too eagerly", i.e. indistinguishable from the
+    imbalance being measured.
+
+    Default None keeps every other caller byte-identical.
+    """
     state = GenerateState(args)
 
     if state.aborted:
@@ -291,9 +314,12 @@ async def generate_and_rm_group(
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+        task = asyncio.create_task(
+            generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation)
         )
+        if on_sample_task is not None:
+            on_sample_task(sample, task)
+        tasks.append(task)
 
     group = await asyncio.gather(*tasks)
 
