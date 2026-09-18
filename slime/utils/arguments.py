@@ -407,8 +407,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--tuner-cubic-gamma", type=float, default=2.0,
                 help=(
                     "Slow-start growth factor, used only before the FIRST starvation "
-                    "establishes W_max. 1.0 degenerates to additive growth by --tuner-step "
-                    "and is the control arm for 'does slow start earn anything'. Slow start "
+                    "establishes W_max. 1.0 means NO slow start -- B is HELD at its initial "
+                    "value until the first congestion event, which is the control arm for "
+                    "'does slow start earn anything' and the right shape for a short run "
+                    "started near the boundary. (It deliberately does NOT grow by "
+                    "--tuner-step: a fixed step is the very behaviour CUBIC replaces.) "
+                    "Slow start "
                     "is entered once and never re-entered: measured drift of the safe B is "
                     "DOWNWARD (144 -> 96 -> 48 over 50 rollouts), so re-probing "
                     "exponentially after a starvation would climb into a boundary that just "

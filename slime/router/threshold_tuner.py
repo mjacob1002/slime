@@ -562,6 +562,11 @@ class CubicTuner(ThresholdTuner):
       which is exactly wrong when the congestion event was a false alarm -- and until the
       zero-chunk bug in `collect_observation` is fixed, some of them are (§13.3). Turn it
       on once the signal is trustworthy, as its own arm.
+    * **`gamma = 1.0` holds B instead of growing it.** It is the control arm for "does
+      slow start earn anything", so it must not grow by a fixed `step` -- that would
+      reintroduce the constant-step behaviour CUBIC replaces and make the comparison
+      meaningless. With `gamma = 1` the controller sits at `b_init` until the first
+      starvation, which is the right shape for a short run started near the boundary.
     * **Slow start is entered once and never re-entered.** Tahoe restarts it on timeout
       because capacity may have grown; our measured drift is downward, so re-probing
       exponentially would climb into a boundary that just moved down. This is the
@@ -570,6 +575,12 @@ class CubicTuner(ThresholdTuner):
     RAILS. The base class caps |dB| at `step` symmetrically, which would flatten both the
     multiplicative decrease and the cubic growth into a staircase. This class widens both
     caps to the full B range by default; `b_min`/`b_max` still bound the result.
+
+    **`step` is not a knob for this tuner.** Once the first congestion event establishes
+    `W_max`, every move size comes from the curve -- large during concave recovery, ~0 on
+    the plateau, accelerating during convex probing (measured, W_max=144: -40, +24, +16,
+    +8, +8, +24, +48). `step` is accepted only because the base class requires it, and it
+    is never read: `gamma > 1` grows multiplicatively and `gamma = 1` holds.
 
     LATTICE. Under `--migration-count-unit groups` the policy can only fire at multiples of
     `n_samples_per_prompt`, so a sub-quantum move is a no-op and the plateau would freeze.
@@ -670,8 +681,19 @@ class CubicTuner(ThresholdTuner):
 
         self.t += 1
         if self.in_slow_start:
-            nxt = self.current * self.gamma if self.gamma > 1.0 else self.current + self.step
-            nxt = min(self.ssthresh, nxt)
+            if self.gamma <= 1.0:
+                # gamma = 1.0 means NO slow start: hold B at its initial value until the
+                # first congestion event establishes W_max, then let the curve take over.
+                # This is the control arm for "does slow start earn anything", and it is
+                # deliberately a HOLD rather than additive growth -- growing by a fixed
+                # `step` would reintroduce exactly the constant-step behaviour CUBIC
+                # exists to replace, and would make the arm untestable as a control.
+                self._reason = (
+                    f"{self.signal}={r:.5f} <= eps={self.epsilon:.5f}; gamma=1 so no slow "
+                    f"start -- holding B={self.current} until the first congestion event"
+                )
+                return None
+            nxt = min(self.ssthresh, self.current * self.gamma)
             self._reason = (
                 f"{self.signal}={r:.5f} <= eps={self.epsilon:.5f}; slow start "
                 f"x{self.gamma:g} -> {nxt:.1f} (ssthresh={self.ssthresh:.1f})"

@@ -684,9 +684,14 @@ def test_cubic_missing_signal_holds():
     o = TunerObservation(rollout_id=1, threshold=32, idle_ratio=0.03,
                          training_span_gpu_s=100.0, busy_gpu_s=97.0, wall_s=500.0)
     check("interior None -> hold", t.update(o), 32)
-    check("gamma=1.0 degenerates to additive",
-          CubicTuner(initial=32, step=5, gamma=1.0, epsilon=0.005,
-                     skip_first=False).update(cobs(0.001)), 37)
+    # gamma=1.0 HOLDS until the first congestion event -- it must not grow by `step`,
+    # which would reintroduce the constant-step behaviour CUBIC exists to replace and
+    # make it useless as a control arm.
+    t1 = CubicTuner(initial=32, step=5, gamma=1.0, epsilon=0.005, skip_first=False)
+    check("gamma=1.0 holds while healthy", t1.update(cobs(0.001, rollout_id=1)), 32)
+    check("still holding", t1.update(cobs(0.001, rollout_id=2)), 32)
+    check("congestion still works", t1.update(cobs(0.30, rollout_id=3)), 22)
+    check("and the curve takes over after", t1.update(cobs(0.001, rollout_id=4)) > 22, True)
 
 
 def test_cubic_construction_validation():
