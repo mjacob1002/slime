@@ -294,7 +294,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--threshold-tuner",
                 type=str,
                 default="fixed",
-                choices=("fixed", "idle_ratio", "idle_threshold", "interior_idle"),
+                choices=("fixed", "idle_ratio", "idle_threshold", "interior_idle", "cubic"),
                 help=(
                     "Automatically retune --migration-batch-threshold between rollouts. "
                     "'fixed' (default) never changes it -- the control arm. 'idle_ratio' "
@@ -376,6 +376,58 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                                      "--tuner-idle-target: the two epsilons differ by "
                                      "~6x and sharing one flag invites carrying a stale "
                                      "value into a new arm.")
+            # ---- CubicTuner (--threshold-tuner cubic) -------------------------------
+            # TCP CUBIC (RFC 9438) with t in ROLLOUTS. Design: perf_analysis/
+            # CUBIC_TUNER_DESIGN.md. Several defaults deliberately differ from the RFC --
+            # see that doc's 5.1 and 13 before changing them.
+            parser.add_argument(
+                "--tuner-cubic-c", type=float, default=1.0,
+                help=(
+                    "CUBIC's scaling constant C, which sets how long the controller dwells "
+                    "on the plateau just under the last known-bad B. NOT the RFC's 0.4: C "
+                    "survives the seconds->rollouts clock change numerically but not the "
+                    "change in HORIZON. TCP sees thousands of RTTs between congestion "
+                    "events; a 10-rollout arm gives ~9 decisions. Escaping a W_max set 33%% "
+                    "too low takes t=7 at C=0.4 and t=4 at C=1.6, so 1.0 keeps a 2-3 "
+                    "rollout plateau while halving the escape time. Use 0.4 only for runs "
+                    "of >= 50 rollouts."
+                ),
+            )
+            parser.add_argument(
+                "--tuner-cubic-beta", type=float, default=0.7,
+                help=(
+                    "Multiplicative-decrease factor: on a starvation event B drops to "
+                    "beta*W_max. This is the RETAINED fraction -- CUBIC keeps 70%%, where "
+                    "Reno keeps 50%%. The measured starvation penalty here is only +5..17%% "
+                    "of a rollout, so a gentle backoff is right; Reno's 0.5 would give back "
+                    "migration volume that costs more than the starvation did."
+                ),
+            )
+            parser.add_argument(
+                "--tuner-cubic-gamma", type=float, default=2.0,
+                help=(
+                    "Slow-start growth factor, used only before the FIRST starvation "
+                    "establishes W_max. 1.0 degenerates to additive growth by --tuner-step "
+                    "and is the control arm for 'does slow start earn anything'. Slow start "
+                    "is entered once and never re-entered: measured drift of the safe B is "
+                    "DOWNWARD (144 -> 96 -> 48 over 50 rollouts), so re-probing "
+                    "exponentially after a starvation would climb into a boundary that just "
+                    "moved down."
+                ),
+            )
+            parser.add_argument(
+                "--tuner-cubic-fast-convergence", type=int, default=0, choices=(0, 1),
+                help=(
+                    "RFC 9438 4.7. On a starvation at a B BELOW the previous W_max, pull "
+                    "W_max down further (x(1+beta)/2) on the theory the ceiling is falling. "
+                    "Default 0 (OFF), unlike the RFC: its stated purpose is releasing "
+                    "bandwidth to a competing flow, which does not exist here, and it "
+                    "deliberately OVER-reacts to a lower W_max -- wrong when the congestion "
+                    "event was a false alarm. Until the zero-chunk rule in "
+                    "collect_observation is fixed, some events ARE false alarms. Enable as "
+                    "its own arm once the signal is trustworthy."
+                ),
+            )
             parser.add_argument("--tuner-skip-first", type=int, default=1, choices=(0, 1),
                                 help="1 (default) = ignore rollout 0 when tuning. Its "
                                      "idle_ratio is startup-inflated (measured 771s vs "
