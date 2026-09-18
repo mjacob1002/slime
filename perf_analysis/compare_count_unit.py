@@ -107,16 +107,23 @@ def load_arm(d, engines_per_group=2):
         f["live"] = sum(v for v in vals if v is not None) if all(v is not None for v in vals) else None
 
     unit, B, rollouts = "?", None, []
-    cp = os.path.join(trial, "trial_config.json")
-    if os.path.exists(cp):
+    # Read the flags from the LAUNCHED COMMAND in driver.log, not trial_config.json:
+    # that file records only the sweep label's `extra_args`, so anything passed via
+    # --extra-train-args (which is appended LAST and therefore wins in argparse) is
+    # invisible there. Reading it reported a samples/B=18 arm as groups/B=64.
+    for src in (os.path.join(d, "driver.log"), os.path.join(trial, "trial_config.json")):
+        if not os.path.exists(src):
+            continue
         try:
-            txt = json.dumps(json.load(open(cp)))
-            um = re.findall(r"--migration-count-unit\s+(\w+)", txt)
-            bm = re.findall(r"--migration-batch-threshold\s+(\d+)", txt)
-            unit = um[-1] if um else "groups"          # flag absent => historical default
-            B = int(bm[-1]) if bm else None            # extra_train_args is appended last
-        except (ValueError, OSError):
-            pass
+            txt = open(src, errors="replace").read()
+        except OSError:
+            continue
+        um = re.findall(r"--migration-count-unit\s+(\w+)", txt)
+        bm = re.findall(r"--migration-batch-threshold\s+(\d+)", txt)
+        if bm:
+            unit = um[-1] if um else "groups"       # flag absent => historical default
+            B = int(bm[-1])
+            break
     rp = os.path.join(trial, "report.json")
     if os.path.exists(rp):
         try:
