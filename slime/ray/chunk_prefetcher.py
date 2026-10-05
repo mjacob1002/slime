@@ -56,6 +56,37 @@ class ChunkPrefetcher:
         """True if a prefetch is in flight."""
         return self._grab_ref is not None
 
+    def grab_scattered_sync(self, train_group: int) -> list:
+        """Synchronous poll for this train group's share (--rollpacker-faithful-queue).
+
+        The work queue returns `(item, sample_indices)` entries; `sample_indices is None`
+        means the whole prompt group, otherwise only those samples of it are this train
+        group's (the rest went to other train groups). Never used together with
+        start_prefetch(): RollPacker polls only after a batch has been trained.
+        """
+        entries = ray.get(self._work_queue.grab_scattered.remote(train_group))
+        resolved = []
+        for item, sample_indices in entries:
+            data = self._resolve_items([item])[0]
+            if sample_indices is not None:
+                data = self._select_samples(data, sample_indices)
+            resolved.append(data)
+        return resolved
+
+    @staticmethod
+    def _select_samples(data: dict, sample_indices: list) -> dict:
+        """A copy of one prompt group's train data restricted to `sample_indices`.
+
+        Every per-sample field is a list with one entry per sample (see
+        StreamingRolloutManager._convert_samples_to_train_data); anything else is
+        group-level and is passed through unchanged.
+        """
+        n = len(data["total_lengths"])
+        return {
+            key: [val[i] for i in sample_indices] if isinstance(val, list) and len(val) == n else val
+            for key, val in data.items()
+        }
+
     @staticmethod
     def _resolve_items(new_items: list) -> list:
         """Resolve Box refs to actual data dicts."""

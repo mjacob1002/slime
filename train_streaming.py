@@ -70,10 +70,9 @@ def _grab_policy_kwargs(args, total_gpus: int) -> dict:
     if getattr(args, "grab_policy", None) != "rollpacker_prefetch":
         return {}
     steady = getattr(args, "rollpacker_steady_batch_size", None)
+    scaling_down = getattr(args, "rollpacker_scaling_down_train_batch_size", None)
     return {
-        "scaling_down_train_batch_size": int(
-            getattr(args, "rollpacker_scaling_down_train_batch_size", 64)
-        ),
+        "scaling_down_train_batch_size": int(64 if scaling_down is None else scaling_down),
         "train_world_size": int(total_gpus),
         "div_multiplier": int(getattr(args, "rollpacker_div_multiplier", 0)),
         # Consumer count, used to derive the steady-state cap when it is not set
@@ -82,6 +81,40 @@ def _grab_policy_kwargs(args, total_gpus: int) -> dict:
         # right divisor here.
         "num_train_groups": int(total_gpus // args.tensor_model_parallel_size),
         "steady_state_batch_size": None if steady is None else int(steady),
+    }
+
+
+def _rollpacker_scatter_kwargs(args, total_gpus: int) -> dict | None:
+    """Config for the faithful RollPacker work queue, or None when it is off.
+
+    See slime/ray/rollpacker_scatter.py for what each value mirrors.
+    """
+    if not getattr(args, "rollpacker_faithful_queue", False):
+        return None
+    if getattr(args, "grab_policy", None) != "rollpacker_prefetch":
+        raise ValueError(
+            "--rollpacker-faithful-queue requires --grab-policy rollpacker_prefetch, "
+            f"got {getattr(args, 'grab_policy', None)!r}"
+        )
+    # The scatter splits a grab across the train groups the scale-down emptied, which only
+    # a StreamTrainer policy publishes; with any other policy nothing would ever stream.
+    if not issubclass(resolve_migration_policy_cls(args), StreamTrainerMigration):
+        raise ValueError(
+            "--rollpacker-faithful-queue requires a stream_trainer migration policy, "
+            f"got --migration-policy {getattr(args, 'migration_policy', 'none')!r}"
+        )
+    scaling_down = getattr(args, "rollpacker_scaling_down_train_batch_size", None)
+    return {
+        # RollPacker's config sets scaling_down_train_batch_size == rollout_batch_size.
+        "scaling_down_train_batch_size": int(
+            args.rollout_batch_size if scaling_down is None else scaling_down
+        ),
+        "train_world_size": int(total_gpus),
+        "n_samples_per_prompt": int(args.n_samples_per_prompt),
+        "per_device_train_batch_size": int(
+            getattr(args, "rollpacker_per_device_train_batch_size", 1)
+        ),
+        "seed": int(getattr(args, "seed", 0) or 0),
     }
 
 
@@ -99,6 +132,8 @@ def validate_streaming_args(args):
     assert args.num_elastic_nodes > 0 or args.num_elastic_gpus_per_node > 0, (
         "Streaming training requires elastic nodes"
     )
+    # Fail before the engines load, not when the work queue is built minutes later.
+    _rollpacker_scatter_kwargs(args, total_gpus=0)
 
 
 class _StallWatchdog:
@@ -259,6 +294,8 @@ def train(args):
         infer_engines=gpus_per_engine_cache,
         train_tp=train_tp, infer_tp=infer_tp,
         migration_policy=getattr(args, "migration_policy", "none") or "none",
+        grab_policy=getattr(args, "grab_policy", None),
+        rollpacker_faithful_queue=bool(getattr(args, "rollpacker_faithful_queue", False)),
         migration_preserve_tokens=bool(getattr(args, "migration_preserve_tokens", False)),
         migration_dst_usage_cap=float(getattr(args, "migration_dst_usage_cap", 0.70)),
         migration_min_src_usage=float(getattr(args, "migration_min_src_usage", 0.05)),
@@ -285,6 +322,9 @@ def train(args):
         f"[DRIVER] Creating StreamingWorkQueue for rollouts "
         f"(max_items_per_grab={max_items_per_grab})"
     )
+    rp_scatter_kwargs = _rollpacker_scatter_kwargs(args, total_gpus)
+    # print(), not logger: driver-side logger.info does not reach the captured job output.
+    print(f"[PRINT_INFO][DRIVER] rollpacker_faithful_queue={rp_scatter_kwargs}", flush=True)
     # num_engines == producers (one per inference engine); train-group bookkeeping
     # lets the work queue tell the driver when all engines for a train group are done.
     work_queue = StreamingWorkQueue.remote(
@@ -295,6 +335,7 @@ def train(args):
         expected_items_per_rollout=args.rollout_batch_size,
         grab_policy_name=getattr(args, 'grab_policy', None),
         grab_policy_kwargs=_grab_policy_kwargs(args, total_gpus),
+        rollpacker_scatter_kwargs=rp_scatter_kwargs,
     )
 
     # Group switch controller. The migration policy CLASS decides which one
@@ -684,9 +725,23 @@ def train(args):
         logger.info(f"[DRIVER] Gradient sync + optimizer step took {sync_elapsed:.2f}s")
         print(f"Gradient sync {rollout_id} took {sync_elapsed:.2f}s")
 
-        # Periodic save
+        # Periodic save: model + optimizer (Megatron checkpoint under --save) and the data
+        # source position, the same pair train.py writes, so a later run can --load it.
+        # Timed separately so a rollout's wall time can be read with or without it. A failed
+        # save is reported but must not take the run (and its timing data) down with it.
+        save_elapsed = 0.0
         if should_run_periodic_action(rollout_id, args.save_interval, None, args.num_rollout):
-            elastic_group.save_model(rollout_id)
+            save_start = time.time()
+            try:
+                with get_tracer().event("checkpoint_save", device="all", rollout_id=rollout_id):
+                    elastic_group.save_model(rollout_id, force_sync=True)
+                    ray.get(streaming_rollout_mgr.save.remote(rollout_id))
+                save_elapsed = time.time() - save_start
+                print(f"Checkpoint save {rollout_id} took {save_elapsed:.2f}s -> {args.save}", flush=True)
+            except Exception as e:  # noqa: BLE001 -- report and keep training
+                save_elapsed = time.time() - save_start
+                print(f"[PRINT_INFO][DRIVER] CHECKPOINT SAVE FAILED at rollout {rollout_id} "
+                      f"after {save_elapsed:.2f}s: {e!r}", flush=True)
 
         # Weight update + switch all back to inference
         wu_start = time.time()
@@ -765,6 +820,7 @@ def train(args):
             "weight_update_time_s": wu_elapsed,
             "total_rollout_time_s": rollout_elapsed,
             "overlap_time_s": overlap_time,
+            "checkpoint_save_time_s": save_elapsed,
         }
         if gen_result:
             rollout_metrics["mean_reward"] = gen_result.get("mean_reward")
@@ -773,6 +829,13 @@ def train(args):
             rollout_metrics["num_truncated"] = gen_result.get("num_truncated")
             rollout_metrics["num_completed"] = gen_result.get("num_completed")
         all_rollout_metrics.append(rollout_metrics)
+        # Rewritten every rollout so the timings survive a run that dies later.
+        with open("/tmp/slime_streaming_report.json", "w") as f:
+            json.dump({"partial": True, "num_rollouts": args.num_rollout,
+                       "rollouts": all_rollout_metrics}, f, indent=2)
+        # Same for the Perfetto trace: write() dumps every event so far, so a run that is
+        # killed later still leaves the trace of the rollouts it finished.
+        get_tracer().write()
 
         # Log the per-rollout reward curve (and perf) to wandb/tensorboard. wandb
         # is already initialized via init_tracking() above; the streaming driver

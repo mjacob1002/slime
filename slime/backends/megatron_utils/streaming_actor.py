@@ -824,6 +824,14 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
         from slime.ray.chunk_prefetcher import ChunkPrefetcher
         prefetcher = ChunkPrefetcher(work_queue_handle) if is_tp_src else None
 
+        # --rollpacker-faithful-queue: the work queue splits every grab across the train
+        # groups and holds the next one until all of them have trained their share, so this
+        # loop polls for its own share, never grabs ahead, and stops when the queue says
+        # this group has received its final share. See slime/ray/rollpacker_scatter.py.
+        rp_scatter = bool(getattr(get_args(), "rollpacker_faithful_queue", False))
+        if rp_scatter:
+            assert train_group is not None, "--rollpacker-faithful-queue needs the train group index"
+
         while True:
             # ── inter-chunk profiling: capture perf_counter timestamps at each
             # major step so the driver can emit per-step perfetto events.
@@ -832,7 +840,9 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
             # TP rank 0: collect prefetched data or do synchronous grab (first iteration)
             if is_tp_src:
-                if prefetcher.has_pending():
+                if rp_scatter:
+                    resolved = prefetcher.grab_scattered_sync(train_group)
+                elif prefetcher.has_pending():
                     resolved = prefetcher.collect_prefetch()
                 else:
                     resolved = prefetcher.grab_sync()
@@ -881,7 +891,7 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
                     )
 
                 # Start prefetch BEFORE GPU compute — overlaps queue grab with forward+backward
-                if is_tp_src:
+                if is_tp_src and not rp_scatter:
                     prefetcher.start_prefetch()
                 t_prefetch_started = time.perf_counter()
 
@@ -972,7 +982,10 @@ class StreamingMegatronTrainRayActor(MegatronTrainRayActor):
 
             # TP rank 0 checks completion; broadcast to other TP ranks
             if is_tp_src:
-                done = ray.get(work_queue_handle.is_done.remote())
+                if rp_scatter:
+                    done = ray.get(work_queue_handle.is_done_for.remote(train_group))
+                else:
+                    done = ray.get(work_queue_handle.is_done.remote())
             else:
                 done = False
 

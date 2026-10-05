@@ -166,12 +166,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--rollpacker-scaling-down-train-batch-size",
                 type=int,
-                default=64,
+                default=None,
                 help=(
                     "Only for --grab-policy rollpacker_prefetch. Fixed per-grab "
                     "prompt-group count, mirroring RollPacker's "
                     "scaling_down_train_batch_size (64 in their Table 3 config). "
-                    "Unlike the tail-split policies this never steps down."
+                    "Unlike the tail-split policies this never steps down. Unset: 64, "
+                    "or --rollout-batch-size with --rollpacker-faithful-queue (their "
+                    "config sets it equal to rollout_batch_size)."
+                ),
+            )
+            parser.add_argument(
+                "--rollpacker-faithful-queue",
+                action="store_true",
+                default=False,
+                help=(
+                    "Only for --grab-policy rollpacker_prefetch with a stream_trainer "
+                    "migration policy. Reproduce RollPacker's work queue instead of the "
+                    "earlier single-consumer port: (1) every streamed grab is split into "
+                    "equal sample-count shares across the scaled-down train groups, which "
+                    "train them in lockstep; (2) the residual left when generation ends "
+                    "is split across ALL train groups; (3) no grab-ahead -- the next grab "
+                    "is taken only after the current one is trained; (4) grab sizes follow "
+                    "RollPacker's formulas (see slime/ray/rollpacker_scatter.py). "
+                    "--rollpacker-steady-batch-size and --rollpacker-div-multiplier are "
+                    "ignored in this mode: both are derived."
+                ),
+            )
+            parser.add_argument(
+                "--rollpacker-per-device-train-batch-size",
+                type=int,
+                default=1,
+                help=(
+                    "Only with --rollpacker-faithful-queue. RollPacker's "
+                    "training_args.per_device_train_batch_size, which enters only through "
+                    "pg_prompt_count = 2 * this * (scaled-down train groups) // "
+                    "n_samples_per_prompt: the per-grab bound from the second grab on and "
+                    "the divisibility multiplier (0 = unbounded). Default 1, the value in "
+                    "their stream-trainer config."
                 ),
             )
             parser.add_argument(

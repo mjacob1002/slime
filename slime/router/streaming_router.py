@@ -38,6 +38,20 @@ from slime.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+def _prompt_order_key(samples: list[Sample]) -> int | None:
+    """Submission order of a prompt group: RollPacker's `prompt_id` counter.
+
+    `RolloutDataSource.get_samples` numbers prompt groups (`group_index`) and samples
+    (`index`) in the order it hands them out. Returns None when neither is set, in which
+    case the work queue falls back to arrival order.
+    """
+    for sample in samples:
+        if sample.group_index is not None:
+            return int(sample.group_index)
+    indices = [s.index for s in samples if s.index is not None]
+    return int(min(indices)) if indices else None
+
+
 class StreamingRouter:
     """Coordinator that dispatches prompt groups to engines and collects results.
 
@@ -629,7 +643,19 @@ class StreamingRouter:
                 # Convert and push to work queue
                 train_data = self.convert_samples_fn(flat_samples)
                 data_ref = Box(ray.put(train_data))
-                ray.get(self.work_queue.push_data.remote(data_ref))
+                # Sample count and prompt id (submission order) travel with the item: the
+                # faithful RollPacker queue splits a grab by sample and selects in
+                # prompt-id order. Every other grab policy ignores both.
+                num_samples = (
+                    len(train_data["total_lengths"])
+                    if isinstance(train_data, dict) and "total_lengths" in train_data
+                    else len(flat_samples)
+                )
+                ray.get(
+                    self.work_queue.push_data.remote(
+                        data_ref, num_samples, _prompt_order_key(flat_samples)
+                    )
+                )
                 logger.info(
                     f"[ROLLOUT] Engine {engine_rank} group {group_idx} pushed: "
                     f"{len(flat_samples)} samples"

@@ -17,6 +17,10 @@ from slime.ray.grab_policy import (
     TAIL_SINGLE_ITEM_THRESHOLD,
     make_grab_policy,
 )
+from slime.ray.rollpacker_scatter import (
+    RollPackerScatterConfig,
+    RollPackerScatterCoordinator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,7 @@ class StreamingWorkQueue:
         expected_items_per_rollout: int = 0,
         grab_policy_name: str | None = None,
         grab_policy_kwargs: dict | None = None,
+        rollpacker_scatter_kwargs: dict | None = None,
     ):
         from slime.utils.logging_utils import configure_logger
         configure_logger()
@@ -99,6 +104,20 @@ class StreamingWorkQueue:
         # controller may admit. Empty for every other migration policy.
         self._scale_down_groups: set[int] = set()
 
+        # --rollpacker-faithful-queue: RollPacker's coordinator + scatter. When set, items
+        # live in the coordinator instead of `_pending`, and trainers must poll through
+        # grab_scattered()/is_done_for() -- see slime/ray/rollpacker_scatter.py.
+        self._rp: RollPackerScatterCoordinator | None = None
+        if rollpacker_scatter_kwargs:
+            self._rp = RollPackerScatterCoordinator(
+                RollPackerScatterConfig(
+                    expected_items_per_rollout=self._expected_items_per_rollout,
+                    num_train_groups=num_train_groups,
+                    **rollpacker_scatter_kwargs,
+                )
+            )
+            logger.info(f"[WORK_QUEUE] RollPacker faithful queue enabled: {self._rp.cfg}")
+
         logger.info(
             f"[WORK_QUEUE] Initialized with num_engines={num_engines}, "
             f"num_train_groups={num_train_groups}, "
@@ -119,6 +138,8 @@ class StreamingWorkQueue:
         """
         added = set(train_groups) - self._scale_down_groups
         self._scale_down_groups.update(train_groups)
+        if self._rp is not None:
+            self._rp.set_stream_members(sorted(self._scale_down_groups))
         logger.info(
             f"[WORK_QUEUE] record_scale_down_groups({sorted(train_groups)}) "
             f"new={sorted(added)} total={sorted(self._scale_down_groups)}"
@@ -133,11 +154,17 @@ class StreamingWorkQueue:
         """
         return sorted(self._scale_down_groups)
 
-    def push_data(self, data_ref):
+    def push_data(self, data_ref, num_samples: int | None = None, order_key: int | None = None):
         """Push a completed prompt group's data into the queue.
 
         Called by the rollout manager as each prompt group finishes inference.
+        `num_samples` and `order_key` (the prompt's submission index) are only used by the
+        faithful RollPacker queue, which splits by sample and selects in prompt-id order.
         """
+        if self._rp is not None:
+            self._rp.push(data_ref, num_samples, order_key)
+            logger.info(f"[WORK_QUEUE] push_data: queue_size={self._rp.pending_count}")
+            return
         self._pending.append(data_ref)
         logger.info(f"[WORK_QUEUE] push_data: queue_size={len(self._pending)}")
 
@@ -199,6 +226,8 @@ class StreamingWorkQueue:
     def mark_generation_complete(self):
         """Signal that all generation is done — no more data will be pushed."""
         self._generation_complete = True
+        if self._rp is not None:
+            self._rp.mark_generation_complete()
         logger.info("[WORK_QUEUE] mark_generation_complete")
 
     def get_newly_completed_engines(self) -> set[int]:
@@ -241,6 +270,11 @@ class StreamingWorkQueue:
         Returns:
             List of data items (may be empty if nothing new).
         """
+        if self._rp is not None:
+            raise RuntimeError(
+                "grab_available() called with --rollpacker-faithful-queue: trainers must "
+                "use grab_scattered(train_group) so a grab is split across train groups"
+            )
         pending_count = len(self._pending)
         state = GrabState(
             pending_count=pending_count,
@@ -284,8 +318,33 @@ class StreamingWorkQueue:
             )
         return items
 
+    def grab_scattered(self, train_group: int) -> list:
+        """Faithful RollPacker queue: `train_group`'s share of the current grab.
+
+        Returns a list of `(item, sample_indices)` entries (`sample_indices is None` means
+        the whole item), or [] when there is nothing for this group right now. The split,
+        the lockstep barrier and the sizing rules live in RollPackerScatterCoordinator.
+        """
+        assert self._rp is not None, "grab_scattered() requires --rollpacker-faithful-queue"
+        entries = self._rp.grab(int(train_group))
+        if entries:
+            self._items_grabbed_so_far = self._rp.items_assigned
+            logger.info(
+                f"[WORK_QUEUE] grab_scattered(train_group={train_group}): "
+                f"{self._rp.last_delivered_samples} samples from {len(entries)} prompt "
+                f"group(s), state={self._rp.snapshot()}"
+            )
+        return entries
+
+    def is_done_for(self, train_group: int) -> bool:
+        """Faithful RollPacker queue: has `train_group` been handed its final share?"""
+        assert self._rp is not None, "is_done_for() requires --rollpacker-faithful-queue"
+        return self._rp.is_done_for(int(train_group))
+
     def is_done(self) -> bool:
         """True when all generation is complete AND the queue is drained."""
+        if self._rp is not None:
+            return self._rp.is_done()
         return self._generation_complete and len(self._pending) == 0
 
     def reset(self):
@@ -299,4 +358,6 @@ class StreamingWorkQueue:
         self._completed_train_groups.clear()
         self._consumed_train_groups.clear()
         self._scale_down_groups.clear()
+        if self._rp is not None:
+            self._rp.reset()
         logger.info("[WORK_QUEUE] Reset")

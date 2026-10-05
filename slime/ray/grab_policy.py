@@ -178,6 +178,17 @@ class AllEnginesTrainingPolicy(GrabPolicy):
 class RollPackerPrefetchPolicy(GrabPolicy):
     """RollPacker's released prefetch behaviour.
 
+    SUPERSEDED for baseline use by `--rollpacker-faithful-queue`
+    (slime/ray/rollpacker_scatter.py), which adds the coordinator + scatter this class
+    lacks. This class is kept unchanged so earlier measurements stay reproducible. Two
+    statements below were corrected by the 2026-10-02 audit against RollPacker 1dc8aae7
+    (perf_analysis/rollpacker_queue_audit.md):
+      * `pg_prompt_count` at their Table 3 config is 0, not 8: DP=2 there, so
+        `pg_world_size` is 1 and 2*1*1//4 = 0, which leaves every grab bounded only by
+        `scaling_down_train_batch_size`. It is 0 at slime's 8-GPU shapes as well.
+      * The residual IS trained across all DP replicas: `train_step_full` is
+        `DP_MP_DISPATCH_FIRST` (base_worker.py:297, decorator.py:215-219).
+
     Mirrors `prefetch_completed_requests` in RollPacker's
     `roll/distributed/scheduler/multi_async_generate_scheduler.py:695-760`,
     called from `roll/pipeline/base_worker.py:396`. It is NOT a tail-split

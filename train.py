@@ -268,7 +268,9 @@ def train(args):
         record_actor_step_stats(rollout_id, actor_train_result)
         flush_throughput_records()
 
-        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+        save_start_time = time.time()
+        did_save = should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout)
+        if did_save:
             if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
                 actor_model.save_model(
                     rollout_id,
@@ -284,6 +286,10 @@ def train(args):
                     rollout_manager.save.remote(rollout_id),
                     f"save rollout {rollout_id}",
                 )
+
+        save_elapsed = time.time() - save_start_time if did_save else 0.0
+        if did_save:
+            print(f"Checkpoint save {rollout_id} took {save_elapsed:.2f}s -> {args.save}", flush=True)
 
         print(f"[DEBUG] offload_train + onload_rollout for rollout {rollout_id}")
         with get_tracer().event("offload_train", device="all", rollout_id=rollout_id):
@@ -331,7 +337,10 @@ def train(args):
             inference_s=None if rollout_elapsed is None else round(rollout_elapsed, 3),
             train_s=None if train_elapsed is None else round(train_elapsed, 3),
             weight_update_s=None if weight_update_elapsed is None else round(weight_update_elapsed, 3),
+            save_s=round(save_elapsed, 3),
         )
+        # Rewrite the Perfetto trace every rollout so a run killed later keeps what it finished.
+        get_tracer().write()
 
     total_train_end_time = time.time()
     train_time = total_train_end_time - total_train_start_time
