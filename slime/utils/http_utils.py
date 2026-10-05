@@ -265,6 +265,69 @@ def _init_ray_distributed_post(args):
     _post_actors = created
 
 
+# ---------------------------------------------------------------------------------------
+# Optional aiohttp backend for `post` (SLIME_HTTP_BACKEND=aiohttp; default stays httpx).
+#
+# Why: with ~1,300 concurrent long-lived requests from one rollout process, httpx/httpcore's
+# connection-pool bookkeeping saturates the event loop. Measured with 1,280 multi-turn
+# Text2SQL trajectories against fake engines (perf_analysis/client_bench/): per-turn time
+# spent outside the engine was 6.98 s median with httpx vs 0.002 s with aiohttp, and the
+# same work finished in 21 s instead of 65 s. Semantics are kept identical to `_post`:
+# same retry loop (sleep 1 s, up to max_retries), raise_for_status, JSON-else-text body,
+# no timeout, same connection cap. One session per event loop (a session is bound to the
+# loop that created it).
+# ---------------------------------------------------------------------------------------
+_aiohttp_sessions: dict = {}
+
+
+def _http_backend() -> str:
+    return os.environ.get("SLIME_HTTP_BACKEND", "httpx").lower()
+
+
+def _aiohttp_session():
+    import aiohttp
+
+    loop = asyncio.get_running_loop()
+    s = _aiohttp_sessions.get(loop)
+    if s is None or s.closed:
+        s = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=_client_concurrency or 0, limit_per_host=0),
+            timeout=aiohttp.ClientTimeout(total=None),
+        )
+        _aiohttp_sessions[loop] = s
+    return s
+
+
+async def _post_aiohttp(url, payload, max_retries=60):
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            async with _aiohttp_session().post(url, json=payload or {}) as response:
+                response_text = None
+                if response.status >= 400:
+                    response_text = await response.text()
+                response.raise_for_status()
+                body = await response.read()
+            try:
+                output = json.loads(body)
+            except json.JSONDecodeError:
+                output = body.decode(errors="replace")
+        except Exception as e:
+            retry_count += 1
+            logger.info(
+                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, "
+                f"response={locals().get('response_text')})"
+            )
+            if retry_count >= max_retries:
+                logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
+                raise e
+            await asyncio.sleep(1)
+            continue
+        break
+
+    return output
+
+
 async def post(url, payload, max_retries=60):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
@@ -280,6 +343,8 @@ async def post(url, payload, max_retries=60):
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
+    if _http_backend() == "aiohttp":
+        return await _post_aiohttp(url, payload, max_retries)
     return await _post(_http_client, url, payload, max_retries)
 
 
