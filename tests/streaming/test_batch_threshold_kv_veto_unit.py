@@ -153,6 +153,18 @@ class TestVeto:
         assert pol.veto_log[0]["need_tokens"] == 2 * GROUP_TOKENS
         assert pol.veto_log[0]["room_tokens"] == 2000
 
+    def test_empty_firing_is_not_evaluated(self):
+        # The parent fires when a train group's last group completes (0 in
+        # flight < B). Nothing to evacuate: no veto, no record, B untouched,
+        # and the parent latches exactly as before.
+        pol = _policy(kv_target=0.0001)
+        chk = FakeFeasibilityChecker({e: 5000 for e in range(4)})
+        ctx = _ctx(in_flight_groups={0: [], 1: [], 2: [], 3: []}, feasibility_checker=chk)
+        assert _run(pol.on_request_completed(0, _group(), ctx)) == []
+        assert pol.veto_log == []
+        assert pol.cumulative_batch_threshold == 8
+        assert 0 in pol._triggered_groups
+
     def test_probes_once_per_firing(self):
         pol = _policy()
         chk = FakeFeasibilityChecker({0: 0, 1: CAP - 300, 2: CAP - 300, 3: CAP - 300})

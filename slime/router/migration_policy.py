@@ -1029,6 +1029,12 @@ class TrainGroupBatchThresholdKVVetoMigration(TrainGroupBatchThresholdKVGatedMig
             for e in ctx.engines_for_train_group(self._firing_group)
             for grp in ctx.in_flight_groups.get(e, [])
         )
+        if need == 0:
+            # The parent fires even when the train group has nothing left in
+            # flight (its last group just completed); there is nothing to
+            # evacuate and nothing to veto, so stay silent and let the parent
+            # issue its (empty) decision list and latch as it always has.
+            return
         # Unknown capacity (failed probe) contributes no room, same as the
         # parent's "unknown reads as full".
         room = sum(

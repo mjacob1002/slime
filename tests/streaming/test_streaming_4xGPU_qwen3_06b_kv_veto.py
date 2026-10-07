@@ -145,7 +145,7 @@ def verify(run_dir: Path) -> None:
     # the trigger was released; a vetoed firing produces the second, never the first.
     fired = re.findall(r"\[BATCH-THRESHOLD\] group (\d+) fired", text)
     released = re.findall(r"\[BATCH-THRESHOLD\] group (\d+) not latched", text)
-    allowed = re.findall(r"\[KV-VETO\] group (\d+): need=(\d+) <= room=(\d+)", text)
+    allowed = re.findall(r"\[KV-VETO\] group (\d+): need=([1-9]\d*) <= room=(\d+)", text)
     vetoed = re.findall(r"\[KV-VETO\] group (\d+): need=(\d+) > room=(\d+) .*?B (\d+) -> (\d+)", text)
     tuner_lines = re.findall(r"\[PRINT_INFO\]\[TUNER\] rollout (\d+): idle_ratio=", text)
     synced = re.findall(r"\[TUNER\] rollout (\d+): policy moved B (\d+)->(\d+)", text)
@@ -158,8 +158,9 @@ def verify(run_dir: Path) -> None:
     assert len(allowed) + len(vetoed) >= 1, "the veto was never evaluated -- did the trigger fire?"
     assert len(tuner_lines) >= ROLLOUTS - 1, "the between-rollout tuner did not decide every rollout"
 
+    assert "need=0 " not in text, "an empty firing (nothing in flight) must not be evaluated or logged"
     if FORCED:
-        assert len(vetoed) >= 1 and len(allowed) == 0, "a tiny kv_target must veto every firing"
+        assert len(vetoed) >= 1 and len(allowed) == 0, "a tiny kv_target must veto every non-empty firing"
         assert len(released) >= len(vetoed), "a vetoed firing must release the latch"
         assert len(fired) == 0, "nothing may migrate while every firing is vetoed"
         b_path = [int(v[3]) for v in vetoed] + [int(vetoed[-1][4])]
