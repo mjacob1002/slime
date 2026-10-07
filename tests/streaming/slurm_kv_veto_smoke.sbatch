@@ -22,7 +22,7 @@ export SMOKE_ROLLOUTS=${2:-3}
 export SMOKE_B=${SMOKE_B:-32}
 export SMOKE_KV_TARGET=${SMOKE_KV_TARGET:-1.0}
 export SMOKE_TAG=${SMOKE_TAG:-n${SMOKE_N}_B${SMOKE_B}_kvt${SMOKE_KV_TARGET}}
-export BENCH_CODE_ROOT=${BENCH_CODE_ROOT:-/workspace/slime/.snapshots/kv_veto_20261007}
+export BENCH_CODE_ROOT=${BENCH_CODE_ROOT:-/workspace/slime/.snapshots/kv_veto_20261007b}
 TEST=${SMOKE_TEST:-/workspace/slime/tests/streaming/test_streaming_4xGPU_qwen3_06b_kv_veto.py}
 
 # Container processes (docker exec) are NOT in the Slurm cgroup and survive the job, so stop
