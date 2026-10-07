@@ -762,6 +762,22 @@ def train(args):
         # rollout's complete per-GPU training/chunk/ws spans (every streaming emit is
         # driver-side), so the observation needs no new instrumentation and is
         # byte-identical to what perf_analysis/compare_gpu_time.py reports offline.
+        # The live policy may have moved B itself during the rollout (the KV-veto
+        # policy lowers it on every veto). Adopt that value before observing, so the
+        # tuner's next step continues from it rather than overwriting it. -1 means
+        # the policy has no threshold, in which case nothing changes here.
+        live_threshold = ray.get(streaming_rollout_mgr.get_migration_threshold.remote())
+        if live_threshold != -1 and live_threshold != tuned_threshold:
+            print(
+                f"[PRINT_INFO][TUNER] rollout {rollout_id}: policy moved B "
+                f"{tuned_threshold}->{live_threshold} within the rollout; syncing"
+            )
+            tuned_threshold = live_threshold
+            threshold_tuner.sync(live_threshold)
+        # KV-veto records (empty for every other policy) go into the trace as
+        # instant events so perf_analysis can see whether the veto ever bound.
+        for rec in ray.get(streaming_rollout_mgr.drain_kv_veto_log.remote()):
+            get_tracer().instant("kv_veto", device="driver", rollout_id=rollout_id, **rec)
         tuner_obs = collect_observation(
             rollout_id=rollout_id, threshold=tuned_threshold, wall_s=rollout_elapsed,
         )

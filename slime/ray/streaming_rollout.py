@@ -92,6 +92,27 @@ class StreamingRolloutManager:
             )
         return policy.cumulative_batch_threshold
 
+    def get_migration_threshold(self) -> int:
+        """B currently in effect in the live policy, or -1 if it has none.
+
+        Read-only counterpart of `set_migration_threshold`. A policy may change B
+        on its own within a rollout (train_group_batch_threshold_kv_veto lowers it
+        on every KV veto), so the driver's tuner syncs from this before proposing
+        the next value instead of overwriting the policy's own adjustment.
+        """
+        policy = getattr(self.router, "migration_policy", None) if self.router else None
+        if policy is None or not hasattr(policy, "cumulative_batch_threshold"):
+            return -1
+        return int(policy.cumulative_batch_threshold)
+
+    def drain_kv_veto_log(self) -> list[dict]:
+        """Veto records the live policy accumulated since the last call (empty for
+        every policy that does not keep one). The driver writes them into the
+        perfetto trace as `kv_veto` instant events."""
+        policy = getattr(self.router, "migration_policy", None) if self.router else None
+        drain = getattr(policy, "drain_veto_log", None)
+        return list(drain()) if callable(drain) else []
+
     def set_engine_urls(self, engine_urls: list[str]):
         """Set engine URLs and initialize the generation state + router.
 
