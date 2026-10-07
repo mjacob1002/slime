@@ -182,6 +182,17 @@ class ThresholdTuner(ABC):
         self.current = self._clamp(proposed)
         return self.current
 
+    def sync(self, live: int) -> None:
+        """Adopt the B the live policy actually holds before the next `update()`.
+
+        A policy may move B on its own within a rollout (train_group_batch_threshold_kv_veto
+        lowers it on every KV veto). The next proposal must start from that value, not
+        from what this tuner last set, or the between-rollout step would silently undo
+        the within-rollout one. Deliberately not clamped: the rails apply to what the
+        tuner proposes, not to what it observes.
+        """
+        self.current = int(live)
+
     # ------------------------------------------------------------- subclass API
 
     @abstractmethod

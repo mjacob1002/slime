@@ -736,10 +736,15 @@ class TrainGroupBatchThresholdKVGatedMigration(TrainGroupBatchThresholdMigration
         cumulative_batch_threshold: int = 8,
         min_completed_per_group: int = 64,
         latch_when_blocked: bool = False,
+        count_unit: str = "groups",
     ):
+        # `count_unit` is passed through unchanged: the factory has handed it to
+        # every batch-threshold policy since --migration-count-unit was added, and
+        # without this parameter the CLI could not construct this class at all.
         super().__init__(
             cumulative_batch_threshold=cumulative_batch_threshold,
             min_completed_per_group=min_completed_per_group,
+            count_unit=count_unit,
         )
         self.latch_when_blocked = latch_when_blocked
         # Ledger for the firing in progress; cleared and re-probed each firing.
@@ -914,6 +919,171 @@ class TrainGroupBatchThresholdKVGatedMigration(TrainGroupBatchThresholdMigration
         if blocked_groups == 0:
             return True
         return self.latch_when_blocked
+
+
+class TrainGroupBatchThresholdKVVetoMigration(TrainGroupBatchThresholdKVGatedMigration):
+    """`train_group_batch_threshold_kv_gated` plus a whole-evacuation KV veto that
+    steps B down while it holds.
+
+    Port of granular-cais-rl's `kv_aware_controller` (branch
+    adaptive-t-r-controller, main.py `_watch_and_compact`) onto our batch-
+    threshold trigger. Their unit is a rollout worker and their threshold T_r;
+    ours is a train group and B. Everything about the trigger is inherited
+    unchanged: a train group fires when `unfinished_groups x group_size < B`
+    (the 'groups' count unit) and, when it migrates, it evacuates EVERY
+    unfinished group on all of its engines.
+
+    What this class adds, per firing, after the parent's once-per-firing probe:
+
+        need = sum(tokens held in cache by every unfinished group on the firing
+                   train group)                              # what must move
+        room = sum over candidate destinations of
+                   max(0, kv_target * max_total_num_tokens - num_tokens)
+        veto  = need > room
+
+    `kv_target` defaults to 1.0: raw capacity, no headroom fraction, the same
+    posture as the parent's per-destination gate. On a veto NOTHING migrates,
+    the one-shot latch is released (the next completion on that train group
+    re-probes and re-decides), and, if `adjusts_threshold`, B is lowered by one
+    step and floored at that step:
+
+        B <- max(veto_step, B - veto_step)
+
+    so the trigger needs fewer unfinished groups before it fires again: 'not
+    yet', not 'never'. The lowered B persists across rollouts -- the driver's
+    between-rollout tuner reads it back (`get_migration_threshold`) and
+    continues from it. With `adjusts_threshold=False` the veto only defers and
+    B is left to the between-rollout tuner alone (their `kv_veto_adjusts_t_r`).
+
+    When the veto does NOT hold, this class makes exactly the parent's
+    decisions: the per-destination ledger still places each group, so no single
+    engine is overfilled even though the aggregate fits. With no
+    `feasibility_checker` on the context there is nothing to probe and this
+    degrades to the parent, which degrades to the ungated fixed-B policy.
+
+    Every veto is appended to `veto_log` so the actor can hand the records to
+    the driver, which writes them into the perfetto trace as `kv_veto` instant
+    events; a run in which the log stays empty was identical to fixed B.
+    """
+
+    def __init__(
+        self,
+        cumulative_batch_threshold: int = 8,
+        min_completed_per_group: int = 64,
+        latch_when_blocked: bool = False,
+        count_unit: str = "groups",
+        kv_target: float = 1.0,
+        veto_step: int = 8,
+        adjusts_threshold: bool = True,
+    ):
+        super().__init__(
+            cumulative_batch_threshold=cumulative_batch_threshold,
+            min_completed_per_group=min_completed_per_group,
+            latch_when_blocked=latch_when_blocked,
+            count_unit=count_unit,
+        )
+        if not kv_target > 0.0:
+            raise ValueError(f"kv_target must be > 0, got {kv_target}")
+        if int(veto_step) < 1:
+            raise ValueError(f"veto_step must be >= 1, got {veto_step}")
+        self.kv_target = float(kv_target)
+        self.veto_step = int(veto_step)
+        self.adjusts_threshold = bool(adjusts_threshold)
+        self._firing_group: int | None = None
+        self._vetoed = False
+        self.veto_log: list[dict] = []
+
+    def reset(self) -> None:
+        # B is deliberately NOT reset: a step-down persists into the next rollout.
+        super().reset()
+        self._firing_group = None
+        self._vetoed = False
+
+    def drain_veto_log(self) -> list[dict]:
+        """Hand back (and clear) the veto records accumulated so far."""
+        out, self.veto_log = self.veto_log, []
+        return out
+
+    async def on_request_completed(
+        self,
+        src_engine: int,
+        completed_group: list[Sample],
+        ctx: MigrationContext,
+    ) -> list[MigrationDecision]:
+        # Hook 1 receives only the candidate list, so remember which train group
+        # is firing before the parent's loop runs. Trigger logic is untouched.
+        self._firing_group = ctx.train_group_for_engine(src_engine)
+        self._vetoed = False
+        return await super().on_request_completed(src_engine, completed_group, ctx)
+
+    # ---- hook 1: parent probes once; then decide whether the WHOLE evacuation fits
+    async def _begin_destination_selection(
+        self, candidates: list[int], ctx: MigrationContext
+    ) -> None:
+        await super()._begin_destination_selection(candidates, ctx)
+        self._vetoed = False
+        if ctx.feasibility_checker is None or self._firing_group is None:
+            return  # nothing probed -> parent behaviour
+        need = sum(
+            self._migration_cost(grp, ctx)
+            for e in ctx.engines_for_train_group(self._firing_group)
+            for grp in ctx.in_flight_groups.get(e, [])
+        )
+        # Unknown capacity (failed probe) contributes no room, same as the
+        # parent's "unknown reads as full".
+        room = sum(
+            max(0.0, self.kv_target * b.token_capacity - b.probed_tokens)
+            for b in self._budgets.values()
+            if b.token_capacity > 0
+        )
+        if need <= room:
+            logger.info(
+                f"[KV-VETO] group {self._firing_group}: need={need} <= room={room:.0f} "
+                f"(kv_target={self.kv_target}); evacuation allowed"
+            )
+            return
+        self._vetoed = True
+        old = self.cumulative_batch_threshold
+        if self.adjusts_threshold:
+            self.cumulative_batch_threshold = max(self.veto_step, old - self.veto_step)
+        self.veto_log.append({
+            "train_group": self._firing_group,
+            "need_tokens": int(need),
+            "room_tokens": int(room),
+            "kv_target": self.kv_target,
+            "b_before": old,
+            "b_after": self.cumulative_batch_threshold,
+            "candidates": list(candidates),
+        })
+        logger.info(
+            f"[KV-VETO] group {self._firing_group}: need={need} > room={room:.0f} "
+            f"(kv_target={self.kv_target}, {len(self._budgets)} destination(s) probed); "
+            f"evacuation deferred, B {old} -> {self.cumulative_batch_threshold}"
+            + ("" if self.adjusts_threshold else " (unchanged: adjusts_threshold=False)")
+        )
+
+    # ---- hook 2: a vetoed firing places nothing ---------------------------
+    def _accept_destination(
+        self,
+        dst: int,
+        grp: list[Sample],
+        added_tokens: int,
+        ctx: MigrationContext,
+    ) -> bool:
+        if self._vetoed:
+            return False
+        return super()._accept_destination(dst, grp, added_tokens, ctx)
+
+    # ---- hook 5: a vetoed firing is 'not yet', never 'never' -------------
+    def _should_latch(
+        self,
+        decisions: list[MigrationDecision],
+        candidates: list[int],
+        blocked_groups: int,
+    ) -> bool:
+        if self._vetoed:
+            return False
+        return super()._should_latch(decisions, candidates, blocked_groups)
 
 
 class ProactiveTrainGroupMigration(TrainGroupAwareMigration):
@@ -1528,6 +1698,7 @@ MIGRATION_POLICY_REGISTRY: dict[str, type[MigrationPolicy]] = {
     "train_group_batch_threshold": TrainGroupBatchThresholdMigration,
     "train_group_batch_threshold_aggressive": TrainGroupBatchThresholdAggressiveMigration,
     "train_group_batch_threshold_kv_gated": TrainGroupBatchThresholdKVGatedMigration,
+    "train_group_batch_threshold_kv_veto": TrainGroupBatchThresholdKVVetoMigration,
 }
 
 
@@ -1582,6 +1753,22 @@ def make_migration_policy(args) -> MigrationPolicy:
         if issubclass(cls, TrainGroupBatchThresholdKVGatedMigration):
             kwargs["latch_when_blocked"] = bool(
                 getattr(args, "migration_kv_gate_latch_when_blocked", False)
+            )
+        if issubclass(cls, TrainGroupBatchThresholdKVVetoMigration):
+            # The veto step defaults to one prompt group, in the threshold's own
+            # unit: n_samples_per_prompt under 'groups' (B counts every sample of
+            # an unfinished group), 1 under 'samples'.
+            step = getattr(args, "migration_kv_veto_step", None)
+            if step is None:
+                step = 1 if kwargs["count_unit"] == "samples" else int(
+                    getattr(args, "n_samples_per_prompt", 1) or 1
+                )
+            kwargs.update(
+                kv_target=float(getattr(args, "migration_kv_target", 1.0)),
+                veto_step=int(step),
+                adjusts_threshold=bool(
+                    int(getattr(args, "migration_kv_veto_adjusts_threshold", 1))
+                ),
             )
         return cls(**kwargs)
     return cls()

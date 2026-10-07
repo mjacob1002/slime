@@ -481,6 +481,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "train_group_batch_threshold",
                     "train_group_batch_threshold_aggressive",
                     "train_group_batch_threshold_kv_gated",
+                    "train_group_batch_threshold_kv_veto",
                 ],
                 default="none",
                 help=(
@@ -635,6 +636,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "/get_load probes, since destinations drain continuously. Set this "
                     "to isolate the gate from the retry behaviour when comparing "
                     "against train_group_batch_threshold."
+                ),
+            )
+            # --- train_group_batch_threshold_kv_veto only ---------------------
+            parser.add_argument(
+                "--migration-kv-target",
+                type=float,
+                default=1.0,
+                help=(
+                    "Only for --migration-policy train_group_batch_threshold_kv_veto. "
+                    "A firing is vetoed when the tokens held by every unfinished group "
+                    "on the firing train group exceed the destinations' free capacity, "
+                    "sum(kv_target * max_total_num_tokens - num_tokens). Default 1.0: "
+                    "raw capacity, no headroom. Lower it (e.g. 0.9) if SGLang logs "
+                    "request retractions after migrations."
+                ),
+            )
+            parser.add_argument(
+                "--migration-kv-veto-step",
+                type=int,
+                default=None,
+                help=(
+                    "Only for train_group_batch_threshold_kv_veto. How much B is lowered "
+                    "on each veto, in B's own unit; B is floored at this value. Default: "
+                    "one prompt group (n_samples_per_prompt under the 'groups' count "
+                    "unit, 1 under 'samples'). Match --tuner-step so the within-rollout "
+                    "and between-rollout steps move B by the same amount."
+                ),
+            )
+            parser.add_argument(
+                "--migration-kv-veto-adjusts-threshold",
+                type=int,
+                choices=[0, 1],
+                default=1,
+                help=(
+                    "Only for train_group_batch_threshold_kv_veto. 1 (default): a veto "
+                    "lowers B by --migration-kv-veto-step and the lowered B persists "
+                    "into later rollouts. 0: a veto only defers the evacuation and never "
+                    "touches B (B then moves only through --threshold-tuner)."
                 ),
             )
             parser.add_argument(
