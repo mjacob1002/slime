@@ -32,6 +32,12 @@ RE_MISS = re.compile(r"PREDICTION MISS on E(\d+): probed (\d+) < predicted (\d+)
 RE_FIRED = re.compile(r"\[BATCH-THRESHOLD\] group (\d+) fired")
 RE_NOLATCH = re.compile(r"\[BATCH-THRESHOLD\] group (\d+) not latched")
 RE_ABORT = re.compile(r"\[MIGRATION\] aborting (\d+) rid\(s\)")
+# train_group_batch_threshold_kv_veto: one line per vetoed firing.
+RE_VETO = re.compile(
+    r"\[KV-VETO\] group (\d+): need=(\d+) > room=(\d+) .*?evacuation deferred, "
+    r"B (\d+) -> (\d+)"
+)
+RE_VETO_OK = re.compile(r"\[KV-VETO\] group (\d+): need=(\d+) <= room=(\d+)")
 
 
 def resolve(p: Path) -> Path:
@@ -106,6 +112,28 @@ def analyze(path: Path) -> None:
               f"({sum(aborts)} rids aborted+re-dispatched)")
     else:
         print("\nmigrations executed            : 0")
+
+    vetoes = RE_VETO.findall(text)
+    allowed = RE_VETO_OK.findall(text)
+    if vetoes or allowed:
+        n = len(vetoes) + len(allowed)
+        print(f"\nKV VETO (train_group_batch_threshold_kv_veto): {len(vetoes)} vetoed / "
+              f"{n} evaluated firings"
+              + (f"  ({len(vetoes)/n:.1%})" if n else ""))
+        if vetoes:
+            b_path = [int(b0) for _, _, _, b0, _ in vetoes] + [int(vetoes[-1][4])]
+            over = [int(need) / int(room) if int(room) else float("inf")
+                    for _, need, room, _, _ in vetoes]
+            print(f"  B along the vetoes           : {' -> '.join(map(str, b_path))}")
+            print(f"  need/room at veto            : min {min(over):.2f}x  "
+                  f"median {sorted(over)[len(over)//2]:.2f}x  max {max(over):.2f}x")
+            print("  per train group              : " + ", ".join(
+                f"g{g}={sum(1 for v in vetoes if v[0] == g)}"
+                for g in sorted({v[0] for v in vetoes}, key=int)))
+        else:
+            print("\n  *** VETO NEVER BOUND: every evaluated evacuation fit. This arm is\n"
+                  "      behaviourally identical to kv_gated (and to fixed B when nothing\n"
+                  "      was blocked), so a wall-clock delta is NOISE, not the veto. ***")
 
 
 if __name__ == "__main__":
